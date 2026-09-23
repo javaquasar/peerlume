@@ -1,0 +1,32 @@
+[package]
+name = "peerlume"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast = "1.5.2"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+flate2 = "1.1.10"
+getrandom = "0.4.3"
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.15"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+toml = "1.1.6"
+trash = "5.2.9"
+url = "2.5.8"
+
+[dev-dependencies]
+proptest = "1.11.0"
+testcontainers = { version = "0.28.0", features = ["blocking"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

@@ -1,0 +1,24 @@
+[package]
+name = "peerlume-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+peerlume = { path = ".." }
+
+[[bin]]
+name = "metainfo"
+path = "fuzz_targets/metainfo.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "blocklist"
+path = "fuzz_targets/blocklist.rs"
+test = false
+doc = false

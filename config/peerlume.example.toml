@@ -1,0 +1,35 @@
+[network]
+listen = "0.0.0.0:6881"
+max_peer_connections = 80
+connection_timeout_seconds = 10
+
+[discovery]
+tracker = true
+dht = true
+pex = true
+lsd = false
+respect_private_flag = true
+
+[tracker]
+reporting = "accurate"
+send_completed_event = true
+send_stopped_event = true
+
+[privacy]
+redact_tracker_credentials = true
+allow_trackerless_private = false
+
+[limits]
+download_kib_per_second = 0
+upload_kib_per_second = 0
+max_active_downloads = 3
+
+[policy]
+peer_selection = "balanced"
+piece_selection = "rarest-first"
+choking = "tit-for-tat"
+endgame = true
+
+[logging]
+level = "info"
+format = "pretty"
