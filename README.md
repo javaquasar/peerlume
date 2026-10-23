@@ -311,7 +311,10 @@ positioned storage, verified magnet-metadata assembly, and an end-to-end local
 single-piece transfer. SQLite in WAL mode persists torrent, file, tracker, queue,
 statistics, and transactional verified-piece checkpoints.
 
-The detailed milestones and release gates are in `docs/release-plan.md`.
+The detailed milestones and release gates are in [Release plan](docs/release-plan.md).
+The living [Library publication track](docs/release-plan.md#library-publication-track)
+records the headless-core packaging blockers, API and embedding work, open decisions,
+and acceptance gates for an experimental library alpha.
 Defensive tracker-accounting tests and anomaly scenarios are documented in
 `docs/tracker-audit-scenarios.md`.
 

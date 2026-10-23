@@ -10,6 +10,12 @@ protected with current-user DPAPI and restored for the matching user after resta
 The ordinary SQLite URL column, logs, errors, and status messages contain only a
 structurally redacted URL.
 
+This is a living plan with two independent tracks: the client milestones below and
+the [library publication track](#library-publication-track). A working application
+or green application CI does not by itself establish library release readiness.
+Add new requirements as they emerge, and mark work complete only with linked
+implementation and verification evidence.
+
 ## Milestone 0.2: hostile-input boundary
 
 ### 1. Resource and path limits
@@ -168,6 +174,190 @@ Done when one documented command runs the deterministic release suite.
 
 The tracker accounting threat model, anomaly matrix, false-positive controls, and
 acceptance criteria are specified in `tracker-audit-scenarios.md`.
+
+## Library publication track
+
+Status: planning. Initial readiness review: 2026-10-23, application commit
+`63556d9`. The first target is an experimental library alpha, not a stable SDK.
+No release date or final crate layout has been committed.
+
+Publish PeerLume as an application-oriented core built on librqbit: torrent
+management, reporting policy, verification and recovery, accounting observations,
+and integration contracts. Do not describe it as an independent BitTorrent engine
+or require a network-engine rewrite as part of library extraction.
+
+### Current baseline
+
+- [x] GUI and TUI rendering are separated from shared client and session logic.
+- [x] Headless core builds are supported inside the repository.
+- [x] Commands, events, persistence, verification, recovery and journals have tests.
+- [x] Windows and Linux application CI and local Docker fixtures are available.
+- [ ] A plain external consumer can build the core without repository overrides.
+- [ ] A deliberately scoped public API and compatibility policy are established.
+- [ ] Runtime, paths, persistence and secrets can be supplied by the embedding host.
+- [ ] Package metadata, examples and artifact verification are release-ready.
+
+These checked items describe existing infrastructure, not completion of the
+library milestones. The initial external-consumer probe failed: a normal path
+dependency with `default-features = false` selected the upstream
+`librqbit-tracker-comms`, which lacks PeerLume's reporting and observation APIs.
+
+### LIB 1 Resolve the dependency publication blocker
+
+Priority: release blocker.
+
+- [ ] Decide whether to upstream the required tracker hooks or maintain a
+  consistently published fork dependency chain.
+- [ ] Ensure PeerLume and librqbit use the same intended tracker implementation;
+  registrations must affect the workers that perform real announces.
+- [ ] Remove the requirement for consumers to copy PeerLume's root Cargo patch.
+- [ ] Add a minimal external-consumer fixture and run it in CI outside the
+  application workspace, with no inherited repository patch or Cargo config.
+- [ ] Verify reporting policy and real announce observations through that consumer,
+  not merely that its imports compile.
+
+Cargo only applies patches from the consuming workspace root; patches declared
+by dependencies are ignored. A direct path dependency or a renamed fork alone
+must not be assumed to replace librqbit's transitive tracker dependency.
+See the [Cargo dependency override rules](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#the-patch-section).
+
+Done when a clean consumer builds and exercises the intended transport using the
+distributable dependency graph, without requiring a consumer-side patch.
+
+### LIB 2 Define crate boundaries and a small public API
+
+Proposed structure, subject to a recorded design decision:
+
+- `peerlume-core`: headless domain and session facade over the transfer backend.
+- Optional SQLite persistence and platform secret-store adapters, behind features
+  or in separate crates.
+- An application package containing egui and ratatui frontends and desktop defaults.
+
+- [ ] Decide the workspace and feature layout; keep UI dependencies out of the
+  library's default dependency graph.
+- [ ] Define a supported `Client` or `Session` facade with builder-based options.
+- [ ] Introduce typed torrent identifiers, lifecycle states and library errors;
+  avoid string-formatted IDs and string-only error matching as the public contract.
+- [ ] Keep internal implementation modules private unless intentionally supported.
+- [ ] Use extensible options and non-exhaustive types where appropriate, so adding
+  a setting does not force consumers to rebuild large struct or enum literals.
+- [ ] Avoid exposing backend-specific types where they would unnecessarily bind
+  consumers to the current fork or backend version.
+- [ ] Separate supported settings from modeled or planned settings. Return an
+  explicit unsupported-capability result instead of implying an option was applied.
+- [ ] Keep accurate reporting as the default and clearly distinguish experimental
+  audit/reporting policies from ordinary transfer accounting.
+
+Done when one documented public facade supports the common workflow without UI
+types, internal module imports, or unsupported configuration assumptions.
+
+### LIB 3 Make embedding and lifecycle behavior explicit
+
+- [ ] Accept paths, journal configuration, persistence and resource limits from
+  the embedding host; remove mandatory PeerLume data-directory conventions.
+- [ ] Make file creation and persistence opt-in or explicit in builder options.
+- [ ] Choose and document runtime ownership: an owned runtime, an existing Tokio
+  runtime, or supported implementations of both.
+- [ ] Report startup failures through a typed result or readiness handshake.
+  Do not silently turn initialization failures into missing optional services.
+- [ ] Provide cancellation and explicit shutdown suitable for async callers.
+- [ ] Define Drop behavior without requiring a GUI event loop or unsafe assumptions
+  about blocking inside a host runtime.
+- [ ] Document event ordering, telemetry coalescing, control backpressure, receiver
+  closure and the host's responsibility to drain events.
+- [ ] Test stalled consumers, startup failure, cancellation, repeated session
+  creation and shutdown from supported sync and async contexts.
+
+Done when a standalone CLI or service can own the library's lifecycle and storage
+without modifying process-global application settings or relying on UI polling.
+
+### LIB 4 Define portability and secret-storage guarantees
+
+- [ ] Introduce an injectable secret-store contract or equivalent explicit policy.
+- [ ] Retain Windows DPAPI as an adapter rather than a universal library assumption.
+- [ ] Define supported behavior on Linux and other target platforms before claiming
+  that private Tracker URLs survive restart there.
+- [ ] Return explicit errors or unsupported-capability results when credentials
+  cannot be securely persisted; do not silently restore an unusable redacted URL.
+- [ ] Test credential round trips, unavailable stores, user-binding failures,
+  redacted exports and absence of secrets in errors and diagnostics.
+- [ ] Publish a platform support matrix; do not infer macOS or other platform
+  support from successful Windows and Linux application builds.
+
+Current behavior uses current-user DPAPI on Windows. The non-Windows persistence
+path does not preserve the full secret URL. This is a portability limitation to
+resolve or explicitly constrain, not a completed cross-platform secret store.
+
+Done when supported platforms have tested, documented restart behavior and no
+plaintext-secret fallback is introduced implicitly.
+
+### LIB 5 Establish packaging and compatibility policy
+
+- [ ] Choose an owner-approved project license and review obligations for vendored
+  dependencies before distributing a standalone library package.
+- [ ] Complete package metadata: description, repository, documentation, license,
+  intended package contents and minimum supported Rust version.
+- [ ] Set and test the MSRV rather than inferring it from the edition or one local
+  build; exercise dependency resolution without relying solely on the app lockfile.
+- [ ] Define the alpha stability policy, supported features, breaking-change rules,
+  persistence/schema compatibility and event-format compatibility.
+- [ ] Review the packaged file list for local downloads, credentials, generated
+  output and unnecessary application-only resources.
+- [ ] Add rustdoc and compiled examples for creation, adding a torrent, observing
+  events, changing policy, handling errors and shutting down.
+- [ ] Document backend limitations, experimental policies and dependency provenance.
+
+Done when a new user can understand the support contract and build a documented
+headless example from the package rather than from the development checkout.
+
+### LIB 6 Verify and release the distributable artifact
+
+- [ ] Run the external-consumer test against the packaged artifact and resolved
+  release dependency graph, not just against workspace source paths.
+- [ ] Verify minimal core, optional persistence, supported frontend combinations,
+  MSRV and current stable Rust on the supported platform matrix.
+- [ ] Run formatting, strict Clippy, unit, property, integration, container and
+  documentation tests; retain the existing transfer and recovery regressions.
+- [ ] Add library lifecycle and API-contract regressions, resource-bound checks,
+  multi-session isolation and portability coverage.
+- [ ] Inspect `cargo package --list`, perform package verification and a publish
+  dry run in a clean environment. Resolve package failures rather than bypassing
+  verification with `--no-verify`.
+- [ ] Review release notes, supported capabilities, unresolved alpha limitations,
+  security/privacy guarantees and license metadata.
+- [ ] Obtain explicit approval for the package name, version, registry and actual
+  publication. A documentation update or dry run is not publication authorization.
+
+Done when the verified alpha artifact is reproducible, its clean-consumer checks
+pass, and the approved publication can proceed without local overrides.
+
+### Library delivery order
+
+1. LIB 1: fix the dependency graph and add a failing-then-passing consumer test.
+2. LIB 2: choose package boundaries and the intentionally supported public facade.
+3. LIB 3 and LIB 4: define host integration, lifecycle and secret-store behavior.
+4. LIB 5: finalize documentation, licensing, MSRV and compatibility expectations.
+5. LIB 6: verify the artifact and prepare an explicitly approved alpha release.
+
+### Open library decisions
+
+- Dependency strategy: upstream hooks or a maintained published fork chain.
+- Package layout: workspace crates versus optional adapter features.
+- Runtime ownership and the sync/async embedding contract.
+- Secret-store providers and the initial supported platform matrix.
+- License, MSRV, package names and alpha version/stability policy.
+- Whether experimental tracker-audit policies require a separate opt-in feature.
+- Which real backend capabilities are guaranteed by the first public release.
+
+### Maintaining the library plan
+
+Keep LIB identifiers stable. Add new milestones with new identifiers rather than
+renumbering existing ones. Add a date and decision rationale when resolving an
+open question. Link completed items to commits, tests or verified artifacts, and
+retain unresolved limitations in the release notes. Application CI success alone
+does not close an external-consumer or package-publication gate.
+
+The client delivery order and gates below remain a separate application track.
 
 ## Delivery order
 
