@@ -20,6 +20,56 @@ pub(crate) struct LiveFixture {
 }
 
 impl LiveFixture {
+    pub fn restart(self) -> Self {
+        let Self {
+            controller,
+            root,
+            id,
+            ..
+        } = self;
+        drop(controller);
+        let store = StateStore::open(&root.path().join("test-state.sqlite3")).unwrap();
+        let record = store
+            .load_all_torrents()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        let settings = ClientSettings::default();
+        let item = crate::client::torrent_from_record(record, &settings);
+        let paused = item.state == TorrentState::Paused;
+        let runtime = SessionRuntime::start_with_options(
+            64,
+            root.path().into(),
+            librqbit::SessionOptions {
+                dht: None,
+                listen: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let backend = ClientBackend::with_session_and_store(runtime, store);
+        backend.send(add_torrent_command(&item, &settings)).unwrap();
+        let mut fixture = Self {
+            controller: Controller::new(backend, vec![item]),
+            root,
+            id,
+            settings_applied: 0,
+        };
+        fixture.wait_for(|fixture| {
+            fixture.controller.torrents[0].completion == CompletionStatus::Verified
+                && fixture.controller.torrents[0].state
+                    == if paused {
+                        TorrentState::Paused
+                    } else {
+                        TorrentState::Seeding
+                    }
+        });
+        fixture
+    }
+
     pub fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let payload = b"local command fixture";
@@ -83,10 +133,11 @@ impl LiveFixture {
         while let Some(notice) = self.controller.poll_next() {
             match notice {
                 SessionNotice::SettingsApplied { id } => {
-                    self.controller
-                        .persist_confirmed_settings(&id, None)
-                        .unwrap();
+                    self.controller.persist_confirmed_update(&id, None).unwrap();
                     self.settings_applied += 1;
+                }
+                SessionNotice::StateApplied { id } => {
+                    self.controller.persist_confirmed_update(&id, None).unwrap();
                 }
                 SessionNotice::Error { .. } => panic!("{notice:?}"),
                 _ => {}

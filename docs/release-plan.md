@@ -299,6 +299,27 @@ are in-process polling observers, not IPC subscriptions or a durable operation
 history. There is no Named Pipe listener, external CLI/MCP access, authorization
 service or library publication in these slices. These unchecked gates remain open.
 
+Lifecycle checkpoint slice, 2026-10-23: engine-confirmed Pause/Resume state changes
+now emit a distinct `StateApplied` notice. GUI and TUI route these notices through
+the same owner-side `persist_confirmed_update` gate as confirmed settings. Queue
+acceptance and engine failures do not overwrite the last confirmed database state.
+Failed checkpoints retain an in-process retry marker; unknown torrent state events
+cannot create a checkpoint marker. Live telemetry still does not cause a database
+write on every tick.
+
+Resume checkpoints store active-transfer intent (`downloading`); restoration maps
+it to WaitingForEngine and lets the new engine verify existing data before Done.
+Pause checkpoints restore Paused rather than automatically resuming. Tests close
+the old runtime and SQLite connection, reopen the database and start a new isolated
+runtime, verifying both intents and preservation of the selected reporting mode.
+Commands accepted without an engine acknowledgement are still not durable
+operations, and interruption/result reconciliation remains a future gate.
+
+CI evidence for the foundation and command-gateway slices: all five jobs passed
+for commit `47d934d` in [GitHub Actions run 40016765319](https://github.com/javaquasar/peerlume/actions/runs/40016765319),
+including Windows GUI/TUI, Linux core/TUI, Docker integration tests and strict
+quality checks. Subsequent changes require their own verification evidence.
+
 ### AGENT 2 Add local IPC and installed client adapters
 
 - [ ] Start with a Windows Named Pipe endpoint restricted to the intended OS user.

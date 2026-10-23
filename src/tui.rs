@@ -154,10 +154,10 @@ impl TuiApp {
     fn poll(&mut self) {
         while let Some(notice) = self.control.poll_next() {
             match notice {
-                SessionNotice::SettingsApplied { id } => {
+                SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
                     if let Err(error) = self
                         .control
-                        .persist_confirmed_settings(&id, self.tracker_audits.get(&id).cloned())
+                        .persist_confirmed_update(&id, self.tracker_audits.get(&id).cloned())
                     {
                         self.status = error;
                     }
@@ -1826,11 +1826,23 @@ mod tests {
         wait_for_tui(&mut app, |app| {
             app.control.torrents[0].state == TorrentState::Seeding
         });
+        assert_eq!(
+            app.control.backend.load_torrents().unwrap()[0].state,
+            "downloading"
+        );
         app.pause_selected();
         assert_eq!(app.control.torrents[0].state, TorrentState::Seeding);
+        assert_eq!(
+            app.control.backend.load_torrents().unwrap()[0].state,
+            "downloading"
+        );
         wait_for_tui(&mut app, |app| {
             app.control.torrents[0].state == TorrentState::Paused
         });
+        assert_eq!(
+            app.control.backend.load_torrents().unwrap()[0].state,
+            "paused"
+        );
         app.toggle_selected_file();
         assert!(app.control.torrents[0].files.files()[0].selected);
         wait_for_tui(&mut app, |app| {

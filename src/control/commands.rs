@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use super::Controller;
 #[cfg(any(test, feature = "gui", feature = "tui"))]
-use crate::{client::torrent_to_record, state::StoredTrackerAuditProfile, torrent::TorrentState};
+use crate::torrent::TorrentState;
+use crate::{client::torrent_to_record, state::StoredTrackerAuditProfile};
 use crate::{
     client::{ClientBackend, mode_submission_failed},
     runtime_status::{ModeApplication, ModeConfig, RepairPolicy},
@@ -237,9 +238,9 @@ impl Controller {
     }
 
     /// The audit profile is presentation-independent data supplied by the UI.
-    /// Call only after SettingsApplied, not after enqueueing a configuration command.
-    #[cfg(any(test, feature = "gui", feature = "tui"))]
-    pub(crate) fn persist_confirmed_settings(
+    /// Call after SettingsApplied or StateApplied, never merely after enqueueing.
+    /// Owner-only API: ReadHandle observers cannot checkpoint application state.
+    pub fn persist_confirmed_update(
         &mut self,
         id: &str,
         audit: Option<StoredTrackerAuditProfile>,
@@ -249,15 +250,15 @@ impl Controller {
             .iter()
             .find(|torrent| torrent.info_hashes.join(";") == id)
             .ok_or("Torrent is unavailable")?;
-        if !self.unpersisted_settings.contains(id) {
-            return Err("No confirmed settings update to persist".into());
+        if !self.unpersisted_updates.contains(id) {
+            return Err("No confirmed update to persist".into());
         }
         if !self.backend.persistence_available() {
             return Err("Persistent state store is unavailable".into());
         }
         let record = torrent_to_record(torrent, audit);
         self.backend.save_torrent(&record)?;
-        self.unpersisted_settings.remove(id);
+        self.unpersisted_updates.remove(id);
         Ok(())
     }
 

@@ -326,6 +326,10 @@ optional revision checks. Both UIs distinguish queue acceptance from engine
 confirmation; file selection and verification settings are saved only after
 acknowledgement. Imports/removal, background ownership and external authorization
 remain separate roadmap items.
+Confirmed Pause/Resume updates are also checkpointed: a restarted application
+restores paused or active-transfer intent without resetting the reporting mode.
+Queued requests are not treated as confirmed state, and restored payload is
+verified by the new engine rather than assumed complete from saved counters.
 The living [Library publication track](docs/release-plan.md#library-publication-track)
 is deferred and retained for future use; it records headless-core packaging blockers,
 API and embedding work, open decisions and acceptance gates for a possible alpha.

@@ -403,11 +403,11 @@ fn a_missing_state_store_is_not_reported_as_successful_persistence() {
     });
     assert!(
         control
-            .persist_confirmed_settings("v1: abc", None)
+            .persist_confirmed_update("v1: abc", None)
             .unwrap_err()
             .contains("unavailable")
     );
-    assert!(control.unpersisted_settings.contains("v1: abc"));
+    assert!(control.unpersisted_updates.contains("v1: abc"));
 }
 
 #[test]
@@ -447,7 +447,7 @@ fn accepted_commands_do_not_accumulate_operation_history() {
         accept(&mut control, TorrentCommand::Pause);
     }
     assert_eq!(control.observed.len(), 1);
-    assert_eq!(control.unpersisted_settings.len(), 0);
+    assert_eq!(control.unpersisted_updates.len(), 0);
     let receipt = control
         .submit_via("v1: abc", TorrentCommand::Pause, None, |_, _| Ok(()))
         .unwrap();
@@ -463,10 +463,10 @@ fn accepted_commands_do_not_accumulate_operation_history() {
 fn persistence_requires_confirmation_preserves_audit_and_retains_retry_on_failure() {
     let store = StateStore::in_memory().unwrap();
     let mut control = Controller::new(ClientBackend::with_state_store(store), vec![torrent()]);
-    assert!(control.persist_confirmed_settings("unknown", None).is_err());
-    assert!(control.persist_confirmed_settings("v1: abc", None).is_err());
+    assert!(control.persist_confirmed_update("unknown", None).is_err());
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
     accept(&mut control, TorrentCommand::SetVerifyAfterDownload(true));
-    assert!(control.persist_confirmed_settings("v1: abc", None).is_err());
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
     assert!(control.backend.load_torrents().unwrap().is_empty());
     assert_eq!(
         control.apply(SessionEvent::VerifyAfterDownload {
@@ -485,22 +485,22 @@ fn persistence_requires_confirmation_preserves_audit_and_retains_retry_on_failur
         steps: vec![],
     };
     control
-        .persist_confirmed_settings("v1: abc", Some(audit.clone()))
+        .persist_confirmed_update("v1: abc", Some(audit.clone()))
         .unwrap();
     let record = control.backend.load_torrents().unwrap().remove(0);
     assert!(record.verify_after_download);
     assert_eq!(record.tracker_audit, Some(audit));
-    assert!(control.persist_confirmed_settings("v1: abc", None).is_err());
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
     control.apply(SessionEvent::VerifyAfterDownload {
         id: "v1: abc".into(),
         enabled: false,
     });
     control.torrents[0].uploaded_bytes = u64::MAX;
-    assert!(control.persist_confirmed_settings("v1: abc", None).is_err());
-    assert!(control.unpersisted_settings.contains("v1: abc"));
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    assert!(control.unpersisted_updates.contains("v1: abc"));
     assert!(control.backend.load_torrents().unwrap()[0].verify_after_download);
     control.torrents[0].uploaded_bytes = 0;
-    control.persist_confirmed_settings("v1: abc", None).unwrap();
+    control.persist_confirmed_update("v1: abc", None).unwrap();
     assert!(!control.backend.load_torrents().unwrap()[0].verify_after_download);
 }
 
@@ -708,4 +708,153 @@ proptest::proptest! {
         proptest::prop_assert_eq!(result.is_ok(), valid);
         proptest::prop_assert_eq!(control.torrents[0].files.selected_count(), before);
     }
+}
+
+#[test]
+fn a_state_acknowledgement_checkpoints_only_the_known_torrent_and_can_retry() {
+    let mut control = Controller::new(
+        ClientBackend::with_state_store(StateStore::in_memory().unwrap()),
+        vec![torrent()],
+    );
+    accept(&mut control, TorrentCommand::Pause);
+    assert!(control.backend.load_torrents().unwrap().is_empty());
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    assert_eq!(
+        control.apply(SessionEvent::StateChanged {
+            id: "unknown".into(),
+            state: "paused"
+        }),
+        SessionNotice::None
+    );
+    assert!(control.unpersisted_updates.is_empty());
+    assert_eq!(
+        control.apply(SessionEvent::StateChanged {
+            id: "v1: abc".into(),
+            state: "paused"
+        }),
+        SessionNotice::StateApplied {
+            id: "v1: abc".into()
+        }
+    );
+    control.torrents[0].uploaded_bytes = u64::MAX;
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    assert!(control.unpersisted_updates.contains("v1: abc"));
+    assert!(control.backend.load_torrents().unwrap().is_empty());
+    control.torrents[0].uploaded_bytes = 0;
+    control.persist_confirmed_update("v1: abc", None).unwrap();
+    assert_eq!(control.backend.load_torrents().unwrap()[0].state, "paused");
+    assert!(control.unpersisted_updates.is_empty());
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+}
+
+#[test]
+fn rejected_or_failed_pause_does_not_overwrite_the_last_confirmed_database_state() {
+    let item = torrent();
+    let mut backend = ClientBackend::with_state_store(StateStore::in_memory().unwrap());
+    backend
+        .save_torrent(&torrent_to_record(&item, None))
+        .unwrap();
+    let mut control = Controller::new(backend, vec![item]);
+    let before = control.backend.load_torrents().unwrap();
+    assert_eq!(
+        control.submit_via("v1: abc", TorrentCommand::Pause, None, |_, _| Err(
+            CommandError::QueueFull
+        )),
+        Err(CommandError::QueueFull)
+    );
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    accept(&mut control, TorrentCommand::Pause);
+    control.apply(SessionEvent::Error {
+        id: "v1: abc".into(),
+        message: "pause failed".into(),
+    });
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    assert_eq!(control.backend.load_torrents().unwrap(), before);
+}
+
+#[test]
+fn confirmed_pause_survives_database_reopen_and_a_new_transfer_session() {
+    let mut fixture = LiveFixture::new();
+    fixture
+        .controller
+        .submit(&fixture.id, TorrentCommand::Resume, None)
+        .unwrap();
+    assert_eq!(
+        fixture.controller.backend.load_torrents().unwrap()[0].state,
+        "paused"
+    );
+    fixture.wait_for(|fixture| fixture.controller.torrents[0].state == TorrentState::Seeding);
+    assert_eq!(
+        fixture.controller.backend.load_torrents().unwrap()[0].state,
+        "downloading"
+    );
+    fixture
+        .controller
+        .submit(&fixture.id, TorrentCommand::Pause, None)
+        .unwrap();
+    assert_eq!(
+        fixture.controller.backend.load_torrents().unwrap()[0].state,
+        "downloading"
+    );
+    fixture.wait_for(|fixture| fixture.controller.torrents[0].state == TorrentState::Paused);
+    assert_eq!(
+        fixture.controller.backend.load_torrents().unwrap()[0].state,
+        "paused"
+    );
+    let fixture = fixture.restart();
+    assert_eq!(fixture.controller.torrents[0].state, TorrentState::Paused);
+    assert!(fixture.controller.torrents[0].completed_successfully());
+    assert_eq!(fixture.controller.torrents[0].runtime.network_downloaded, 0);
+}
+
+#[test]
+fn confirmed_resume_survives_restart_without_resetting_the_reporting_mode() {
+    let mut fixture = LiveFixture::new();
+    fixture
+        .controller
+        .submit(
+            &fixture.id,
+            TorrentCommand::SetMode(ModeConfig {
+                mode: DownloadMode::NoProgress,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+    fixture.wait_for(|fixture| {
+        fixture.controller.torrents[0].overrides.download_mode == DownloadMode::NoProgress
+    });
+    fixture
+        .controller
+        .submit(&fixture.id, TorrentCommand::Resume, None)
+        .unwrap();
+    assert_eq!(
+        fixture.controller.backend.load_torrents().unwrap()[0].state,
+        "paused"
+    );
+    fixture.wait_for(|fixture| fixture.controller.torrents[0].state == TorrentState::Seeding);
+    let saved = fixture
+        .controller
+        .backend
+        .load_torrents()
+        .unwrap()
+        .remove(0);
+    assert_eq!(saved.state, "downloading");
+    assert_eq!(saved.download_mode, DownloadMode::NoProgress);
+    let fixture = fixture.restart();
+    assert_eq!(fixture.controller.torrents[0].state, TorrentState::Seeding);
+    assert_eq!(
+        fixture.controller.torrents[0].overrides.download_mode,
+        DownloadMode::NoProgress
+    );
+    assert_eq!(
+        fixture.controller.torrents[0]
+            .runtime
+            .mode
+            .active()
+            .unwrap()
+            .mode,
+        DownloadMode::NoProgress
+    );
+    assert_eq!(fixture.controller.torrents[0].runtime.network_downloaded, 0);
 }

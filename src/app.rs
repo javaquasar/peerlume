@@ -475,12 +475,12 @@ impl PeerLumeApp {
     fn poll_session_events(&mut self) {
         while let Some(notice) = self.control.poll_next() {
             match notice {
-                SessionNotice::SettingsApplied { id } => {
+                SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
                     let audit = self
                         .tracker_audits
                         .get(&id)
                         .map(TorrentTrackerAudit::to_stored);
-                    if let Err(error) = self.control.persist_confirmed_settings(&id, audit) {
+                    if let Err(error) = self.control.persist_confirmed_update(&id, audit) {
                         self.add_status = error;
                     }
                 }

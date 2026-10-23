@@ -32,7 +32,7 @@ pub struct Controller {
     reader: ReadHandle,
     dirty: bool,
     command_clock: u64,
-    unpersisted_settings: std::collections::BTreeSet<String>,
+    unpersisted_updates: std::collections::BTreeSet<String>,
 }
 
 impl Controller {
@@ -44,7 +44,7 @@ impl Controller {
             reader: ReadHandle::default(),
             dirty: false,
             command_clock: 0,
-            unpersisted_settings: Default::default(),
+            unpersisted_updates: Default::default(),
         };
         controller.publish();
         controller
@@ -92,8 +92,11 @@ impl Controller {
             {
                 continue;
             }
-            if matches!(notice, SessionNotice::SettingsApplied { .. }) {
-                self.unpersisted_settings.insert(id.clone());
+            if matches!(
+                notice,
+                SessionNotice::SettingsApplied { .. } | SessionNotice::StateApplied { .. }
+            ) {
+                self.unpersisted_updates.insert(id.clone());
             }
             let observation = self.observed.entry(id).or_insert_with(|| {
                 self.command_clock = self
@@ -120,7 +123,7 @@ impl Controller {
             .collect();
         let old_len = self.observed.len();
         self.observed.retain(|id, _| ids.contains(id));
-        self.unpersisted_settings.retain(|id| ids.contains(id));
+        self.unpersisted_updates.retain(|id| ids.contains(id));
         self.dirty |= old_len != self.observed.len();
         for torrent in &self.torrents {
             let id = torrent.info_hashes.join(";");

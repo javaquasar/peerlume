@@ -24,6 +24,7 @@ pub enum SessionNotice {
     None,
     Added { id: String },
     SettingsApplied { id: String },
+    StateApplied { id: String },
     Error { id: String, message: String },
     Removed { id: String },
     Stopped,
@@ -135,6 +136,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                 } else {
                     TorrentState::Downloading
                 };
+                return SessionNotice::StateApplied { id };
             }
             SessionNotice::None
         }
@@ -491,7 +493,6 @@ impl ClientBackend {
         self.session_runtime.is_some()
     }
 
-    #[cfg(any(test, feature = "gui", feature = "tui"))]
     pub(crate) fn persistence_available(&self) -> bool {
         self.state_store.is_some()
     }
@@ -679,7 +680,9 @@ pub(crate) mod tests {
                     state: "paused",
                 }
             ),
-            SessionNotice::None
+            SessionNotice::StateApplied {
+                id: "v1: abc".into()
+            }
         );
         assert_eq!(torrents[0].state, TorrentState::Paused);
 
