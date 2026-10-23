@@ -473,10 +473,7 @@ impl Default for PeerLumeApp {
 
 impl PeerLumeApp {
     fn poll_session_events(&mut self) {
-        loop {
-            let Some(notice) = self.control.poll_next() else {
-                break;
-            };
+        while let Some(notice) = self.control.poll_next() {
             match notice {
                 SessionNotice::SettingsApplied { id } => {
                     let audit = self
