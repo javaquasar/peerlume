@@ -2407,7 +2407,7 @@ mod tests {
         assert!(app.status.contains("queued: 0"));
         app.remove_selected();
         assert_eq!(app.control.torrents.len(), 1);
-        assert!(app.status.contains("unavailable"));
+        assert!(app.status.contains("store is unavailable"));
     }
 
     #[test]

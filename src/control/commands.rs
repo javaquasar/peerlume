@@ -55,6 +55,7 @@ pub enum CommandError {
     QueueFull,
     EngineClosed,
     OperationInProgress,
+    PersistenceUnavailable,
 }
 
 impl fmt::Display for CommandError {
@@ -70,6 +71,7 @@ impl fmt::Display for CommandError {
             Self::QueueFull => "Transfer command queue is full; retry after refreshing",
             Self::EngineClosed => "Transfer engine command channel is closed",
             Self::OperationInProgress => "An agent operation is awaiting confirmation",
+            Self::PersistenceUnavailable => "Persistent state store is unavailable",
         })
     }
 }
@@ -218,6 +220,9 @@ impl Controller {
         send: impl FnOnce(&ClientBackend, SessionCommand) -> Result<(), CommandError>,
     ) -> Result<AcceptedCommand, CommandError> {
         let id = self.torrents[index].info_hashes.join(";");
+        if matches!(command, TorrentCommand::Remove) && !self.backend.persistence_available() {
+            return Err(CommandError::PersistenceUnavailable);
+        }
         let revision = self.observed[&id].command_revision;
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(CommandError::RevisionConflict {

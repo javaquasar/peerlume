@@ -701,6 +701,81 @@ fn approved_remove_waits_for_engine_and_keeps_payload() {
 }
 
 #[test]
+fn removal_without_persistence_cannot_claim_success_or_erase_the_model() {
+    let mut control = Controller::new(
+        ClientBackend::offline(),
+        vec![crate::client::tests::torrent()],
+    );
+    assert_eq!(
+        control.remove("v1: abc").err(),
+        Some(CommandError::PersistenceUnavailable)
+    );
+    assert_eq!(control.torrents.len(), 1);
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn tui_trusted_access_panel_defaults_readonly_and_is_not_a_log() {
+    use crossterm::event::KeyCode;
+    let (_root, mut control, _) = setup();
+    let mut panel = frontends::AccessPanel::default();
+    assert!(!panel.open);
+    assert!(panel.key(&mut control, KeyCode::F(8)));
+    assert!(panel.open);
+    panel.key(&mut control, KeyCode::Char('g'));
+    assert!(!panel.token.is_empty());
+    assert_eq!(
+        control
+            .agent_access()
+            .unwrap()
+            .clients
+            .last()
+            .unwrap()
+            .grants,
+        Grants::default()
+    );
+    panel.key(&mut control, KeyCode::Char('m'));
+    panel.key(&mut control, KeyCode::Char('g'));
+    assert!(
+        control
+            .agent_access()
+            .unwrap()
+            .clients
+            .last()
+            .unwrap()
+            .grants
+            .manage
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| panel.render(&control, frame))
+        .unwrap();
+    panel.key(&mut control, KeyCode::Char('x'));
+    assert!(control.agent_access().unwrap().clients.is_empty());
+    panel.key(&mut control, KeyCode::Esc);
+    assert!(!panel.open);
+    assert!(panel.token.is_empty());
+}
+
+#[cfg(feature = "gui")]
+#[test]
+fn egui_trusted_access_panel_renders_without_enabling_access_or_issuing_tokens() {
+    let (_root, mut control, _) = setup();
+    control.agent_access().unwrap().enabled = false;
+    let before = control.agent_access().unwrap().clients.len();
+    let ctx = eframe::egui::Context::default();
+    let mut panel = frontends::AccessPanel {
+        open: true,
+        ..Default::default()
+    };
+    let _ = ctx.run(Default::default(), |ctx| panel.show(&mut control, ctx));
+    assert!(!control.agent_access().unwrap().enabled);
+    assert_eq!(control.agent_access().unwrap().clients.len(), before);
+    assert!(panel.token.is_empty());
+}
+
+#[test]
 fn bounded_retention_refuses_new_work_without_forgetting_idempotency() {
     let root = tempfile::tempdir().unwrap();
     let store = ControlStore::open(&root.path().join("ops.sqlite3")).unwrap();

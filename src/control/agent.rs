@@ -567,6 +567,9 @@ impl AgentService {
                     .submit(torrent_id, command.clone(), Some(*expected_revision))
                     .map_err(|error| match error {
                         super::CommandError::RevisionConflict { .. } => ErrorCode::Conflict,
+                        super::CommandError::PersistenceUnavailable => {
+                            ErrorCode::PersistenceUnavailable
+                        }
                         _ => ErrorCode::EngineRejected,
                     })?;
                 if matches!(command, TorrentCommand::Remove) {

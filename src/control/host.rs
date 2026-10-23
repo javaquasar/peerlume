@@ -200,17 +200,18 @@ async fn listen(
     error: Arc<Mutex<Option<ErrorCode>>>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(wire::MAX_CONNECTIONS));
+    let mut listening = None;
     loop {
         if !enabled.load(Ordering::Relaxed) {
+            listening = None;
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
-        let permit = permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore open");
-        let pipe = match windows_pipe(&address) {
+        let pipe = match listening
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| windows_pipe(&address, true))
+        {
             Ok(pipe) => pipe,
             Err(_) => {
                 *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(ErrorCode::Busy);
@@ -218,9 +219,25 @@ async fn listen(
                 continue;
             }
         };
+        *error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore open");
         loop {
             match tokio::time::timeout(Duration::from_millis(50), pipe.connect()).await {
                 Ok(Ok(())) => {
+                    // Keep at least one pipe instance alive continuously. The first
+                    // creation is exclusive, so a pre-existing endpoint is never trusted.
+                    match windows_pipe(&address, false) {
+                        Ok(next) => listening = Some(next),
+                        Err(_) => {
+                            *error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(ErrorCode::Busy);
+                            break;
+                        }
+                    }
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -240,7 +257,10 @@ async fn listen(
 }
 
 #[cfg(windows)]
-fn windows_pipe(address: &str) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+fn windows_pipe(
+    address: &str,
+    first: bool,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, LocalFree},
         Security::{
@@ -303,6 +323,7 @@ fn windows_pipe(address: &str) -> io::Result<tokio::net::windows::named_pipe::Na
             bInheritHandle: 0,
         };
         let result = tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(first)
             .reject_remote_clients(true)
             .create_with_security_attributes_raw(
                 address,
@@ -311,6 +332,24 @@ fn windows_pipe(address: &str) -> io::Result<tokio::net::windows::named_pipe::Na
         LocalFree(descriptor);
         result
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_endpoint_rejects_an_existing_server_before_accepting_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let address = endpoint(root.path()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let first = windows_pipe(&address, true).unwrap();
+        assert!(windows_pipe(&address, true).is_err());
+        let additional = windows_pipe(&address, false).unwrap();
+        drop(additional);
+        drop(first);
+    });
 }
 
 #[cfg(unix)]
@@ -401,7 +440,21 @@ pub async fn call(directory: &Path, request: &Request) -> Result<Response, Error
             .await
             .map_err(|_| ErrorCode::NotRunning)?;
         let data = read_frame(&mut BufReader::new(stream), wire::MAX_RESPONSE_BYTES + 1).await?;
-        serde_json::from_slice(&data).map_err(|_| ErrorCode::InvalidRequest)
+        let response: Response =
+            serde_json::from_slice(&data).map_err(|_| ErrorCode::InvalidRequest)?;
+        if response.protocol_version != super::PROTOCOL_VERSION {
+            return Err(ErrorCode::IncompatibleProtocol);
+        }
+        if response.error.is_none()
+            && (response.request_id != request.request_id
+                || request
+                    .instance_id
+                    .as_ref()
+                    .is_some_and(|id| *id != response.instance_id))
+        {
+            return Err(ErrorCode::Conflict);
+        }
+        Ok(response)
     })
     .await
     .map_err(|_| ErrorCode::ReconciliationRequired)?

@@ -324,20 +324,20 @@ quality checks. Subsequent changes require their own verification evidence.
 
 ### AGENT 2 Add local IPC and installed client adapters
 
-- [ ] Start with a Windows Named Pipe endpoint restricted to the intended OS user.
+- [x] Start with a Windows Named Pipe endpoint restricted to the intended OS user.
   Define equivalent local transports for additional supported platforms separately.
-- [ ] Add instance ownership, endpoint discovery and a versioned handshake. Detect
+- [x] Add instance ownership, endpoint discovery and a versioned handshake. Detect
   stale discovery records and refuse to attach to an incompatible instance.
-- [ ] Make external control explicitly enabled by the user; do not expose an
+- [x] Make external control explicitly enabled by the user; do not expose an
   unauthenticated network listener by default.
-- [ ] Add a scriptable CLI with structured JSON output and documented exit codes.
-- [ ] Add a thin MCP adapter with discoverable tool schemas. A stdio bridge may
+- [x] Add a scriptable CLI with structured JSON output and documented exit codes.
+- [x] Add a thin MCP adapter with discoverable tool schemas. A stdio bridge may
   attach to IPC but must not create another SessionRuntime or own the download
   lifecycle. Keep protocol output on stdout and diagnostic output on stderr.
-- [ ] Return an explicit not-running result when no instance exists. Starting the
+- [x] Return an explicit not-running result when no instance exists. Starting the
   application must be a separate, authorized action rather than a side effect of
   a read-only query.
-- [ ] Keep background/headless operation optional: attaching to an already running
+- [x] Keep background/headless operation optional: attaching to an already running
   GUI is sufficient for the first slice; a system service is not required.
 
 Done when installed CLI and MCP adapters attach to the same running application,
@@ -349,17 +349,17 @@ without repository source paths, a second engine, or direct database mutation.
   schemas, typed errors, stable torrent IDs, units and timestamp conventions.
 - [ ] Support listing torrents and reading status, file selection, mode application,
   verification, recovery and operation results.
-- [ ] Distinguish tracker-returned peers from currently connected peers, actual
+- [x] Distinguish tracker-returned peers from currently connected peers, actual
   counters from sent counters, and downloaded payload from verified completion.
 - [ ] Support add/preview, pause, resume, recheck, mode changes, repair settings and
   journal export through the same controller used by the UI.
-- [ ] Keep data deletion separate from removing a torrent from the application.
+- [x] Keep data deletion separate from removing a torrent from the application.
   Do not expose arbitrary shell commands as an automation shortcut.
-- [ ] Return acceptance separately from application: enqueueing a command must not
+- [x] Return acceptance separately from application: enqueueing a command must not
   be represented as successful completion or an active reporting policy.
 - [ ] Bound request sizes, result sizes, subscriptions and pagination. Let clients
   filter journals and peer lists without receiving an entire multi-hour history.
-- [ ] Expose only supported capabilities; do not advertise unimplemented settings
+- [x] Expose only supported capabilities; do not advertise unimplemented settings
   or invent successful values for unavailable data.
 
 Done when a client can complete the documented workflow using structured values,
@@ -369,16 +369,16 @@ without parsing UI labels, scraping screenshots, or inferring success from a tim
 
 - [ ] Return an operation ID for rechecks, recovery and other asynchronous work,
   with explicit queued, running, succeeded, failed and cancelled outcomes.
-- [ ] Provide progress, result lookup, deadlines and cancellation semantics. State
+- [x] Provide progress, result lookup, deadlines and cancellation semantics. State
   whether cancelling an observation also cancels the underlying operation.
-- [ ] Add idempotency keys bound to caller identity, command and normalized
+- [x] Add idempotency keys bound to caller identity, command and normalized
   arguments. Reject reuse with different arguments rather than repeating writes.
-- [ ] Use expected revisions or equivalent conflict checks for competing mutations.
+- [x] Use expected revisions or equivalent conflict checks for competing mutations.
 - [ ] Persist the operation records needed for reconnect/restart behavior, with
   bounded retention and explicit semantics for expired keys and interrupted work.
-- [ ] Do not automatically replay destructive or externally visible commands when
+- [x] Do not automatically replay destructive or externally visible commands when
   their previous result is unknown. Return a reconciliation-required outcome.
-- [ ] Keep the application's transfer lifecycle independent of a bridge process:
+- [x] Keep the application's transfer lifecycle independent of a bridge process:
   agent exit, pipe loss or MCP disconnect must not stop ongoing downloads.
 
 Done when connection loss and retries cannot silently duplicate mutations, and a
@@ -389,20 +389,20 @@ client can distinguish completion, failure, interruption and an unknown result.
 - [ ] Default attached agents to read-only access and require explicit grants for
   managing downloads, changing test/reporting policies, exporting data or deleting
   payload files. Treat experimental audit traffic as a separately granted capability.
-- [ ] Authenticate local clients and enforce authorization in the controller, not
+- [x] Authenticate local clients and enforce authorization in the controller, not
   solely in adapter descriptions or MCP tool annotations.
-- [ ] Require a real user approval for destructive actions through a trusted UI or
+- [x] Require a real user approval for destructive actions through a trusted UI or
   equivalent human-controlled channel. An agent-supplied `confirmed=true` is not
   consent; bind any approval to the exact operation and reject altered requests.
 - [ ] Restrict import, download and export paths, revalidate filesystem boundaries,
   and apply input/resource limits to every external entry point.
 - [ ] Redact passkeys, tokens and secret Tracker URL fields from agent responses,
   operation errors and logs. Use secret references rather than returning credentials.
-- [ ] Treat torrent names, filenames and tracker messages as untrusted data, not
+- [x] Treat torrent names, filenames and tracker messages as untrusted data, not
   instructions or authorization to invoke another tool.
 - [ ] Record agent mutations with authenticated client identity, operation/request
   IDs, authorization decision and confirmed outcome, without persisting secrets.
-- [ ] Make granted access visible and revocable in the application. Do not install
+- [x] Make granted access visible and revocable in the application. Do not install
   agent-host configuration or enable remote access without user approval.
 
 Done when denied actions have no side effects, destructive actions cannot bypass
@@ -411,7 +411,7 @@ untrusted tracker metadata as well as ordinary interactive use.
 
 ### AGENT 6 Package and verify the installed workflow
 
-- [ ] Distribute adapters with the application and document executable discovery,
+- [x] Distribute adapters with the application and document executable discovery,
   connection setup, protocol compatibility and access revocation.
 - [ ] Test an installed or packaged build in an isolated user profile, not only a
   development checkout with hardcoded repository paths.
@@ -421,7 +421,7 @@ untrusted tracker metadata as well as ordinary interactive use.
   malformed messages, oversized responses and path-boundary attacks.
 - [ ] Test bounded subscriptions and paged long-running diagnostics without memory
   growth caused by an agent that stops reading.
-- [ ] Verify CLI JSON/exit-code contracts and MCP discovery/schema behavior using
+- [x] Verify CLI JSON/exit-code contracts and MCP discovery/schema behavior using
   local deterministic fixtures, without contacting production trackers.
 - [ ] Add an end-to-end acceptance scenario: connect an agent to a running app,
   read state, perform an authorized operation, observe its confirmed result,
