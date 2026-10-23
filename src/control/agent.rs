@@ -730,7 +730,15 @@ impl AgentService {
                         id,
                         enabled: actual,
                     },
-                ) => id == target && (enabled == actual || *actual),
+                ) => {
+                    id == target
+                        && (enabled == actual
+                            || (*actual
+                                && control.torrents.iter().any(|torrent| {
+                                    torrent.info_hashes.join(";") == *target
+                                        && torrent.overrides.repair_policy.enabled
+                                })))
+                }
                 (
                     Method::Mutate {
                         command: TorrentCommand::SetRepairPolicy(policy),
@@ -738,6 +746,20 @@ impl AgentService {
                     },
                     SessionEvent::RepairPolicy { id, policy: actual },
                 ) => id == target && policy == actual,
+                (
+                    Method::Mutate {
+                        command: TorrentCommand::SetMode(config),
+                        ..
+                    },
+                    SessionEvent::Mode {
+                        id,
+                        application:
+                            crate::runtime_status::ModeApplication::Failed { requested, .. },
+                    },
+                ) if id == target && config == requested => {
+                    failure = true;
+                    true
+                }
                 (
                     Method::Mutate {
                         command: TorrentCommand::SetMode(config),
@@ -859,3 +881,6 @@ fn command_name(command: &TorrentCommand) -> &'static str {
         TorrentCommand::Remove => "remove",
     }
 }
+
+#[cfg(test)]
+mod tests;

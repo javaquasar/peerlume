@@ -459,3 +459,6 @@ pub async fn call(directory: &Path, request: &Request) -> Result<Response, Error
     .await
     .map_err(|_| ErrorCode::ReconciliationRequired)?
 }
+
+#[cfg(test)]
+mod tests;

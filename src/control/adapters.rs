@@ -311,3 +311,6 @@ pub fn mcp_main() -> u8 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

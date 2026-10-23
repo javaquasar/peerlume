@@ -1,0 +1,62 @@
+name: Coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-coverage:
+    name: Linux core and TUI coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: target/coverage-build
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install stable Rust and matching LLVM tools
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .tools/coverage
+            target/coverage-build
+          key: ${{ runner.os }}-coverage-0.9.1-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/coverage.yml') }}
+      - name: Install pinned coverage tool
+        shell: bash
+        run: |
+          if [ ! -x .tools/coverage/bin/cargo-llvm-cov ]; then
+            cargo +stable install cargo-llvm-cov --locked --version 0.9.1 --root .tools/coverage
+          fi
+          echo "$GITHUB_WORKSPACE/.tools/coverage/bin" >> "$GITHUB_PATH"
+      - name: Run instrumented core and TUI tests
+        run: |
+          mkdir -p coverage
+          cargo +stable llvm-cov --locked --no-default-features --features tui --all-targets -p peerlume -p librqbit-tracker-comms --json --summary-only --output-path coverage/summary.json
+      - name: Generate LCOV and HTML reports without rerunning tests
+        run: |
+          cargo +stable llvm-cov report --locked --no-default-features --features tui -p peerlume -p librqbit-tracker-comms --lcov --output-path coverage/lcov.info
+          cargo +stable llvm-cov report --locked --no-default-features --features tui -p peerlume -p librqbit-tracker-comms --html --output-dir coverage/html
+          jq -r '.data[0].totals | "Linux core/TUI line coverage: \(.lines.percent)%\nFunction coverage: \(.functions.percent)%"' coverage/summary.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload measured coverage reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-linux-core-tui
+          path: coverage/
+          if-no-files-found: error
+          retention-days: 14

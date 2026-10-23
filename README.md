@@ -234,6 +234,21 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+For the full local frontend/adapter matrix in one Windows build, use:
+
+```powershell
+cargo test --locked --all-features --all-targets -p peerlume -p librqbit-tracker-comms
+cargo clippy --locked --all-features --all-targets -- -D warnings
+```
+
+The control regressions cover every permission/command combination, wire and
+filesystem bounds, correlated engine acknowledgements, stale confirmations,
+deadlines, cancellation, revocation, operation ownership, SQLite rollback and
+corruption, streaming export, IPC backpressure/disconnection, and separate CLI/MCP
+processes in isolated profiles. Fixtures use synthetic local payloads, not
+production trackers or personal credentials. Property tests supplement named
+regressions; test counts are not a claim of exhaustive state-space coverage.
+
 ## GitHub Actions
 
 The [Tests workflow](https://github.com/javaquasar/peerlume/actions/workflows/ci.yml)
@@ -259,6 +274,15 @@ not use production trackers or private torrent credentials.
 Dependencies are resolved from `Cargo.lock`. Actions are pinned to commit hashes,
 workflow permissions are read-only, and superseded runs for the same branch or
 pull request are canceled. A failed matrix entry does not cancel other entries.
+
+The independent [Coverage workflow](https://github.com/javaquasar/peerlume/actions/workflows/coverage.yml)
+has the same push/PR/manual triggers. It runs instrumented Linux core/TUI tests
+using pinned `cargo-llvm-cov` 0.9.1 and publishes JSON, LCOV and HTML artifacts.
+The job summary reports measured line/function coverage. No percentage is claimed
+until measured and no unmeasured threshold is used to manufacture a passing gate.
+This report does not measure the Windows-only GUI code, Docker-only ignored
+tests, or documentation tests; the main Tests workflow continues to run those
+supported suites separately. The manual upstream UDP test remains ignored.
 
 ## Integration tests
 

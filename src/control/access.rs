@@ -98,3 +98,6 @@ fn is_link(metadata: &std::fs::Metadata) -> bool {
         metadata.file_type().is_symlink()
     }
 }
+
+#[cfg(test)]
+mod tests;

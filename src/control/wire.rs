@@ -162,3 +162,6 @@ pub fn encode_response(response: &Response) -> Vec<u8> {
     bytes.push(b'\n');
     bytes
 }
+
+#[cfg(test)]
+mod tests;

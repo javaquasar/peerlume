@@ -90,3 +90,6 @@ fn stream(
         .sync_all()
         .map_err(|_| ErrorCode::PersistenceUnavailable)
 }
+
+#[cfg(test)]
+mod tests;

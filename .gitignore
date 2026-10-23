@@ -2,3 +2,5 @@
 /fuzz/target
 /downloads
 /dist
+/coverage
+/.tools/coverage
