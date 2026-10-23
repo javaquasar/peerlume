@@ -38,7 +38,6 @@ use crate::{
     file_selection::FileSelectionModel,
     magnet::MagnetLink,
     metainfo::{self, TorrentMetainfo},
-    session::SessionCommand,
     settings::ClientSettings,
     state::{StoredTrackerAuditProfile, StoredTrackerAuditStep},
     torrent::{EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentState},
@@ -93,6 +92,7 @@ pub struct TuiApp {
     show_tracker_identity: bool,
     pending_verify_after_download: bool,
     pending_repair: crate::runtime_status::RepairPolicy,
+    agent_panel: crate::control::frontends::AccessPanel,
 }
 
 impl TuiApp {
@@ -148,6 +148,7 @@ impl TuiApp {
             show_tracker_identity: false,
             pending_verify_after_download: false,
             pending_repair: Default::default(),
+            agent_panel: Default::default(),
         }
     }
 
@@ -155,6 +156,9 @@ impl TuiApp {
         while let Some(notice) = self.control.poll_next() {
             match notice {
                 SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
+                    if !self.control.has_confirmed_update(&id) {
+                        continue;
+                    }
                     if let Err(error) = self
                         .control
                         .persist_confirmed_update(&id, self.tracker_audits.get(&id).cloned())
@@ -167,7 +171,10 @@ impl TuiApp {
                     self.status = format!("Transfer error: {message}");
                     self.push_log(format!("error {id}: {message}"));
                 }
-                SessionNotice::Removed { id } => self.push_log(format!("removed {id}")),
+                SessionNotice::Removed { id } => {
+                    self.tracker_audits.remove(&id);
+                    self.push_log(format!("removed {id}"));
+                }
                 SessionNotice::Stopped => self.push_log("transfer engine stopped"),
                 SessionNotice::None => {}
             }
@@ -206,6 +213,9 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press && self.agent_panel.key(&mut self.control, key.code) {
+            return;
+        }
         if key.kind == KeyEventKind::Press
             && key.code == KeyCode::F(4)
             && self.pending_add.is_some()
@@ -560,15 +570,13 @@ impl TuiApp {
         if self.control.torrents.is_empty() {
             return;
         }
-        let torrent = self.control.torrents.remove(self.selected_torrent);
+        let torrent = &self.control.torrents[self.selected_torrent];
         let id = torrent.info_hashes.join(";");
-        let _ = self
+        self.status = self
             .control
-            .backend
-            .send(SessionCommand::Remove { id: id.clone() });
-        let _ = self.control.backend.remove_torrent(&id);
-        self.tracker_audits.remove(&id);
-        self.status = format!("Removed {}; data kept", torrent.name);
+            .remove(&id)
+            .map(|_| "Removal queued; data will be kept".into())
+            .unwrap_or_else(|e| e.to_string());
         self.clamp_selection();
     }
 
@@ -812,15 +820,10 @@ impl TuiApp {
             return Err("Torrent is already added".into());
         }
         let audit = default_audit(total_size, self.settings.connection.listen_port);
-        self.control
-            .backend
-            .save_torrent(&torrent_to_record(&torrent, Some(audit.clone())))?;
-        self.control
-            .backend
-            .send(add_torrent_command(&torrent, &self.settings))?;
         let name = torrent.name.clone();
+        self.control
+            .add(torrent, &self.settings, Some(audit.clone()))?;
         self.tracker_audits.insert(id, audit);
-        self.control.torrents.push(torrent);
         self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
     }
@@ -849,16 +852,7 @@ impl TuiApp {
             is_private: false,
             overrides: TorrentOverrides::default(),
         };
-        let id = torrent.info_hashes.join(";");
-        self.control
-            .backend
-            .save_torrent(&torrent_to_record(&torrent, None))?;
-        let mut command = add_torrent_command(&torrent, &self.settings);
-        if let SessionCommand::AddTorrent { id: command_id, .. } = &mut command {
-            *command_id = id;
-        }
-        self.control.backend.send(command)?;
-        self.control.torrents.push(torrent);
+        self.control.add(torrent, &self.settings, None)?;
         self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
     }
@@ -1633,15 +1627,40 @@ impl Drop for TuiApp {
 }
 
 pub fn run() -> io::Result<()> {
+    crate::settings::configure_profile_from_args()?;
+    let directory = crate::settings::data_directory();
+    let _instance = crate::control::host::InstanceLock::acquire(&directory)?;
     let mut terminal = TerminalGuard::enter()?;
     let mut app = TuiApp::load();
-    while app.running {
-        app.poll();
-        terminal.terminal.draw(|frame| app.render(frame))?;
+    let download_root = PathBuf::from(&app.settings.download.download_directory);
+    app.control
+        .configure_agents(&directory, download_root)
+        .map_err(|e| io::Error::other(format!("Agent initialization failed: {e:?}")))?;
+    let owner = Arc::new(std::sync::Mutex::new(app));
+    let _host =
+        crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
+    loop {
+        {
+            let mut app = owner.lock().unwrap_or_else(|e| e.into_inner());
+            if !app.running {
+                break;
+            }
+            app.poll();
+            terminal.terminal.draw(|frame| {
+                if app.agent_panel.open {
+                    app.agent_panel.render(&app.control, frame);
+                } else {
+                    app.render(frame);
+                }
+            })?;
+        }
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
         {
-            app.handle_key(key);
+            owner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle_key(key);
         }
     }
     Ok(())
@@ -2387,7 +2406,8 @@ mod tests {
         assert_eq!(app.control.torrents[0].state, before);
         assert!(app.status.contains("queued: 0"));
         app.remove_selected();
-        assert!(app.control.torrents.is_empty());
+        assert_eq!(app.control.torrents.len(), 1);
+        assert!(app.status.contains("unavailable"));
     }
 
     #[test]

@@ -133,11 +133,15 @@ impl LiveFixture {
         while let Some(notice) = self.controller.poll_next() {
             match notice {
                 SessionNotice::SettingsApplied { id } => {
-                    self.controller.persist_confirmed_update(&id, None).unwrap();
+                    if self.controller.has_confirmed_update(&id) {
+                        self.controller.persist_confirmed_update(&id, None).unwrap();
+                    }
                     self.settings_applied += 1;
                 }
                 SessionNotice::StateApplied { id } => {
-                    self.controller.persist_confirmed_update(&id, None).unwrap();
+                    if self.controller.has_confirmed_update(&id) {
+                        self.controller.persist_confirmed_update(&id, None).unwrap();
+                    }
                 }
                 SessionNotice::Error { .. } => panic!("{notice:?}"),
                 _ => {}

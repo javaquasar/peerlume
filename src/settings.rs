@@ -617,10 +617,39 @@ impl LegacySettings {
 }
 
 pub fn data_directory() -> PathBuf {
+    if let Some(directory) = PROFILE_DIRECTORY.get() {
+        return directory.clone();
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("PeerLume")
+}
+
+static PROFILE_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Explicit installed-profile override, set once before starting application workers.
+pub fn configure_profile_from_args() -> io::Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--profile") {
+        let directory = args.get(index + 1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--profile requires a directory",
+            )
+        })?;
+        let path = PathBuf::from(directory);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Profile directory must be absolute",
+            ));
+        }
+        PROFILE_DIRECTORY
+            .set(path)
+            .map_err(|_| io::Error::other("Profile is already configured"))?;
+    }
+    Ok(())
 }
 
 fn settings_path() -> PathBuf {

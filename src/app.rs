@@ -382,6 +382,50 @@ pub struct PeerLumeApp {
     pending_trash: Option<TrashRequest>,
 }
 
+/// Synchronizes frontend transactions with the independent controller owner pump.
+/// The transfer engine and canonical models are never cloned for an adapter.
+pub struct HostedGui {
+    host: crate::control::host::Host,
+    owner: Arc<std::sync::Mutex<PeerLumeApp>>,
+    access: crate::control::frontends::AccessPanel,
+    _instance: crate::control::host::InstanceLock,
+}
+
+impl HostedGui {
+    pub fn start() -> std::io::Result<Self> {
+        let directory = crate::settings::data_directory();
+        let instance = crate::control::host::InstanceLock::acquire(&directory)?;
+        let mut app = PeerLumeApp::default();
+        let download_root = PathBuf::from(&app.settings.download.download_directory);
+        app.control
+            .configure_agents(&directory, download_root)
+            .map_err(|e| {
+                std::io::Error::other(format!("Agent control initialization failed: {e:?}"))
+            })?;
+        let owner = Arc::new(std::sync::Mutex::new(app));
+        let host =
+            crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
+        Ok(Self {
+            host,
+            owner,
+            access: Default::default(),
+            _instance: instance,
+        })
+    }
+}
+
+impl eframe::App for HostedGui {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let owner = Arc::clone(&self.owner);
+        let mut app = owner.lock().unwrap_or_else(|e| e.into_inner());
+        self.access.show(&mut app.control, ctx);
+        if let Some(error) = *self.host.error.lock().unwrap_or_else(|e| e.into_inner()) {
+            self.access.status = format!("IPC unavailable: {error:?}");
+        }
+        app.update(ctx, frame);
+    }
+}
+
 impl Default for PeerLumeApp {
     fn default() -> Self {
         let settings = ClientSettings::load();
@@ -476,6 +520,9 @@ impl PeerLumeApp {
         while let Some(notice) = self.control.poll_next() {
             match notice {
                 SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
+                    if !self.control.has_confirmed_update(&id) {
+                        continue;
+                    }
                     let audit = self
                         .tracker_audits
                         .get(&id)
@@ -498,6 +545,14 @@ impl PeerLumeApp {
                     self.add_status = format!("Transfer error: {message}");
                 }
                 SessionNotice::Removed { id } => {
+                    if !self
+                        .control
+                        .torrents
+                        .iter()
+                        .any(|torrent| torrent.info_hashes.join(";") == id)
+                    {
+                        self.tracker_audits.remove(&id);
+                    }
                     if self
                         .pending_trash
                         .as_ref()
@@ -758,14 +813,8 @@ impl PeerLumeApp {
                 }
                 if ui.button("Remove selected (keep data)").clicked() && !self.control.torrents.is_empty() {
                     let index = self.selected_torrent.min(self.control.torrents.len() - 1);
-                    let removed = self.control.torrents.remove(index);
-                    let id = removed.info_hashes.join(";");
-                    self.tracker_audits.remove(&id);
-                    let _ = self.control.backend.remove_torrent(&id);
-                    self.selected_torrent = self
-                        .selected_torrent
-                        .min(self.control.torrents.len().saturating_sub(1));
-                    self.add_status = format!("Removed {}; downloaded data was kept", removed.name);
+                    let id = self.control.torrents[index].info_hashes.join(";");
+                    self.add_status = self.control.remove(&id).map(|_|"Removal queued; data will be kept".into()).unwrap_or_else(|error|error.to_string());
                 }
                 if !self.add_status.is_empty() {
                     ui.label(&self.add_status);
@@ -979,7 +1028,7 @@ impl PeerLumeApp {
                     .display_name
                     .unwrap_or_else(|| "Magnet metadata".into());
                 let id = magnet.exact_topics.join(";");
-                self.control.torrents.push(TorrentItem {
+                let torrent = TorrentItem {
                     runtime: Default::default(),
                     completion: crate::completion::CompletionStatus::Pending,
                     name: name.clone(),
@@ -997,7 +1046,11 @@ impl PeerLumeApp {
                     state: TorrentState::Paused,
                     is_private: false,
                     overrides: Default::default(),
-                });
+                };
+                if let Err(error) = self.control.add(torrent, &self.settings, None) {
+                    self.add_status = error;
+                    return;
+                }
                 self.selected_torrent = self.control.torrents.len() - 1;
                 if let Some(torrent) = self.control.torrents.last() {
                     self.tracker_audits.insert(
@@ -1010,13 +1063,6 @@ impl PeerLumeApp {
                     );
                 }
                 self.add_status = format!("Added {name}; waiting for metadata exchange");
-                if let Some(torrent) = self.control.torrents.last() {
-                    let mut command = add_torrent_command(torrent, &self.settings);
-                    if let SessionCommand::AddTorrent { id: command_id, .. } = &mut command {
-                        *command_id = id;
-                    }
-                    let _ = self.control.backend.send(command);
-                }
                 self.magnet_input.clear();
             }
             Err(error) => self.add_status = error,
@@ -1274,7 +1320,7 @@ impl PeerLumeApp {
         } else {
             TorrentState::Paused
         };
-        self.control.torrents.push(TorrentItem {
+        let torrent = TorrentItem {
             runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
@@ -1305,24 +1351,17 @@ impl PeerLumeApp {
                 download_directory: Some(dialog.download_directory),
                 ..Default::default()
             },
-        });
-        self.selected_torrent = self.control.torrents.len() - 1;
-        if let Some(torrent) = self.control.torrents.last() {
-            let id = torrent.info_hashes.join(";");
-            self.tracker_audits.insert(id, tracker_audit);
-            let id = torrent.info_hashes.join(";");
-            if let Err(error) = self
-                .control
-                .backend
-                .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
-            {
-                self.add_status = format!("Added {name}; state save failed: {error}");
-            }
-            let _ = self
-                .control
-                .backend
-                .send(add_torrent_command(torrent, &self.settings));
+        };
+        let id = torrent.info_hashes.join(";");
+        if let Err(error) =
+            self.control
+                .add(torrent, &self.settings, Some(tracker_audit.to_stored()))
+        {
+            self.add_status = error;
+            return;
         }
+        self.tracker_audits.insert(id, tracker_audit);
+        self.selected_torrent = self.control.torrents.len() - 1;
         if start_observation {
             let torrent = self
                 .control

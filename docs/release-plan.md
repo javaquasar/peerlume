@@ -179,9 +179,10 @@ acceptance criteria are specified in `tracker-audit-scenarios.md`.
 
 ## Installed application agent control track
 
-Status: in progress; the AGENT 1 foundation and existing-torrent command gateway
-are implemented, but installed-agent
-access is not yet available. Decision recorded on 2026-10-23: implement agent
+Status: in progress; all six AGENT tracks now have implementation slices,
+including installed local CLI/MCP access. See the 2026-10-24 delivery evidence and
+remaining gates below, and [the installed control guide](agent-control.md).
+Decision recorded on 2026-10-23: implement agent
 control as an isolated internal module in this project. Do not publish the core as
 a library, create a standalone SDK, or require a crates.io release for this work.
 The library track remains a future roadmap, not a prerequisite or current delivery
@@ -289,7 +290,8 @@ pause/resume, mode/repair/verification/file acknowledgements and rechecking corr
 data without inventing new network downloads. Frontend integration tests exercise
 both successful and rejected dispatch rather than only mock engine events.
 
-Remaining AGENT 1 work: imports, removal, lifecycle ownership and other local
+Historical remaining work at the end of the 2026-10-23 slice (superseded in part
+by the 2026-10-24 delivery below): imports, removal, lifecycle ownership and other local
 frontend preferences/audit persistence still use transitional crate-local access.
 Authorization, durable command/result correlation, idempotency and coordinated
 restart handling must be implemented before external mutations are enabled.
@@ -441,6 +443,51 @@ editing, GUI click automation, unbounded output, or library publication.
 Keep AGENT identifiers stable and link completed checkboxes to implementation and
 test evidence. Add further requirements without replacing this internal-module
 decision with an implied library-publication requirement.
+
+### Installed control delivery, 2026-10-24
+
+The six AGENT sections above remain release acceptance gates, not a claim that
+every checkbox is closed by one delivery. Current implementation and limitations
+are documented in [Installed agent control](agent-control.md).
+
+- AGENT 1: independent owner pump, shared GUI/TUI/controller synchronization,
+  common ordinary add/remove and existing-torrent commands, bounded observer and
+  frontend notices, confirmation-gated persistence. Legacy preference/audit access
+  and full lifecycle extraction remain open.
+- AGENT 2: explicit session-only enablement, owner-profile lock before engine
+  creation, current-user Windows Named Pipe DACL / mode-0600 Unix socket,
+  `peerlume-control` and `peerlume-mcp`, instance/version discovery, no automatic
+  launch or second engine. Both adapters are tested from copied executables.
+- AGENT 3: typed version-1 request/response contract, discoverable input schema,
+  paged reads for torrents/files/journal/tracker peers and operation results,
+  confirmed vs actual/sent counters, authorized add/preview/manage/export. Unknown
+  capabilities and connected peer addresses are not fabricated. Archived paging
+  and a final complete response-schema publication remain open.
+- AGENT 4: durable bounded operation records, distinct queued/running/terminal
+  outcomes, per-client argument-bound idempotency, revision conflicts, deadlines,
+  safe cancellation before dispatch and reconciliation after restart/ambiguity.
+  Running-work cancellation and automatic safe retention remain open; capacity
+  exhaustion rejects new work rather than silently forgetting idempotency keys.
+- AGENT 5: hashed tokens, independent grants, controller-side authorization,
+  trusted GUI/TUI enable/grant/revoke/approval controls, bound remove/export
+  approvals, path checks, structurally redacted responses/exports and bounded
+  authenticated action/state audit. No agent-grant or approval bypass method,
+  remote listener, arbitrary shell or payload-deletion endpoint. Atomic
+  handle-relative path hardening and payload-deletion approval design stay open.
+- AGENT 6: copied CLI/MCP/profile integration tests, local real tracker/peer
+  download after IPC disconnect without UI polling, authorization/retry/restart/
+  export/property tests, and Windows development ZIP packaging in existing CI.
+  Full graphical frontend + agent E2E, signed installer integration and broader
+  hostile concurrent-filesystem testing remain open.
+
+Implementation: [controller](../src/control/mod.rs),
+[agent coordinator](../src/control/agent.rs), [local host](../src/control/host.rs),
+[adapters](../src/control/adapters.rs), [operation store](../src/control/operations.rs).
+Verification: [controller regressions](../src/control/agent_tests.rs),
+[real transfer after disconnect](../src/control/transfer_test.rs),
+[installed adapters](../tests/installed_adapters.rs). CI runs these through the
+existing all-target Windows/Linux matrix; passing CI does not close the explicit
+remaining release gates above. No library publication is part of this delivery.
 
 ## Library publication track
 

@@ -86,6 +86,21 @@ jobs:
         run: cargo +stable test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
       - name: Run documentation tests
         run: cargo +stable test --locked ${{ matrix.features }} --doc -p peerlume -p librqbit-tracker-comms
+      - name: Build installed Windows application and adapters
+        if: runner.os == 'Windows'
+        run: cargo +stable build --locked --all-features --bins
+      - name: Package tested Windows development build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Upload tested Windows development package
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: peerlume-windows-x64-development
+          path: dist/peerlume-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
 
   docker-tests:
     name: Docker tracker and peer integration tests

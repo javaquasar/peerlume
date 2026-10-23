@@ -1,6 +1,8 @@
-use peerlume::app::PeerLumeApp;
+use peerlume::app::HostedGui;
 
 fn main() -> eframe::Result<()> {
+    peerlume::settings::configure_profile_from_args()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
     if std::env::args().any(|argument| argument == "--update-blocklist") {
         let settings = peerlume::settings::ClientSettings::load();
         match peerlume::blocklist::download_and_cache(&settings.privacy.blocklist_url) {
@@ -25,6 +27,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "PeerLume",
         options,
-        Box::new(|_creation_context| Ok(Box::new(PeerLumeApp::default()))),
+        Box::new(|_creation_context| Ok(Box::new(HostedGui::start()?))),
     )
 }

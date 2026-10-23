@@ -526,7 +526,7 @@ impl SessionRuntime {
                                         emit_state_result(&event_tx, id, result, "downloading");
                                     }
                                     SessionCommand::Remove { id } => {
-                                        let result = if let Some(handle) = torrents.remove(&id) {
+                                        let result = if let Some(handle) = torrents.get(&id).cloned() {
                                             let final_sample = final_transfer_sampler(&handle, &counters);
                                             let result = session
                                                 .delete(handle.id().into(), false)
@@ -540,6 +540,7 @@ impl SessionRuntime {
                                         };
                                         let event = match result {
                                             Ok(()) => {
+                                                torrents.remove(&id);
                                                 checks.remove(&id);
                                                 checked_after_download.remove(&id);
                                                 check_failed.remove(&id);

@@ -6,7 +6,8 @@ use crate::{
 };
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModeConfig {
     pub mode: DownloadMode,
     pub freeze_after_bytes: u64,
@@ -69,7 +70,8 @@ impl ModeApplication {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepairPolicy {
     pub enabled: bool,
     pub max_attempts: u32,

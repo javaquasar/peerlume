@@ -17,7 +17,13 @@ use crate::{
 
 pub const COMMAND_ACCEPTED: &str = "Command queued; awaiting engine confirmation";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TorrentCommand {
     Pause,
     Resume,
@@ -26,6 +32,7 @@ pub enum TorrentCommand {
     SetRepairPolicy(RepairPolicy),
     SetVerifyAfterDownload(bool),
     SetFiles(Vec<usize>),
+    Remove,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +54,7 @@ pub enum CommandError {
     EngineUnavailable,
     QueueFull,
     EngineClosed,
+    OperationInProgress,
 }
 
 impl fmt::Display for CommandError {
@@ -61,6 +69,7 @@ impl fmt::Display for CommandError {
             Self::EngineUnavailable => "Transfer engine is unavailable",
             Self::QueueFull => "Transfer command queue is full; retry after refreshing",
             Self::EngineClosed => "Transfer engine command channel is closed",
+            Self::OperationInProgress => "An agent operation is awaiting confirmation",
         })
     }
 }
@@ -83,6 +92,7 @@ impl TorrentCommand {
             Self::Pause => SessionCommand::Pause { id },
             Self::Resume => SessionCommand::Resume { id },
             Self::Recheck => SessionCommand::Recheck { id },
+            Self::Remove => SessionCommand::Remove { id },
             Self::SetMode(config) => {
                 config
                     .mode
@@ -186,6 +196,13 @@ impl Controller {
             })
             .ok_or(CommandError::UnknownTorrent)?;
         self.reconcile();
+        if self
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.busy(&self.torrents[index].info_hashes.join(";")))
+        {
+            return Err(CommandError::OperationInProgress);
+        }
         let result = self.submit_registered_via(index, command, expected_revision, send);
         if result.is_ok() {
             self.publish();

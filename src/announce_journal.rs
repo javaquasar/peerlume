@@ -245,6 +245,20 @@ impl AnnounceJournal {
             .clone()
     }
     /// Streams the complete disk journal, not just the in-memory tail. Never overwrites a file.
+    pub(crate) fn disk_snapshot(&self) -> Result<(File, u64), String> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.error.is_some() {
+            return Err("Disk journal is incomplete".into());
+        }
+        let path = inner.path.as_ref().ok_or("No disk journal is available")?;
+        let file = File::open(path).map_err(|_| "Disk journal is unavailable")?;
+        let length = file
+            .metadata()
+            .map_err(|_| "Disk journal is unavailable")?
+            .len();
+        Ok((file, length))
+    }
+
     pub fn export(&self, destination: &Path, hash: Option<&str>) -> Result<u64, String> {
         let (path, length, error) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

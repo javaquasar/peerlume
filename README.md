@@ -317,15 +317,15 @@ covers all six automation capabilities as an isolated internal module: shared
 controller, local IPC and CLI/MCP adapters, machine-readable contracts, reliable
 operations, permissions and approvals, and installed-workflow verification.
 This work does not require publishing the core as a library.
-The first foundation is implemented in `src/control/`: both frontends delegate
-session-event reduction to one controller, with bounded, revisioned in-process
-read observations. Installed-agent IPC, CLI/MCP and external mutations are not yet
-available; the roadmap tracks the remaining command/lifecycle and security work.
-Existing-torrent actions now share a typed controller command gateway with
-optional revision checks. Both UIs distinguish queue acceptance from engine
-confirmation; file selection and verification settings are saved only after
-acknowledgement. Imports/removal, background ownership and external authorization
-remain separate roadmap items.
+The implementation in `src/control/` now includes local-only IPC, installed JSON
+CLI and MCP stdio adapters, independent event pumping, authenticated grants,
+revision checks, durable operation/idempotency records and exact-operation user
+approvals. Both frontends expose trusted access controls (egui Agent access, TUI
+F8). Access starts disabled and new tokens default to read-only. Ordinary add and
+remove-with-data-kept paths share the controller gateway; acceptance is not engine
+confirmation. See [Installed agent control](docs/agent-control.md) for setup,
+protocol/schema discovery, resource limits, testing and the remaining hardening
+gates. No external payload deletion or arbitrary shell operation is exposed.
 Confirmed Pause/Resume updates are also checkpointed: a restarted application
 restores paused or active-transfer intent without resetting the reporting mode.
 Queued requests are not treated as confirmed state, and restored payload is
