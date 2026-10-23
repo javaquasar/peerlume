@@ -10,7 +10,7 @@ PeerLume must treat the `private=1` flag as a mandatory protocol constraint.
 - Never place the private torrent info hash into DHT or local discovery.
 - Treat credentials embedded in tracker URLs as secrets.
 - Redact passkeys, query tokens, and authorization data from logs, metrics, errors, and UI.
-- Send accurate `uploaded`, `downloaded`, and `left` counters when announcing.
+- Send accurate `uploaded`, `downloaded`, and `left` counters in the default Normal download mode.
 - Support `started`, `completed`, and `stopped` tracker events.
 
 ## Reporting modes
@@ -21,13 +21,17 @@ PeerLume must treat the `private=1` flag as a mandatory protocol constraint.
 means no peer discovery and therefore no download unless peers are supplied through
 an explicitly authorized private deployment mechanism.
 
-Arbitrary or falsified counters are not part of the production client.
+Each `.torrent` add dialog also offers two explicit test download modes:
+`no_progress` and `upload_ratio_1_5`. Unlike standalone audit scenarios, these
+modes keep actual peer transfer running and change outgoing announce metrics.
+See the download-mode table in `tracker-audit-scenarios.md`.
 
 ## Testability
 
 Tracker communication should be behind a `TrackerClient` trait. Tests may use a mock
-implementation or a tracker bound to loopback. Synthetic counter values must only be
-accepted by test-only code and must never be sent to a non-loopback endpoint.
+implementation or a tracker bound to loopback. The automated download-mode tests
+use local trackers and peers, verify downloaded file contents, and inspect actual
+HTTP and UDP announce messages independently of the local transfer counters.
 
 Suggested counter rules:
 

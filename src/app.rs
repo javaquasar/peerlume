@@ -1,45 +1,43 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
 
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
+    client::{
+        ClientBackend, SessionNotice, add_torrent_command, apply_session_event,
+        torrent_from_record, torrent_to_record,
+    },
+    download_mode::DownloadMode,
     engine::EngineRuntime,
     file_selection::{FileSelectionModel, FileTreeRow},
     metainfo::{self, TorrentMetainfo},
     preferences::{self, PreferencesActions, PreferencesTab, PrivacyRuntime},
-    session::{SessionCommand, SessionEvent, SessionRuntime},
-    settings::{ClientSettings, TrackerReportingMode, data_directory},
-    state::{StateStore, StoredFile, TorrentRecord},
+    session::SessionCommand,
+    settings::ClientSettings,
+    state::{StoredTrackerAuditProfile, StoredTrackerAuditStep, TorrentRecord},
     torrent::{
         EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentPriority, TorrentState,
     },
+    tracker::{
+        AnnounceEvent, AnnounceRequest, announce_for_audit, compact_ipv4_peers,
+        parse_info_hash_hex, validate_audit_target,
+    },
+    tracker_behavior::BehaviorCatalog,
+    ui_schema::{MainPage, TorrentDetailsTab as DetailsTab},
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MainPage {
-    Torrents,
-    Settings,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DetailsTab {
-    Files,
-    Info,
-    Settings,
-    Peers,
-    Trackers,
-    Pieces,
-    Log,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterAction {
@@ -86,7 +84,238 @@ struct TrashRequest {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+struct TrackerAuditExchange {
+    timestamp_unix_ms: u128,
+    step_index: usize,
+    tracker_host: String,
+    info_hash_hex: String,
+    peer_id: String,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<AnnounceEvent>,
+    interval_seconds: Option<u64>,
+    peers: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TrackerAuditStep {
+    delay_seconds: u64,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<AnnounceEvent>,
+}
+
+struct TrackerAuditRun {
+    receiver: Receiver<TrackerAuditWorkerEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for TrackerAuditRun {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+enum TrackerAuditWorkerEvent {
+    Exchange(TrackerAuditExchange),
+    ObservationStarted(u64),
+    Finished,
+    Cancelled,
+}
+
+struct TorrentTrackerAudit {
+    tracker_url: String,
+    allowed_host: String,
+    port: u16,
+    started_only: bool,
+    observation_seconds: u64,
+    steps: Vec<TrackerAuditStep>,
+    exchanges: Vec<TrackerAuditExchange>,
+    status: String,
+    run: Option<TrackerAuditRun>,
+}
+
+impl TorrentTrackerAudit {
+    fn new(tracker_url: String, total_size: u64, port: u16) -> Self {
+        Self {
+            tracker_url,
+            allowed_host: String::new(),
+            port,
+            started_only: false,
+            observation_seconds: 14_400,
+            steps: vec![TrackerAuditStep {
+                delay_seconds: 0,
+                uploaded: 0,
+                downloaded: 0,
+                left: total_size,
+                event: Some(AnnounceEvent::Started),
+            }],
+            exchanges: Vec::new(),
+            status: String::new(),
+            run: None,
+        }
+    }
+
+    fn from_stored(
+        tracker_url: String,
+        total_size: u64,
+        fallback_port: u16,
+        stored: Option<&StoredTrackerAuditProfile>,
+    ) -> Self {
+        let Some(stored) = stored else {
+            return Self::new(tracker_url, total_size, fallback_port);
+        };
+        let mut steps: Vec<_> = stored
+            .steps
+            .iter()
+            .map(|step| TrackerAuditStep {
+                delay_seconds: step.delay_seconds,
+                uploaded: step.uploaded,
+                downloaded: step.downloaded,
+                left: step.left,
+                event: audit_event_from_storage(step.event.as_deref()),
+            })
+            .collect();
+        if steps.is_empty() {
+            steps.push(TrackerAuditStep {
+                delay_seconds: 0,
+                uploaded: 0,
+                downloaded: 0,
+                left: total_size,
+                event: Some(AnnounceEvent::Started),
+            });
+        }
+        Self {
+            tracker_url,
+            allowed_host: stored.allowed_host.clone(),
+            port: stored.port,
+            started_only: stored.started_only,
+            observation_seconds: stored.observation_seconds,
+            steps,
+            exchanges: Vec::new(),
+            status: String::new(),
+            run: None,
+        }
+    }
+
+    fn to_stored(&self) -> StoredTrackerAuditProfile {
+        StoredTrackerAuditProfile {
+            allowed_host: self.allowed_host.clone(),
+            port: self.port,
+            started_only: self.started_only,
+            observation_seconds: self.observation_seconds,
+            steps: self
+                .steps
+                .iter()
+                .map(|step| StoredTrackerAuditStep {
+                    delay_seconds: step.delay_seconds,
+                    uploaded: step.uploaded,
+                    downloaded: step.downloaded,
+                    left: step.left,
+                    event: step.event.map(audit_event_storage).map(str::to_owned),
+                })
+                .collect(),
+        }
+    }
+}
+
+struct AddTrackerAudit {
+    tracker_url: String,
+    allowed_host: String,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    port: u16,
+    event: Option<AnnounceEvent>,
+    started_only: bool,
+    observation_seconds: u64,
+    status: String,
+    peers: Vec<String>,
+    exchanges: Vec<TrackerAuditExchange>,
+    pending: Option<Receiver<TrackerAuditExchange>>,
+    preset_steps: Vec<TrackerAuditStep>,
+}
+
+impl AddTrackerAudit {
+    fn new(tracker_url: String, total_size: u64, port: u16) -> Self {
+        Self {
+            tracker_url,
+            allowed_host: String::new(),
+            uploaded: 0,
+            downloaded: 0,
+            left: total_size,
+            port,
+            event: Some(AnnounceEvent::Started),
+            started_only: false,
+            observation_seconds: 14_400,
+            status: String::new(),
+            peers: Vec::new(),
+            exchanges: Vec::new(),
+            pending: None,
+            preset_steps: Vec::new(),
+        }
+    }
+
+    fn to_profile(&self) -> TorrentTrackerAudit {
+        let mut steps = self.preset_steps.clone();
+        let first = TrackerAuditStep {
+            delay_seconds: steps.first().map_or(0, |step| step.delay_seconds),
+            uploaded: self.uploaded,
+            downloaded: self.downloaded,
+            left: self.left,
+            event: self.event,
+        };
+        if steps.is_empty() {
+            steps.push(first);
+        } else {
+            steps[0] = first;
+        }
+        TorrentTrackerAudit {
+            tracker_url: self.tracker_url.clone(),
+            allowed_host: self.allowed_host.clone(),
+            port: self.port,
+            started_only: self.started_only,
+            observation_seconds: self.observation_seconds,
+            steps,
+            exchanges: self.exchanges.clone(),
+            status: String::new(),
+            run: None,
+        }
+    }
+
+    fn apply_preset(&mut self, profile: &StoredTrackerAuditProfile) {
+        let resolved = TorrentTrackerAudit::from_stored(
+            self.tracker_url.clone(),
+            self.left,
+            self.port,
+            Some(profile),
+        );
+        self.allowed_host = resolved.allowed_host;
+        self.port = resolved.port;
+        self.started_only = resolved.started_only;
+        self.observation_seconds = resolved.observation_seconds;
+        self.preset_steps = resolved.steps;
+        if let Some(first) = self.preset_steps.first() {
+            self.uploaded = first.uploaded;
+            self.downloaded = first.downloaded;
+            self.left = first.left;
+            self.event = first.event;
+        }
+        self.status = format!(
+            "Loaded external profile: {} step(s)",
+            self.preset_steps.len()
+        );
+    }
+}
+
 struct AddTorrentDialog {
+    download_mode: DownloadMode,
+    freeze_after_bytes: u64,
     source_path: PathBuf,
     name: String,
     is_private: bool,
@@ -94,26 +323,38 @@ struct AddTorrentDialog {
     info_hash_v2_hex: Option<String>,
     total_size: u64,
     files: FileSelectionModel,
-    trackers_text: String,
     peer_id: String,
     download_directory: String,
     start_immediately: bool,
+    tracker_audit: AddTrackerAudit,
     error: String,
 }
 
 impl AddTorrentDialog {
-    fn new(source_path: PathBuf, metainfo: TorrentMetainfo, settings: &ClientSettings) -> Self {
+    fn new(
+        source_path: PathBuf,
+        metainfo: TorrentMetainfo,
+        settings: &ClientSettings,
+        download_directory: String,
+    ) -> Self {
         let total_size = metainfo.total_size();
         let mut files = FileSelectionModel::from_metainfo_files(metainfo.files);
         if !settings.download.select_all_files {
             files.select_all(false);
         }
+        let audit_tracker_url = metainfo.trackers.first().cloned().unwrap_or_default();
         Self {
             source_path,
-            trackers_text: metainfo.trackers.join("\n"),
+            download_mode: DownloadMode::Normal,
+            freeze_after_bytes: crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES,
             peer_id: metainfo::generate_peer_id(&settings.bittorrent.peer_id_prefix),
-            download_directory: settings.download.download_directory.clone(),
+            download_directory,
             start_immediately: settings.download.start_when_added,
+            tracker_audit: AddTrackerAudit::new(
+                audit_tracker_url,
+                total_size,
+                settings.connection.listen_port,
+            ),
             name: metainfo.name,
             is_private: metainfo.is_private,
             info_hash_v1_hex: metainfo.info_hash_v1_hex,
@@ -143,11 +384,13 @@ pub struct PeerLumeApp {
     blocklist_probe: String,
     blocklist_probe_result: String,
     add_dialog: Option<AddTorrentDialog>,
+    last_download_directory: Option<String>,
     pending_torrent_paths: VecDeque<PathBuf>,
     add_status: String,
     magnet_input: String,
-    state_store: Option<StateStore>,
-    session_runtime: Option<SessionRuntime>,
+    backend: ClientBackend,
+    tracker_audits: HashMap<String, TorrentTrackerAudit>,
+    behavior_catalog: Result<BehaviorCatalog, String>,
     trash_confirmation: Option<TrashRequest>,
     pending_trash: Option<TrashRequest>,
 }
@@ -172,21 +415,32 @@ impl Default for PeerLumeApp {
         let auto_update =
             settings.privacy.blocklist_enabled && settings.privacy.blocklist_auto_update;
         let update_url = settings.privacy.blocklist_url.clone();
-        let state_store = StateStore::open(&data_directory().join("state.sqlite3")).ok();
-        let session_runtime = SessionRuntime::start(
-            256,
-            PathBuf::from(&settings.download.download_directory),
-            settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
-        )
-        .ok();
-        let restored_torrents: Vec<_> = state_store
-            .as_ref()
-            .and_then(|store| store.load_all_torrents().ok())
-            .unwrap_or_default()
+        let backend = ClientBackend::start(&settings);
+        let restored_records = backend.load_torrents().unwrap_or_default();
+        let tracker_audits = restored_records
+            .iter()
+            .map(|record| {
+                let total_size = record
+                    .files
+                    .iter()
+                    .filter(|file| file.selected)
+                    .map(|file| file.size_bytes)
+                    .sum();
+                (
+                    record.id.clone(),
+                    TorrentTrackerAudit::from_stored(
+                        record.trackers.first().cloned().unwrap_or_default(),
+                        total_size,
+                        settings.connection.listen_port,
+                        record.tracker_audit.as_ref(),
+                    ),
+                )
+            })
+            .collect();
+        let torrents = restored_records
             .into_iter()
             .map(|record| torrent_from_record(record, &settings))
             .collect();
-        let torrents = restored_torrents;
 
         let mut app = Self {
             page: MainPage::Torrents,
@@ -206,21 +460,23 @@ impl Default for PeerLumeApp {
             blocklist_probe: "127.0.0.1".into(),
             blocklist_probe_result: String::new(),
             add_dialog: None,
+            last_download_directory: None,
             pending_torrent_paths: VecDeque::new(),
             add_status: String::new(),
             magnet_input: String::new(),
-            state_store,
-            session_runtime,
+            backend,
+            tracker_audits,
+            behavior_catalog: BehaviorCatalog::load(),
             trash_confirmation: None,
             pending_trash: None,
         };
         if auto_update {
             app.start_blocklist_update(update_url);
         }
-        if let Some(runtime) = &app.session_runtime {
-            for torrent in &app.torrents {
-                let _ = runtime.try_send(session_add_command(torrent, &app.settings));
-            }
+        for torrent in &app.torrents {
+            let _ = app
+                .backend
+                .send(add_torrent_command(torrent, &app.settings));
         }
         app
     }
@@ -229,63 +485,13 @@ impl Default for PeerLumeApp {
 impl PeerLumeApp {
     fn poll_session_events(&mut self) {
         loop {
-            let event = self
-                .session_runtime
-                .as_ref()
-                .and_then(SessionRuntime::try_recv);
+            let event = self.backend.try_recv();
             let Some(event) = event else { break };
-            match event {
-                SessionEvent::Added { id } => {
-                    if let Some(torrent) = self.find_torrent_mut(&id)
-                        && torrent.state == TorrentState::WaitingForEngine
-                    {
-                        torrent.state = TorrentState::Downloading;
-                    }
+            match apply_session_event(&mut self.torrents, event) {
+                SessionNotice::Added { .. } => {
                     self.add_status = "Transfer engine started the torrent".into();
                 }
-                SessionEvent::StateChanged { id, state } => {
-                    if let Some(torrent) = self.find_torrent_mut(&id) {
-                        torrent.state = if state == "paused" {
-                            TorrentState::Paused
-                        } else {
-                            TorrentState::Downloading
-                        };
-                    }
-                }
-                SessionEvent::Stats {
-                    id,
-                    downloaded_bytes,
-                    uploaded_bytes,
-                    download_rate,
-                    upload_rate,
-                    file_progress,
-                    peers,
-                    finished,
-                    paused,
-                } => {
-                    if let Some(torrent) = self.find_torrent_mut(&id) {
-                        for (index, progress) in file_progress.into_iter().enumerate() {
-                            torrent.files.set_file_downloaded(index, progress);
-                        }
-                        torrent.downloaded_bytes = if torrent.files.files().is_empty() {
-                            downloaded_bytes
-                        } else {
-                            torrent.files.selected_downloaded()
-                        };
-                        torrent.uploaded_bytes = uploaded_bytes;
-                        torrent.download_rate = download_rate;
-                        torrent.upload_rate = upload_rate;
-                        torrent.peers = peers;
-                        torrent.state = if finished {
-                            TorrentState::Seeding
-                        } else if paused {
-                            TorrentState::Paused
-                        } else {
-                            TorrentState::Downloading
-                        };
-                    }
-                }
-                SessionEvent::Error { id, message } => {
+                SessionNotice::Error { id, message } => {
                     if self
                         .pending_trash
                         .as_ref()
@@ -293,16 +499,9 @@ impl PeerLumeApp {
                     {
                         self.pending_trash = None;
                     }
-                    if !id.is_empty()
-                        && let Some(torrent) = self.find_torrent_mut(&id)
-                    {
-                        torrent.state = TorrentState::Error;
-                        torrent.download_rate = 0;
-                        torrent.upload_rate = 0;
-                    }
                     self.add_status = format!("Transfer error: {message}");
                 }
-                SessionEvent::Removed { id } => {
+                SessionNotice::Removed { id } => {
                     if self
                         .pending_trash
                         .as_ref()
@@ -311,17 +510,12 @@ impl PeerLumeApp {
                         self.complete_trash_request();
                     }
                 }
-                SessionEvent::Stopped => {
+                SessionNotice::Stopped => {
                     self.add_status = "Transfer engine stopped".into();
                 }
+                SessionNotice::None => {}
             }
         }
-    }
-
-    fn find_torrent_mut(&mut self, id: &str) -> Option<&mut TorrentItem> {
-        self.torrents.iter_mut().find(|torrent| {
-            torrent.info_hashes.join(";") == id || torrent.info_hashes.contains(&id.to_owned())
-        })
     }
 
     fn complete_trash_request(&mut self) {
@@ -340,13 +534,12 @@ impl PeerLumeApp {
                 .position(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
             {
                 self.torrents.remove(index);
+                self.tracker_audits.remove(&request.torrent_id);
                 self.selected_torrent = self
                     .selected_torrent
                     .min(self.torrents.len().saturating_sub(1));
             }
-            if let Some(store) = &self.state_store {
-                let _ = store.remove_torrent(&request.torrent_id);
-            }
+            let _ = self.backend.remove_torrent(&request.torrent_id);
         } else if let Some(index) = self
             .torrents
             .iter()
@@ -364,14 +557,12 @@ impl PeerLumeApp {
                 torrent.peers = 0;
                 torrent.seeds = 0;
                 torrent.state = TorrentState::Paused;
-                session_add_command(torrent, &self.settings)
+                add_torrent_command(torrent, &self.settings)
             };
-            if let Some(runtime) = &self.session_runtime {
-                let _ = runtime.try_send(command);
-            }
-            if let (Some(store), Some(torrent)) = (&mut self.state_store, self.torrents.get(index))
-            {
-                let _ = store.save_torrent(&torrent_record(torrent));
+            let _ = self.backend.send(command);
+            if let Some(torrent) = self.torrents.get(index) {
+                let audit = self.tracker_audits.get(&request.torrent_id);
+                let _ = self.backend.save_torrent(&torrent_record(torrent, audit));
             }
         }
         self.add_status = format!(
@@ -452,11 +643,11 @@ impl PeerLumeApp {
             .trash_confirmation
             .take()
             .expect("trash confirmation exists");
-        let Some(runtime) = &self.session_runtime else {
+        if !self.backend.session_available() {
             self.add_status = "Transfer engine is unavailable; nothing was deleted".into();
             return;
-        };
-        match runtime.try_send(SessionCommand::Remove {
+        }
+        match self.backend.send(SessionCommand::Remove {
             id: request.torrent_id.clone(),
         }) {
             Ok(()) => {
@@ -516,8 +707,16 @@ impl PeerLumeApp {
             ui.horizontal(|ui| {
                 ui.heading("PeerLume");
                 ui.separator();
-                ui.selectable_value(&mut self.page, MainPage::Torrents, "Torrents");
-                ui.selectable_value(&mut self.page, MainPage::Settings, "Preferences");
+                ui.selectable_value(
+                    &mut self.page,
+                    MainPage::Torrents,
+                    MainPage::Torrents.label(),
+                );
+                ui.selectable_value(
+                    &mut self.page,
+                    MainPage::Preferences,
+                    MainPage::Preferences.label(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let active = self
                         .torrents
@@ -551,11 +750,9 @@ impl PeerLumeApp {
                             TorrentState::Downloading | TorrentState::WaitingForEngine
                         ) {
                             torrent.state = TorrentState::Paused;
-                            if let Some(runtime) = &self.session_runtime {
-                                let _ = runtime.try_send(SessionCommand::Pause {
-                                    id: torrent.info_hashes.join(";"),
-                                });
-                            }
+                            let _ = self.backend.send(SessionCommand::Pause {
+                                id: torrent.info_hashes.join(";"),
+                            });
                         }
                     }
                 }
@@ -565,11 +762,9 @@ impl PeerLumeApp {
                             torrent.state = TorrentState::WaitingForEngine;
                             torrent.download_rate = 0;
                             torrent.upload_rate = 0;
-                            if let Some(runtime) = &self.session_runtime {
-                                let _ = runtime.try_send(SessionCommand::Resume {
-                                    id: torrent.info_hashes.join(";"),
-                                });
-                            }
+                            let _ = self.backend.send(SessionCommand::Resume {
+                                id: torrent.info_hashes.join(";"),
+                            });
                         }
                     }
                 }
@@ -577,9 +772,8 @@ impl PeerLumeApp {
                     let index = self.selected_torrent.min(self.torrents.len() - 1);
                     let removed = self.torrents.remove(index);
                     let id = removed.info_hashes.join(";");
-                    if let Some(store) = &self.state_store {
-                        let _ = store.remove_torrent(&id);
-                    }
+                    self.tracker_audits.remove(&id);
+                    let _ = self.backend.remove_torrent(&id);
                     self.selected_torrent = self
                         .selected_torrent
                         .min(self.torrents.len().saturating_sub(1));
@@ -740,7 +934,16 @@ impl PeerLumeApp {
         }
         match TorrentMetainfo::load(&path) {
             Ok(metainfo) => {
-                self.add_dialog = Some(AddTorrentDialog::new(path, metainfo, &self.settings));
+                let download_directory = self
+                    .last_download_directory
+                    .clone()
+                    .unwrap_or_else(|| self.settings.download.download_directory.clone());
+                self.add_dialog = Some(AddTorrentDialog::new(
+                    path,
+                    metainfo,
+                    &self.settings,
+                    download_directory,
+                ));
                 self.add_status.clear();
             }
             Err(error) => self.add_status = format!("Could not open torrent: {error}"),
@@ -799,15 +1002,23 @@ impl PeerLumeApp {
                     overrides: Default::default(),
                 });
                 self.selected_torrent = self.torrents.len() - 1;
+                if let Some(torrent) = self.torrents.last() {
+                    self.tracker_audits.insert(
+                        id.clone(),
+                        TorrentTrackerAudit::new(
+                            torrent.trackers.first().cloned().unwrap_or_default(),
+                            torrent.selected_size(),
+                            self.settings.connection.listen_port,
+                        ),
+                    );
+                }
                 self.add_status = format!("Added {name}; waiting for metadata exchange");
-                if let (Some(runtime), Some(torrent)) =
-                    (&self.session_runtime, self.torrents.last())
-                {
-                    let mut command = session_add_command(torrent, &self.settings);
+                if let Some(torrent) = self.torrents.last() {
+                    let mut command = add_torrent_command(torrent, &self.settings);
                     if let SessionCommand::AddTorrent { id: command_id, .. } = &mut command {
                         *command_id = id;
                     }
-                    let _ = runtime.try_send(command);
+                    let _ = self.backend.send(command);
                 }
                 self.magnet_input.clear();
             }
@@ -816,9 +1027,11 @@ impl PeerLumeApp {
     }
 
     fn show_add_torrent_dialog(&mut self, ctx: &egui::Context) {
+        let mut picked_download_directory = None;
         let Some(dialog) = self.add_dialog.as_mut() else {
             return;
         };
+        poll_tracker_audit(dialog);
         let mut add = false;
         let mut cancel = false;
         let peer_prefix = self.settings.bittorrent.peer_id_prefix.clone();
@@ -863,6 +1076,42 @@ impl PeerLumeApp {
                     });
 
                 ui.separator();
+                ui.heading("Download mode");
+                let modes = self.behavior_catalog.as_ref().map(|catalog| catalog.download_modes.as_slice())
+                    .unwrap_or(&DownloadMode::ALL);
+                let previous_mode = dialog.download_mode;
+                egui::ComboBox::from_id_salt("add_download_mode")
+                    .selected_text(dialog.download_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in modes {
+                            ui.selectable_value(&mut dialog.download_mode, *mode, mode.label());
+                        }
+                    });
+                ui.label(dialog.download_mode.description());
+                if dialog.download_mode == DownloadMode::FreezeAfter {
+                    ui.horizontal(|ui| {
+                        ui.label("Freeze after received bytes");
+                        ui.add(egui::DragValue::new(&mut dialog.freeze_after_bytes).range(1..=i64::MAX as u64));
+                    });
+                }
+                if dialog.download_mode != previous_mode && dialog.download_mode != DownloadMode::Normal {
+                    if dialog.tracker_audit.started_only {
+                        dialog.start_immediately = self.settings.download.start_when_added;
+                    }
+                    dialog.tracker_audit.started_only = false;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Tracker URL");
+                    ui.add(egui::TextEdit::singleline(&mut dialog.tracker_audit.tracker_url).desired_width(560.0));
+                });
+                show_tracker_account_identity(ui, &dialog.tracker_audit.tracker_url);
+                if dialog.download_mode == DownloadMode::Normal {
+                    ui.collapsing("Advanced tracker audit", |ui| {
+                        show_tracker_audit(ui, dialog, &mut self.behavior_catalog);
+                    });
+                }
+
+                ui.separator();
                 ui.heading("Download location");
                 ui.horizontal(|ui| {
                     ui.add(
@@ -874,7 +1123,9 @@ impl PeerLumeApp {
                             .set_directory(&dialog.download_directory)
                             .pick_folder()
                     {
-                        dialog.download_directory = path.display().to_string();
+                        let directory = path.display().to_string();
+                        dialog.download_directory = directory.clone();
+                        picked_download_directory = Some(directory);
                     }
                 });
                 ui.label("Files from this torrent will be written under this directory.");
@@ -931,27 +1182,40 @@ impl PeerLumeApp {
                 }
 
                 ui.separator();
-                ui.heading("Identity and trackers");
+                ui.heading("Identity");
                 ui.label(
-                    "The info hash identifies the content and cannot be changed. Peer ID belongs to this client session.",
+                    "The info hash identifies the content and cannot be changed. The editable Peer ID below is used by tracker audit requests.",
                 );
                 ui.horizontal(|ui| {
-                    ui.label("Peer ID");
-                    ui.monospace(&dialog.peer_id);
+                    ui.label("Audit Peer ID");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.peer_id)
+                            .desired_width(240.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
                     if ui.button("Generate another").clicked() {
                         dialog.peer_id = metainfo::generate_peer_id(&peer_prefix);
                     }
+                    ui.label(format!("{}/20 bytes", dialog.peer_id.len()));
                 });
-                ui.text_edit_singleline(&mut dialog.peer_id);
                 ui.label(
-                    "Tracker URLs may contain another user's passkey. Review, replace, or remove those URLs before adding.",
+                    "The normal transfer backend uses its own session-wide Peer ID; changing the audit ID does not change production peer connections.",
                 );
-                ui.add(
-                    egui::TextEdit::multiline(&mut dialog.trackers_text)
-                        .desired_rows(4)
-                        .hint_text("One tracker URL per line"),
+                ui.label(
+                    "The Tracker URL above is attached to this download.",
                 );
-                ui.checkbox(&mut dialog.start_immediately, "Start after adding");
+                if dialog.tracker_audit.started_only {
+                    dialog.start_immediately = false;
+                }
+                ui.add_enabled(
+                    !dialog.tracker_audit.started_only,
+                    egui::Checkbox::new(&mut dialog.start_immediately, "Start after adding"),
+                );
+                if dialog.tracker_audit.started_only {
+                    ui.label(
+                        "Normal transfer starts paused so the staging tracker receives only the single audit announce.",
+                    );
+                }
                 if dialog.is_private {
                     ui.label("Private torrent: DHT, PEX and LSD will remain disabled.");
                 }
@@ -969,6 +1233,10 @@ impl PeerLumeApp {
                 });
                     });
             });
+
+        if let Some(directory) = picked_download_directory {
+            self.last_download_directory = Some(directory);
+        }
 
         if cancel || modal.should_close() {
             self.add_dialog = None;
@@ -993,6 +1261,9 @@ impl PeerLumeApp {
             }
         };
         let dialog = self.add_dialog.take().expect("dialog exists");
+        self.last_download_directory = Some(dialog.download_directory.clone());
+        let tracker_audit = dialog.tracker_audit.to_profile();
+        let start_observation = tracker_audit.started_only;
         let name = dialog.name.clone();
         let state = if dialog.start_immediately {
             TorrentState::WaitingForEngine
@@ -1021,22 +1292,56 @@ impl PeerLumeApp {
             state,
             is_private: dialog.is_private,
             overrides: TorrentOverrides {
+                download_mode: dialog.download_mode,
+                freeze_after_bytes: dialog.freeze_after_bytes,
                 download_directory: Some(dialog.download_directory),
                 ..Default::default()
             },
         });
         self.selected_torrent = self.torrents.len() - 1;
         if let Some(torrent) = self.torrents.last() {
-            if let Some(store) = &mut self.state_store
-                && let Err(error) = store.save_torrent(&torrent_record(torrent))
+            let id = torrent.info_hashes.join(";");
+            self.tracker_audits.insert(id, tracker_audit);
+            let id = torrent.info_hashes.join(";");
+            if let Err(error) = self
+                .backend
+                .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
             {
                 self.add_status = format!("Added {name}; state save failed: {error}");
             }
-            if let Some(runtime) = &self.session_runtime {
-                let _ = runtime.try_send(session_add_command(torrent, &self.settings));
-            }
+            let _ = self
+                .backend
+                .send(add_torrent_command(torrent, &self.settings));
         }
-        self.details_tab = DetailsTab::Files;
+        if start_observation {
+            let torrent = self.torrents.last().expect("just added torrent exists");
+            let id = torrent.info_hashes.join(";");
+            if let Some(audit) = self.tracker_audits.get_mut(&id) {
+                let full_size = torrent
+                    .files
+                    .files()
+                    .iter()
+                    .map(|file| file.size_bytes)
+                    .sum();
+                let step = TrackerAuditStep {
+                    delay_seconds: 0,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: full_size,
+                    event: Some(AnnounceEvent::Started),
+                };
+                let observation_seconds = audit.observation_seconds;
+                let _ = start_torrent_tracker_audit(
+                    torrent,
+                    audit,
+                    vec![(0, step)],
+                    observation_seconds,
+                );
+            }
+            self.details_tab = DetailsTab::Trackers;
+        } else {
+            self.details_tab = DetailsTab::Files;
+        }
         if self.add_status.is_empty() {
             self.add_status = if state == TorrentState::WaitingForEngine {
                 format!("Added {name}; waiting for the full transfer engine")
@@ -1062,36 +1367,66 @@ impl PeerLumeApp {
                     torrent.state = TorrentState::WaitingForEngine;
                     torrent.download_rate = 0;
                     torrent.upload_rate = 0;
-                    if let Some(runtime) = &self.session_runtime {
-                        let _ = runtime.try_send(SessionCommand::Resume {
-                            id: torrent.info_hashes.join(";"),
-                        });
-                    }
+                    let _ = self.backend.send(SessionCommand::Resume {
+                        id: torrent.info_hashes.join(";"),
+                    });
                 }
             } else if ui.button("Pause").clicked() {
                 torrent.state = TorrentState::Paused;
                 torrent.download_rate = 0;
                 torrent.upload_rate = 0;
-                if let Some(runtime) = &self.session_runtime {
-                    let _ = runtime.try_send(SessionCommand::Pause {
-                        id: torrent.info_hashes.join(";"),
-                    });
-                }
+                let _ = self.backend.send(SessionCommand::Pause {
+                    id: torrent.info_hashes.join(";"),
+                });
             }
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Files, "Files");
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Info, "Info");
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Files,
+                DetailsTab::Files.label(),
+            );
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Info,
+                DetailsTab::Info.label(),
+            );
             ui.selectable_value(
                 &mut self.details_tab,
                 DetailsTab::Settings,
-                "Torrent settings",
+                DetailsTab::Settings.label(),
             );
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Peers, "Peers");
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Trackers, "Trackers");
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Pieces, "Pieces");
-            ui.selectable_value(&mut self.details_tab, DetailsTab::Log, "Log");
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Peers,
+                DetailsTab::Peers.label(),
+            );
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Trackers,
+                DetailsTab::Trackers.label(),
+            );
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Pieces,
+                DetailsTab::Pieces.label(),
+            );
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Log,
+                DetailsTab::Log.label(),
+            );
         });
         match self.details_tab {
-            DetailsTab::Files => Self::show_file_tree(ui, torrent),
+            DetailsTab::Files => {
+                if Self::show_file_tree(ui, torrent) {
+                    let _ = self
+                        .backend
+                        .send(crate::client::file_selection_command(torrent));
+                    let audit = self.tracker_audits.get(&torrent.info_hashes.join(";"));
+                    if let Err(e) = self.backend.save_torrent(&torrent_record(torrent, audit)) {
+                        self.add_status = e;
+                    }
+                }
+            }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
             DetailsTab::Settings => Self::show_torrent_settings(ui, torrent, &self.settings),
             DetailsTab::Peers => {
@@ -1101,11 +1436,22 @@ impl PeerLumeApp {
                 ));
             }
             DetailsTab::Trackers => {
-                for tracker in &torrent.trackers {
-                    ui.monospace(crate::identity::redact_tracker_url(tracker));
-                }
-                if torrent.trackers.is_empty() {
-                    ui.label("No trackers");
+                let id = torrent.info_hashes.join(";");
+                let audit = self.tracker_audits.entry(id.clone()).or_insert_with(|| {
+                    TorrentTrackerAudit::new(
+                        torrent.trackers.first().cloned().unwrap_or_default(),
+                        torrent.selected_size(),
+                        self.settings.connection.listen_port,
+                    )
+                });
+                let changed =
+                    show_torrent_tracker_audit(ui, torrent, audit, &mut self.behavior_catalog);
+                if changed
+                    && let Err(error) = self
+                        .backend
+                        .save_torrent(&torrent_record(torrent, Some(audit)))
+                {
+                    audit.status = format!("Could not save tracker settings: {error}");
                 }
             }
             DetailsTab::Pieces => {
@@ -1116,13 +1462,72 @@ impl PeerLumeApp {
                 ));
             }
             DetailsTab::Log => {
-                ui.label("Session events will appear here as the network engine connects.");
+                ui.horizontal(|ui| {
+                    ui.label("Real download announces (not the standalone audit)");
+                    if ui.button("Recheck files").clicked() {
+                        self.add_status = match self.backend.send(SessionCommand::Recheck {
+                            id: torrent.info_hashes.join(";"),
+                        }) {
+                            Ok(()) => {
+                                "Rechecking existing files; transfer counters are retained".into()
+                            }
+                            Err(e) => e,
+                        };
+                    }
+                });
+                if let Some(journal) = self.backend.journal() {
+                    if let Some(path) = journal.path() {
+                        ui.label(format!("JSONL: {}", path.display()));
+                    }
+                    if let Some(error) = journal.error() {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
+                    let hash = crate::announce_journal::torrent_hash(&torrent.info_hashes);
+                    ui.horizontal(|ui| {
+                        for (label, filter, enabled) in [
+                            ("Export torrent JSONL", hash, hash.is_some()),
+                            ("Export session JSONL", None, true),
+                        ] {
+                            if ui.add_enabled(enabled, egui::Button::new(label)).clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("JSON Lines", &["jsonl"])
+                                    .set_file_name("announce-export.jsonl")
+                                    .save_file()
+                            {
+                                self.add_status = match journal.export(&path, filter) {
+                                    Ok(count) => {
+                                        format!("Exported {count} announces to {}", path.display())
+                                    }
+                                    Err(e) => e,
+                                };
+                            }
+                        }
+                    });
+                    let entries = hash
+                        .map(|hash| journal.entries(Some(hash)))
+                        .unwrap_or_default();
+                    ui.label(format!("{} entries in live tail (session limit {}); export reads full disk history", entries.len(), crate::announce_journal::LIVE_CAPACITY));
+                    egui::ScrollArea::vertical()
+                        .id_salt("real_announce_log")
+                        .show(ui, |ui| {
+                            for entry in entries.iter().rev() {
+                                ui.collapsing(entry.summary(), |ui| {
+                                    if let Ok(json) = serde_json::to_string_pretty(entry) {
+                                        ui.monospace(json);
+                                    }
+                                });
+                            }
+                        });
+                } else {
+                    ui.label("Transfer session is unavailable");
+                }
             }
         }
     }
 
-    fn show_file_tree(ui: &mut egui::Ui, torrent: &mut TorrentItem) {
+    fn show_file_tree(ui: &mut egui::Ui, torrent: &mut TorrentItem) -> bool {
         let previous_size = torrent.selected_size();
+        let previous_count = torrent.files.selected_count();
         ui.horizontal(|ui| {
             if ui.small_button("Select all").clicked() {
                 torrent.files.select_all(true);
@@ -1183,9 +1588,18 @@ impl PeerLumeApp {
         if selected_size != previous_size {
             torrent.downloaded_bytes = torrent.files.selected_downloaded();
         }
+        selection_changed || previous_count != torrent.files.selected_count()
     }
 
     fn show_torrent_info(ui: &mut egui::Ui, torrent: &TorrentItem, global: &ClientSettings) {
+        show_tracker_account_identity(
+            ui,
+            torrent
+                .trackers
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
         let effective =
             EffectiveTorrentSettings::resolve(global, &torrent.overrides, torrent.is_private);
         egui::Grid::new("torrent_info")
@@ -1194,7 +1608,20 @@ impl PeerLumeApp {
                 for (label, value) in [
                     ("Source", torrent.source.clone()),
                     ("Info hash", torrent.info_hashes.join("; ")),
-                    ("Peer ID", torrent.peer_id.clone()),
+                    ("Audit Peer ID", torrent.peer_id.clone()),
+                    (
+                        "Download mode",
+                        torrent.overrides.download_mode.label().into(),
+                    ),
+                    (
+                        "Freeze threshold (bytes)",
+                        (if torrent.overrides.freeze_after_bytes == 0 {
+                            crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES
+                        } else {
+                            torrent.overrides.freeze_after_bytes
+                        })
+                        .to_string(),
+                    ),
                     ("Selected size", format_size(torrent.selected_size())),
                     ("Downloaded", format_size(torrent.downloaded_bytes)),
                     ("Uploaded", format_size(torrent.uploaded_bytes)),
@@ -1225,7 +1652,7 @@ impl PeerLumeApp {
                     (
                         "Tracker traffic",
                         if effective.tracker_enabled {
-                            "Enabled with accurate counters"
+                            torrent.overrides.download_mode.description()
                         } else {
                             "Disabled"
                         }
@@ -1498,7 +1925,7 @@ impl eframe::App for PeerLumeApp {
         self.show_header(ctx);
         match self.page {
             MainPage::Torrents => self.show_torrents(ctx),
-            MainPage::Settings => self.show_settings(ctx),
+            MainPage::Preferences => self.show_settings(ctx),
         }
         self.show_add_torrent_dialog(ctx);
         self.show_trash_confirmation(ctx);
@@ -1661,7 +2088,864 @@ fn show_file_drop_overlay(ctx: &egui::Context) {
     );
 }
 
+fn show_behavior_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    catalog: &mut Result<BehaviorCatalog, String>,
+    full_size: u64,
+    selected_size: u64,
+    port: u16,
+) -> Option<StoredTrackerAuditProfile> {
+    let mut selected = None;
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id)
+            .selected_text("Load behavior profile")
+            .show_ui(ui, |ui| {
+                if let Ok(catalog) = catalog {
+                    for profile in &catalog.profiles {
+                        if ui.selectable_label(false, &profile.label).clicked() {
+                            selected =
+                                Some(catalog.resolve(&profile.id, full_size, selected_size, port));
+                        }
+                    }
+                }
+            });
+        if ui.button("Reload profiles").clicked() {
+            *catalog = BehaviorCatalog::load();
+        }
+    });
+    if let Err(error) = catalog {
+        ui.colored_label(egui::Color32::RED, format!("Behavior profiles: {error}"));
+    }
+    match selected {
+        Some(Ok(profile)) => Some(profile),
+        Some(Err(error)) => {
+            ui.colored_label(egui::Color32::RED, error);
+            None
+        }
+        None => None,
+    }
+}
+
+fn show_tracker_account_identity(ui: &mut egui::Ui, tracker_url: &str) {
+    let fields = crate::identity::tracker_identity_fields(tracker_url);
+    // Transient visibility only. Changing the URL hides the newly selected key.
+    let id = ui.make_persistent_id(("tracker_account_identity", tracker_url));
+    let mut reveal = ui.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong("Tracker account / user identity");
+            if ui
+                .add_enabled(
+                    !fields.is_empty(),
+                    egui::Button::new(if reveal { "Hide" } else { "Show" }),
+                )
+                .clicked()
+            {
+                reveal = !reveal;
+            }
+        });
+        if fields.is_empty() {
+            ui.label("No recognized account ID/key in this Tracker URL.");
+        } else {
+            egui::Grid::new(id.with("fields"))
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for field in &fields {
+                        ui.label(field.label());
+                        ui.monospace(field.display_value(reveal));
+                        ui.end_row();
+                    }
+                });
+        }
+        ui.small(crate::identity::TRACKER_IDENTITY_HINT);
+        ui.small("Read-only, derived from Tracker URL. Edit that URL to change the attached key.");
+    });
+    ui.data_mut(|data| data.insert_temp(id, reveal));
+}
+
+fn show_tracker_audit(
+    ui: &mut egui::Ui,
+    dialog: &mut AddTorrentDialog,
+    catalog: &mut Result<BehaviorCatalog, String>,
+) {
+    let mut send = false;
+    let audit = &mut dialog.tracker_audit;
+    ui.heading("Tracker audit");
+    ui.add_enabled_ui(audit.pending.is_none(), |ui| {
+        if let Some(profile) = show_behavior_picker(
+            ui,
+            "add_behavior_profile",
+            catalog,
+            dialog.total_size,
+            dialog.files.selected_size(),
+            audit.port,
+        ) {
+            audit.apply_preset(&profile);
+        }
+    });
+    if audit.preset_steps.len() > 1 {
+        ui.label(format!("{} external scenario steps will be attached. Run them from the Trackers tab after adding.", audit.preset_steps.len()));
+    }
+    ui.label(
+        "Send one controlled announce with independent counters and inspect the returned peer list.",
+    );
+    ui.label(
+        "These values apply only to the audit request and are never used by the normal transfer session.",
+    );
+    ui.horizontal(|ui| {
+        ui.label("Allowed staging host");
+        ui.add(egui::TextEdit::singleline(&mut audit.allowed_host).desired_width(280.0));
+        ui.label("Leave empty for localhost/loopback.");
+    });
+    ui.add_enabled(
+        audit.pending.is_none(),
+        egui::Checkbox::new(
+            &mut audit.started_only,
+            "Started-only observation after adding (staging audit only)",
+        ),
+    );
+    if audit.started_only {
+        ui.horizontal(|ui| {
+            ui.label("Observation duration");
+            ui.add(
+                egui::DragValue::new(&mut audit.observation_seconds)
+                    .range(60..=604_800)
+                    .suffix(" s"),
+            );
+            ui.label(format!("({})", format_duration(audit.observation_seconds)));
+        });
+        ui.label(
+            "The audit sends one started announce with uploaded=0, downloaded=0 and left=full size, then waits without further announces or completed.",
+        );
+        ui.label("The single announce will be sent automatically after Add torrent.");
+    }
+    ui.add_enabled_ui(!audit.started_only, |ui| {
+        egui::Grid::new("add_torrent_tracker_audit_counters")
+            .num_columns(4)
+            .show(ui, |ui| {
+                ui.label("Uploaded");
+                ui.add(egui::DragValue::new(&mut audit.uploaded).range(0..=u64::MAX));
+                ui.label("Downloaded");
+                ui.add(egui::DragValue::new(&mut audit.downloaded).range(0..=u64::MAX));
+                ui.end_row();
+                ui.label("Left");
+                ui.add(egui::DragValue::new(&mut audit.left).range(0..=u64::MAX));
+                ui.label("Port");
+                ui.add(egui::DragValue::new(&mut audit.port).range(1..=u16::MAX));
+                ui.end_row();
+            });
+    });
+    if !audit.started_only {
+        ui.horizontal(|ui| {
+            ui.label("Event");
+            egui::ComboBox::from_id_salt("add_torrent_tracker_audit_event")
+                .selected_text(audit_event_label(audit.event))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut audit.event, None, "None");
+                    ui.selectable_value(&mut audit.event, Some(AnnounceEvent::Started), "Started");
+                    ui.selectable_value(
+                        &mut audit.event,
+                        Some(AnnounceEvent::Completed),
+                        "Completed",
+                    );
+                    ui.selectable_value(&mut audit.event, Some(AnnounceEvent::Stopped), "Stopped");
+                });
+            if ui
+                .add_enabled(
+                    audit.pending.is_none(),
+                    egui::Button::new("Send audit announce"),
+                )
+                .clicked()
+            {
+                send = true;
+            }
+            if audit.pending.is_some() {
+                ui.spinner();
+            }
+        });
+    }
+    if !audit.status.is_empty() {
+        ui.label(&audit.status);
+    }
+    if !audit.peers.is_empty() {
+        ui.collapsing(format!("Returned peers ({})", audit.peers.len()), |ui| {
+            for peer in &audit.peers {
+                ui.monospace(peer);
+            }
+        });
+    }
+    if send {
+        start_tracker_audit(dialog);
+    }
+}
+
+fn start_tracker_audit(dialog: &mut AddTorrentDialog) {
+    let preparation = (|| {
+        let info_hash = dialog
+            .info_hash_v1_hex
+            .as_deref()
+            .ok_or_else(|| "Tracker audit currently requires a v1 or hybrid torrent".to_owned())
+            .and_then(parse_info_hash_hex)?;
+        metainfo::validate_peer_id(&dialog.peer_id)?;
+        let peer_id: [u8; 20] = dialog
+            .peer_id
+            .as_bytes()
+            .try_into()
+            .map_err(|_| "Peer ID must contain exactly 20 ASCII bytes".to_owned())?;
+        let tracker_url = dialog.tracker_audit.tracker_url.trim().to_owned();
+        if tracker_url.is_empty() {
+            return Err("Choose a tracker URL for the audit request".into());
+        }
+        let allowed_host = dialog.tracker_audit.allowed_host.trim();
+        let allow_hosts = (!allowed_host.is_empty()).then(|| vec![allowed_host.to_owned()]);
+        let allow_hosts = allow_hosts.unwrap_or_default();
+        validate_audit_target(&tracker_url, &allow_hosts)?;
+        let request = AnnounceRequest {
+            info_hash,
+            peer_id,
+            port: dialog.tracker_audit.port,
+            uploaded: if dialog.tracker_audit.started_only {
+                0
+            } else {
+                dialog.tracker_audit.uploaded
+            },
+            downloaded: if dialog.tracker_audit.started_only {
+                0
+            } else {
+                dialog.tracker_audit.downloaded
+            },
+            left: if dialog.tracker_audit.started_only {
+                dialog.total_size
+            } else {
+                dialog.tracker_audit.left
+            },
+            event: if dialog.tracker_audit.started_only {
+                Some(AnnounceEvent::Started)
+            } else {
+                dialog.tracker_audit.event
+            },
+        };
+        Ok((tracker_url, allow_hosts, request))
+    })();
+    let (tracker_url, allow_hosts, request) = match preparation {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            dialog.tracker_audit.status = error;
+            return;
+        }
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    dialog.tracker_audit.status = "Sending controlled announce...".into();
+    dialog.tracker_audit.peers.clear();
+    dialog.tracker_audit.pending = Some(receiver);
+    std::thread::spawn(move || {
+        let exchange = execute_tracker_audit(&tracker_url, &allow_hosts, request, 0);
+        let _ = sender.send(exchange);
+    });
+}
+
+fn poll_tracker_audit(dialog: &mut AddTorrentDialog) {
+    let completed =
+        dialog
+            .tracker_audit
+            .pending
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(exchange) => Some(Ok(exchange)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Tracker audit worker stopped unexpectedly".to_owned()))
+                }
+            });
+    let Some(result) = completed else {
+        return;
+    };
+    dialog.tracker_audit.pending = None;
+    match result {
+        Ok(exchange) => {
+            if let Some(error) = &exchange.error {
+                dialog.tracker_audit.status = format!("Audit announce failed: {error}");
+            } else {
+                dialog.tracker_audit.status = format!(
+                    "Tracker responded: interval {} seconds, {} peers",
+                    exchange.interval_seconds.unwrap_or_default(),
+                    exchange.peers.len()
+                );
+            }
+            dialog.tracker_audit.peers.clone_from(&exchange.peers);
+            dialog.tracker_audit.exchanges.push(exchange);
+        }
+        Err(error) => {
+            dialog.tracker_audit.status = format!("Audit announce failed: {error}");
+            dialog.tracker_audit.peers.clear();
+        }
+    }
+}
+
+fn audit_event_label(event: Option<AnnounceEvent>) -> &'static str {
+    match event {
+        None => "None",
+        Some(AnnounceEvent::Started) => "Started",
+        Some(AnnounceEvent::Completed) => "Completed",
+        Some(AnnounceEvent::Stopped) => "Stopped",
+    }
+}
+
+fn audit_event_storage(event: AnnounceEvent) -> &'static str {
+    match event {
+        AnnounceEvent::Started => "started",
+        AnnounceEvent::Completed => "completed",
+        AnnounceEvent::Stopped => "stopped",
+    }
+}
+
+fn audit_event_from_storage(event: Option<&str>) -> Option<AnnounceEvent> {
+    match event {
+        Some("started") => Some(AnnounceEvent::Started),
+        Some("completed") => Some(AnnounceEvent::Completed),
+        Some("stopped") => Some(AnnounceEvent::Stopped),
+        _ => None,
+    }
+}
+
+enum TrackerAuditStepAction {
+    Send(usize),
+    MoveUp(usize),
+    MoveDown(usize),
+    Remove(usize),
+}
+
+fn show_torrent_tracker_audit(
+    ui: &mut egui::Ui,
+    torrent: &mut TorrentItem,
+    audit: &mut TorrentTrackerAudit,
+    catalog: &mut Result<BehaviorCatalog, String>,
+) -> bool {
+    poll_torrent_tracker_audit(audit);
+    let mut profile_changed = false;
+    ui.heading("Per-torrent tracker audit");
+    ui.add_enabled_ui(audit.run.is_none(), |ui| {
+        let full_size = torrent
+            .files
+            .files()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum();
+        if let Some(profile) = show_behavior_picker(
+            ui,
+            "torrent_behavior_profile",
+            catalog,
+            full_size,
+            torrent.selected_size(),
+            audit.port,
+        ) {
+            let exchanges = std::mem::take(&mut audit.exchanges);
+            *audit = TorrentTrackerAudit::from_stored(
+                audit.tracker_url.clone(),
+                full_size,
+                audit.port,
+                Some(&profile),
+            );
+            audit.exchanges = exchanges;
+            audit.status = "External profile applied; saved as a per-torrent snapshot".into();
+            profile_changed = true;
+        }
+    });
+    ui.label(
+        "The scenario below is independent from normal tracker reporting and keeps a separate exchange log.",
+    );
+    ui.horizontal(|ui| {
+        ui.label("Tracker URL");
+        if ui
+            .add(egui::TextEdit::singleline(&mut audit.tracker_url).desired_width(560.0))
+            .changed()
+        {
+            torrent.trackers.clear();
+            let tracker_url = audit.tracker_url.trim();
+            if !tracker_url.is_empty() {
+                torrent.trackers.push(tracker_url.to_owned());
+            }
+            profile_changed = true;
+        }
+    });
+    show_tracker_account_identity(ui, &audit.tracker_url);
+    ui.label("Tracker URL changes are saved securely and applied to the transfer after restart.");
+    ui.horizontal(|ui| {
+        ui.label("Allowed staging host");
+        profile_changed |= ui
+            .add(egui::TextEdit::singleline(&mut audit.allowed_host).desired_width(280.0))
+            .changed();
+        ui.label("Leave empty for localhost/loopback.");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Announced port");
+        profile_changed |= ui
+            .add(egui::DragValue::new(&mut audit.port).range(1..=u16::MAX))
+            .changed();
+    });
+    profile_changed |= ui
+        .checkbox(
+            &mut audit.started_only,
+            "Started-only observation (staging audit only)",
+        )
+        .changed();
+    if audit.started_only {
+        ui.horizontal(|ui| {
+            ui.label("Observation duration");
+            profile_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut audit.observation_seconds)
+                        .range(60..=604_800)
+                        .suffix(" s"),
+                )
+                .changed();
+            ui.label(format!("({})", format_duration(audit.observation_seconds)));
+        });
+        ui.label(
+            "One started announce is sent with uploaded=0, downloaded=0 and left=full selected size. No further announce, completed, or stopped is sent during the observation window.",
+        );
+    }
+
+    ui.add_space(6.0);
+    ui.strong("Scenario steps");
+    ui.label("Delay is measured from the previous step. Every step performs one announce.");
+    let mut action = None;
+    ui.add_enabled_ui(!audit.started_only, |ui| {
+        egui::Grid::new("torrent_tracker_audit_steps")
+            .striped(true)
+            .show(ui, |ui| {
+                for heading in [
+                    "#",
+                    "Delay s",
+                    "Uploaded",
+                    "Downloaded",
+                    "Left",
+                    "Event",
+                    "Actions",
+                ] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                let step_count = audit.steps.len();
+                for (index, step) in audit.steps.iter_mut().enumerate() {
+                    ui.label((index + 1).to_string());
+                    profile_changed |= ui
+                        .add(egui::DragValue::new(&mut step.delay_seconds).range(0..=86_400))
+                        .changed();
+                    profile_changed |= ui
+                        .add(egui::DragValue::new(&mut step.uploaded).range(0..=u64::MAX))
+                        .changed();
+                    profile_changed |= ui
+                        .add(egui::DragValue::new(&mut step.downloaded).range(0..=u64::MAX))
+                        .changed();
+                    profile_changed |= ui
+                        .add(egui::DragValue::new(&mut step.left).range(0..=u64::MAX))
+                        .changed();
+                    egui::ComboBox::from_id_salt(("torrent_tracker_audit_event", index))
+                        .selected_text(audit_event_label(step.event))
+                        .show_ui(ui, |ui| {
+                            profile_changed |=
+                                ui.selectable_value(&mut step.event, None, "None").changed();
+                            profile_changed |= ui
+                                .selectable_value(
+                                    &mut step.event,
+                                    Some(AnnounceEvent::Started),
+                                    "Started",
+                                )
+                                .changed();
+                            profile_changed |= ui
+                                .selectable_value(
+                                    &mut step.event,
+                                    Some(AnnounceEvent::Completed),
+                                    "Completed",
+                                )
+                                .changed();
+                            profile_changed |= ui
+                                .selectable_value(
+                                    &mut step.event,
+                                    Some(AnnounceEvent::Stopped),
+                                    "Stopped",
+                                )
+                                .changed();
+                        });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(audit.run.is_none(), egui::Button::new("Send"))
+                            .clicked()
+                        {
+                            action = Some(TrackerAuditStepAction::Send(index));
+                        }
+                        if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                            action = Some(TrackerAuditStepAction::MoveUp(index));
+                        }
+                        if ui
+                            .add_enabled(index + 1 < step_count, egui::Button::new("↓"))
+                            .clicked()
+                        {
+                            action = Some(TrackerAuditStepAction::MoveDown(index));
+                        }
+                        if ui
+                            .add_enabled(step_count > 1, egui::Button::new("Remove"))
+                            .clicked()
+                        {
+                            action = Some(TrackerAuditStepAction::Remove(index));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+
+    let mut run_all = false;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                audit.run.is_none() && !audit.started_only,
+                egui::Button::new("Add step"),
+            )
+            .clicked()
+        {
+            let previous = audit.steps.last().cloned().unwrap_or(TrackerAuditStep {
+                delay_seconds: 0,
+                uploaded: 0,
+                downloaded: 0,
+                left: torrent.selected_size(),
+                event: None,
+            });
+            audit.steps.push(TrackerAuditStep {
+                event: None,
+                ..previous
+            });
+            profile_changed = true;
+        }
+        if ui
+            .add_enabled(
+                audit.run.is_none() && (audit.started_only || !audit.steps.is_empty()),
+                egui::Button::new(if audit.started_only {
+                    "Start observation"
+                } else {
+                    "Run scenario"
+                }),
+            )
+            .clicked()
+        {
+            run_all = true;
+        }
+        if ui
+            .add_enabled(audit.run.is_some(), egui::Button::new("Stop"))
+            .clicked()
+            && let Some(run) = &audit.run
+        {
+            run.cancel.store(true, Ordering::Relaxed);
+            audit.status = "Stopping scenario...".into();
+        }
+        if ui.button("Clear exchange log").clicked() {
+            audit.exchanges.clear();
+        }
+        if audit.run.is_some() {
+            ui.spinner();
+        }
+    });
+
+    match action {
+        Some(TrackerAuditStepAction::Send(index)) => {
+            let mut step = audit.steps[index].clone();
+            step.delay_seconds = 0;
+            let _ = start_torrent_tracker_audit(torrent, audit, vec![(index, step)], 0);
+        }
+        Some(TrackerAuditStepAction::MoveUp(index)) => {
+            audit.steps.swap(index, index - 1);
+            profile_changed = true;
+        }
+        Some(TrackerAuditStepAction::MoveDown(index)) => {
+            audit.steps.swap(index, index + 1);
+            profile_changed = true;
+        }
+        Some(TrackerAuditStepAction::Remove(index)) => {
+            audit.steps.remove(index);
+            profile_changed = true;
+        }
+        None => {}
+    }
+    if run_all {
+        let (steps, observation_seconds) = if audit.started_only {
+            let full_size = torrent
+                .files
+                .files()
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum();
+            (
+                vec![(
+                    0,
+                    TrackerAuditStep {
+                        delay_seconds: 0,
+                        uploaded: 0,
+                        downloaded: 0,
+                        left: full_size,
+                        event: Some(AnnounceEvent::Started),
+                    },
+                )],
+                audit.observation_seconds,
+            )
+        } else {
+            (audit.steps.iter().cloned().enumerate().collect(), 0)
+        };
+        let _ = start_torrent_tracker_audit(torrent, audit, steps, observation_seconds);
+    }
+    if !audit.status.is_empty() {
+        ui.label(&audit.status);
+    }
+
+    ui.separator();
+    ui.strong(format!("Tracker exchange log ({})", audit.exchanges.len()));
+    if audit.exchanges.is_empty() {
+        ui.label("No audit announces have been sent for this torrent.");
+    }
+    for exchange in audit.exchanges.iter().rev() {
+        let title = format!(
+            "{} · step {} · {} · up {} / down {} / left {}",
+            exchange.timestamp_unix_ms,
+            exchange.step_index + 1,
+            audit_event_label(exchange.event),
+            exchange.uploaded,
+            exchange.downloaded,
+            exchange.left
+        );
+        ui.collapsing(title, |ui| {
+            ui.label(format!("Sent to host: {}", exchange.tracker_host));
+            ui.monospace(format!("info_hash={}", exchange.info_hash_hex));
+            ui.monospace(format!("peer_id={}", exchange.peer_id));
+            ui.monospace(format!(
+                "port={} uploaded={} downloaded={} left={} event={}",
+                exchange.port,
+                exchange.uploaded,
+                exchange.downloaded,
+                exchange.left,
+                audit_event_label(exchange.event)
+            ));
+            if let Some(error) = &exchange.error {
+                ui.colored_label(egui::Color32::RED, format!("Error: {error}"));
+            } else {
+                ui.label(format!(
+                    "Received interval: {} seconds",
+                    exchange.interval_seconds.unwrap_or_default()
+                ));
+                ui.label(format!("Received peers: {}", exchange.peers.len()));
+                for peer in &exchange.peers {
+                    ui.monospace(peer);
+                }
+            }
+        });
+    }
+    profile_changed
+}
+
+fn start_torrent_tracker_audit(
+    torrent: &TorrentItem,
+    audit: &mut TorrentTrackerAudit,
+    steps: Vec<(usize, TrackerAuditStep)>,
+    observation_seconds: u64,
+) -> Result<(), String> {
+    if audit.run.is_some() {
+        return Err("An audit scenario is already running".into());
+    }
+    let info_hash = torrent
+        .info_hashes
+        .iter()
+        .find_map(|hash| hash.strip_prefix("v1: "))
+        .ok_or_else(|| "Tracker audit currently requires a v1 or hybrid torrent".to_owned())
+        .and_then(parse_info_hash_hex);
+    let info_hash = match info_hash {
+        Ok(hash) => hash,
+        Err(error) => {
+            audit.status = error.clone();
+            return Err(error);
+        }
+    };
+    if let Err(error) = metainfo::validate_peer_id(&torrent.peer_id) {
+        audit.status = error.clone();
+        return Err(error);
+    }
+    let peer_id: [u8; 20] = torrent
+        .peer_id
+        .as_bytes()
+        .try_into()
+        .map_err(|_| "Peer ID must contain exactly 20 ASCII bytes".to_owned())?;
+    let tracker_url = audit.tracker_url.trim().to_owned();
+    let allowed_host = audit.allowed_host.trim();
+    let allow_hosts = if allowed_host.is_empty() {
+        Vec::new()
+    } else {
+        vec![allowed_host.to_owned()]
+    };
+    if let Err(error) = validate_audit_target(&tracker_url, &allow_hosts) {
+        audit.status = error.clone();
+        return Err(error);
+    }
+    let port = audit.port;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (sender, receiver) = mpsc::channel();
+    audit.status = if observation_seconds == 0 {
+        format!("Running {} audit step(s)...", steps.len())
+    } else {
+        format!(
+            "Starting {} observation with one announce...",
+            format_duration(observation_seconds)
+        )
+    };
+    audit.run = Some(TrackerAuditRun { receiver, cancel });
+    std::thread::spawn(move || {
+        for (step_index, step) in steps {
+            if !wait_for_audit_delay(step.delay_seconds, &worker_cancel) {
+                let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
+                return;
+            }
+            let request = AnnounceRequest {
+                info_hash,
+                peer_id,
+                port,
+                uploaded: step.uploaded,
+                downloaded: step.downloaded,
+                left: step.left,
+                event: step.event,
+            };
+            let exchange = execute_tracker_audit(&tracker_url, &allow_hosts, request, step_index);
+            if sender
+                .send(TrackerAuditWorkerEvent::Exchange(exchange))
+                .is_err()
+            {
+                return;
+            }
+        }
+        if observation_seconds > 0 {
+            if sender
+                .send(TrackerAuditWorkerEvent::ObservationStarted(
+                    observation_seconds,
+                ))
+                .is_err()
+            {
+                return;
+            }
+            if !wait_for_audit_delay(observation_seconds, &worker_cancel) {
+                let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
+                return;
+            }
+        }
+        let _ = sender.send(TrackerAuditWorkerEvent::Finished);
+    });
+    Ok(())
+}
+
+fn poll_torrent_tracker_audit(audit: &mut TorrentTrackerAudit) {
+    let mut finished = None;
+    if let Some(run) = &audit.run {
+        loop {
+            match run.receiver.try_recv() {
+                Ok(TrackerAuditWorkerEvent::Exchange(exchange)) => {
+                    audit.exchanges.push(exchange);
+                    audit.status = format!("Completed {} audit step(s)", audit.exchanges.len());
+                }
+                Ok(TrackerAuditWorkerEvent::ObservationStarted(seconds)) => {
+                    audit.status = format!(
+                        "Observing for {}; no further announces will be sent",
+                        format_duration(seconds)
+                    );
+                }
+                Ok(TrackerAuditWorkerEvent::Finished) => {
+                    finished = Some(if audit.started_only {
+                        "Started-only observation completed".to_owned()
+                    } else {
+                        "Scenario completed".to_owned()
+                    });
+                    break;
+                }
+                Ok(TrackerAuditWorkerEvent::Cancelled) => {
+                    finished = Some("Scenario cancelled".to_owned());
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    finished = Some("Audit worker stopped unexpectedly".to_owned());
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(status) = finished {
+        audit.run = None;
+        audit.status = status;
+    }
+}
+
+fn wait_for_audit_delay(seconds: u64, cancel: &AtomicBool) -> bool {
+    crate::tracker_behavior::wait_for_delay(seconds, cancel)
+}
+
+fn execute_tracker_audit(
+    tracker_url: &str,
+    allow_hosts: &[String],
+    request: AnnounceRequest,
+    step_index: usize,
+) -> TrackerAuditExchange {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    let tracker_host = validate_audit_target(tracker_url, allow_hosts)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "invalid target".into());
+    let mut exchange = TrackerAuditExchange {
+        timestamp_unix_ms,
+        step_index,
+        tracker_host,
+        info_hash_hex: hex_bytes(&request.info_hash),
+        peer_id: String::from_utf8_lossy(&request.peer_id).into_owned(),
+        port: request.port,
+        uploaded: request.uploaded,
+        downloaded: request.downloaded,
+        left: request.left,
+        event: request.event,
+        interval_seconds: None,
+        peers: Vec::new(),
+        error: None,
+    };
+    match announce_for_audit(tracker_url, &request, allow_hosts).and_then(|response| {
+        let peers = compact_ipv4_peers(&response.compact_peers)?
+            .into_iter()
+            .map(|peer| peer.to_string())
+            .collect();
+        Ok((response.interval_seconds, peers))
+    }) {
+        Ok((interval_seconds, peers)) => {
+            exchange.interval_seconds = Some(interval_seconds);
+            exchange.peers = peers;
+        }
+        Err(error) => exchange.error = Some(error),
+    }
+    exchange
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn validate_add_dialog(dialog: &AddTorrentDialog) -> Result<Vec<String>, String> {
+    dialog
+        .download_mode
+        .validate_threshold(dialog.freeze_after_bytes)?;
+    dialog
+        .download_mode
+        .validate_metadata(dialog.info_hash_v1_hex.is_some(), dialog.total_size)?;
     if dialog.files.selected_count() == 0 {
         return Err("Select at least one file".into());
     }
@@ -1672,131 +2956,44 @@ fn validate_add_dialog(dialog: &AddTorrentDialog) -> Result<Vec<String>, String>
         return Err("Download location points to a file, not a directory".into());
     }
     metainfo::validate_peer_id(&dialog.peer_id)?;
-
-    let mut trackers = Vec::new();
-    for line in dialog.trackers_text.lines() {
-        let tracker = line.trim();
-        if tracker.is_empty() {
-            continue;
+    if dialog.tracker_audit.started_only {
+        if dialog.info_hash_v1_hex.is_none() {
+            return Err(
+                "Started-only observation currently requires a v1 or hybrid torrent".into(),
+            );
         }
+        let allowed_host = dialog.tracker_audit.allowed_host.trim();
+        let allow_hosts = if allowed_host.is_empty() {
+            Vec::new()
+        } else {
+            vec![allowed_host.to_owned()]
+        };
+        validate_audit_target(dialog.tracker_audit.tracker_url.trim(), &allow_hosts)?;
+    }
+
+    let tracker = dialog.tracker_audit.tracker_url.trim();
+    let trackers = if tracker.is_empty() {
+        Vec::new()
+    } else {
         if !["http://", "https://", "udp://"]
             .iter()
             .any(|prefix| tracker.starts_with(prefix))
         {
             return Err(format!("Unsupported tracker URL: {tracker}"));
         }
-        if !trackers.iter().any(|existing| existing == tracker) {
-            trackers.push(tracker.to_owned());
-        }
-    }
+        vec![tracker.to_owned()]
+    };
     if dialog.is_private && dialog.start_immediately && trackers.is_empty() {
         return Err("A private torrent needs a tracker URL before it can start".into());
     }
     Ok(trackers)
 }
 
-fn session_add_command(torrent: &TorrentItem, settings: &ClientSettings) -> SessionCommand {
-    let effective =
-        EffectiveTorrentSettings::resolve(settings, &torrent.overrides, torrent.is_private);
-    let selected: Vec<_> = torrent
-        .files
-        .files()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, file)| file.selected.then_some(index))
-        .collect();
-    let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
-    SessionCommand::AddTorrent {
-        id: torrent.info_hashes.join(";"),
-        source: torrent.source.clone(),
-        output_folder: effective.download_directory,
-        only_files,
-        trackers: torrent.trackers.clone(),
-        paused: matches!(torrent.state, TorrentState::Paused | TorrentState::Error),
-        peer_limit: (effective.max_peers > 0).then_some(effective.max_peers),
-    }
-}
-
-fn torrent_record(torrent: &TorrentItem) -> TorrentRecord {
-    let hash = |prefix: &str| {
-        torrent
-            .info_hashes
-            .iter()
-            .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
-    };
-    TorrentRecord {
-        id: torrent.info_hashes.join(";"),
-        name: torrent.name.clone(),
-        source: torrent.source.clone(),
-        info_hash_v1: hash("v1: "),
-        info_hash_v2: hash("v2: "),
-        is_private: torrent.is_private,
-        state: torrent.state.label().to_ascii_lowercase(),
-        queue_position: 0,
-        download_directory: torrent.overrides.download_directory.clone(),
-        trackers: torrent.trackers.clone(),
-        files: torrent
-            .files
-            .files()
-            .iter()
-            .enumerate()
-            .map(|(index, file)| StoredFile {
-                index: index as u32,
-                path: file.path.clone(),
-                size_bytes: file.size_bytes,
-                downloaded_bytes: file.downloaded_bytes,
-                selected: file.selected,
-                priority: 0,
-            })
-            .collect(),
-        verified_pieces: Vec::new(),
-        downloaded_bytes: torrent.downloaded_bytes,
-        uploaded_bytes: torrent.uploaded_bytes,
-    }
-}
-
-fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> TorrentItem {
-    let files = FileSelectionModel::from_snapshot(record.files.into_iter().map(|file| {
-        (
-            file.path,
-            file.size_bytes,
-            file.downloaded_bytes,
-            file.selected,
-        )
-    }));
-    let downloaded_bytes = files.selected_downloaded();
-    let mut info_hashes = Vec::new();
-    if let Some(hash) = record.info_hash_v1 {
-        info_hashes.push(format!("v1: {hash}"));
-    }
-    if let Some(hash) = record.info_hash_v2 {
-        info_hashes.push(format!("v2: {hash}"));
-    }
-    TorrentItem {
-        name: record.name,
-        source: record.source,
-        info_hashes,
-        trackers: record.trackers,
-        peer_id: metainfo::generate_peer_id(&settings.bittorrent.peer_id_prefix),
-        files,
-        downloaded_bytes,
-        uploaded_bytes: record.uploaded_bytes,
-        download_rate: 0,
-        upload_rate: 0,
-        peers: 0,
-        seeds: 0,
-        state: match record.state.as_str() {
-            "seeding" => TorrentState::Seeding,
-            "downloading" | "waiting for transfer engine" => TorrentState::WaitingForEngine,
-            "error" => TorrentState::Error,
-            _ => TorrentState::Paused,
-        },
-        is_private: record.is_private,
-        overrides: TorrentOverrides {
-            download_directory: record.download_directory,
-            ..Default::default()
-        },
-    }
+fn torrent_record(
+    torrent: &TorrentItem,
+    tracker_audit: Option<&TorrentTrackerAudit>,
+) -> TorrentRecord {
+    torrent_to_record(torrent, tracker_audit.map(TorrentTrackerAudit::to_stored))
 }
 
 fn option_string(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, default: &str) {
@@ -1888,6 +3085,143 @@ fn format_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracker_account_ui_masks_by_default_reveals_explicitly_and_resets_on_url_change() {
+        fn render(url: &str, previously_revealed_url: Option<&str>) -> String {
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(previous) = previously_revealed_url {
+                        let id = ui.make_persistent_id(("tracker_account_identity", previous));
+                        ui.data_mut(|data| data.insert_temp(id, true));
+                    }
+                    show_tracker_account_identity(ui, url);
+                });
+            });
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let url = "https://tracker.test/announce?uk=fixture-account-key&uid=42";
+        let hidden = render(url, None);
+        assert!(hidden.contains("Tracker account / user identity"));
+        assert!(hidden.contains("(uk)"));
+        assert!(hidden.contains("(uid)"));
+        assert!(hidden.contains("[hidden]"));
+        assert!(!hidden.contains("fixture-account-key"));
+        assert!(render(url, Some(url)).contains("fixture-account-key"));
+        let changed = render(
+            "https://tracker.test/announce?uk=new-fixture-key",
+            Some(url),
+        );
+        assert!(!changed.contains("new-fixture-key"));
+    }
+
+    #[test]
+    fn add_dialog_defaults_to_normal_and_validates_all_download_modes() {
+        let metainfo = TorrentMetainfo {
+            name: "fixture".into(),
+            files: vec![crate::metainfo::MetainfoFile {
+                path: "file.bin".into(),
+                size_bytes: 100,
+            }],
+            trackers: vec!["http://127.0.0.1/announce".into()],
+            is_private: true,
+            info_hash_v1_hex: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            info_hash_v2_hex: None,
+        };
+        let mut dialog = AddTorrentDialog::new(
+            "test.torrent".into(),
+            metainfo,
+            &ClientSettings::default(),
+            "downloads".into(),
+        );
+        assert_eq!(dialog.download_mode, DownloadMode::Normal);
+        assert!(dialog.start_immediately);
+        assert!(!dialog.tracker_audit.started_only);
+        for mode in DownloadMode::ALL {
+            dialog.download_mode = mode;
+            assert!(validate_add_dialog(&dialog).is_ok());
+        }
+        dialog.info_hash_v1_hex = None;
+        assert!(validate_add_dialog(&dialog).is_err());
+    }
+
+    #[test]
+    fn add_dialog_preserves_every_external_step_and_first_step_edits() {
+        let catalog =
+            BehaviorCatalog::from_toml(include_str!("../config/tracker-behaviors.example.toml"))
+                .unwrap();
+        let profile = catalog.resolve("periodic-test", 1000, 250, 1234).unwrap();
+        let mut audit = AddTrackerAudit::new("http://localhost/announce".into(), 1000, 1234);
+        audit.apply_preset(&profile);
+        audit.uploaded = 42;
+        let saved = audit.to_profile().to_stored();
+        assert_eq!(saved.steps.len(), 4);
+        assert_eq!(saved.steps[0].uploaded, 42);
+        assert_eq!(saved.steps[1..], profile.steps[1..]);
+        assert_eq!(audit.tracker_url, "http://localhost/announce");
+    }
+
+    #[test]
+    fn tracker_audit_defaults_are_safe_and_match_the_torrent() {
+        let audit =
+            AddTrackerAudit::new("http://127.0.0.1:8080/announce".into(), 1_048_576, 51_413);
+
+        assert_eq!(audit.uploaded, 0);
+        assert_eq!(audit.downloaded, 0);
+        assert_eq!(audit.left, 1_048_576);
+        assert_eq!(audit.port, 51_413);
+        assert_eq!(audit.event, Some(AnnounceEvent::Started));
+        assert!(audit.allowed_host.is_empty());
+        assert!(!audit.started_only);
+        assert_eq!(audit.observation_seconds, 14_400);
+        assert!(audit.pending.is_none());
+    }
+
+    #[test]
+    fn tracker_audit_profile_round_trips_without_url_or_exchange_log() {
+        let mut audit = TorrentTrackerAudit::new(
+            "https://tracker.test/private-passkey/announce".into(),
+            1_000,
+            51_413,
+        );
+        audit.allowed_host = "tracker.test".into();
+        audit.started_only = true;
+        audit.observation_seconds = 21_600;
+        audit.steps.push(TrackerAuditStep {
+            delay_seconds: 30,
+            uploaded: 40,
+            downloaded: 60,
+            left: 940,
+            event: Some(AnnounceEvent::Completed),
+        });
+
+        let stored = audit.to_stored();
+        let restored = TorrentTrackerAudit::from_stored(String::new(), 1_000, 1, Some(&stored));
+
+        assert!(restored.tracker_url.is_empty());
+        assert!(restored.exchanges.is_empty());
+        assert_eq!(restored.allowed_host, "tracker.test");
+        assert_eq!(restored.port, 51_413);
+        assert!(restored.started_only);
+        assert_eq!(restored.observation_seconds, 21_600);
+        assert_eq!(restored.steps.len(), 2);
+        assert_eq!(restored.steps[1].delay_seconds, 30);
+        assert_eq!(restored.steps[1].event, Some(AnnounceEvent::Completed));
+    }
+
+    #[test]
+    fn audit_log_info_hash_uses_lowercase_hex() {
+        assert_eq!(hex_bytes(&[0x00, 0xab, 0xff]), "00abff");
+    }
 
     #[test]
     fn dropped_torrent_extension_is_case_insensitive() {

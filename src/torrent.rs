@@ -34,6 +34,9 @@ pub enum TorrentPriority {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TorrentOverrides {
+    pub download_mode: crate::download_mode::DownloadMode,
+    /// Zero means use the shared default (1 GiB); only relevant to FreezeAfter.
+    pub freeze_after_bytes: u64,
     pub download_directory: Option<String>,
     pub sequential_download: Option<bool>,
     pub priority: TorrentPriority,

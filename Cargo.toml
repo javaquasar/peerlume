@@ -3,14 +3,32 @@ name = "peerlume"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+tui = ["dep:crossterm", "dep:ratatui"]
+
+[[bin]]
+name = "peerlume"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "peerlume-tui"
+path = "src/bin/peerlume-tui.rs"
+required-features = ["tui"]
+
 [dependencies]
 crc32fast = "1.5.2"
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+crossterm = { version = "0.29.0", optional = true }
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"], optional = true }
 flate2 = "1.1.10"
 getrandom = "0.4.3"
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+librqbit-tracker-comms = "9.0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rfd = "0.15"
+rfd = { version = "0.15", optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"], optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -21,7 +39,11 @@ toml = "1.1.6"
 trash = "5.2.9"
 url = "2.5.8"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [dev-dependencies]
+tempfile = "3.27.0"
 proptest = "1.11.0"
 testcontainers = { version = "0.28.0", features = ["blocking"] }
 
@@ -30,3 +52,6 @@ debug = 0
 
 [profile.test]
 debug = 0
+
+[patch.crates-io]
+librqbit-tracker-comms = { path = "vendor/librqbit-tracker-comms" }

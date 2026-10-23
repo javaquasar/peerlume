@@ -6,7 +6,9 @@ use std::{
 use peerlume::{
     metainfo::TorrentMetainfo,
     piece_map::{FileSpan, map_selected_files_to_pieces},
-    state::{StateStore, StoredFile, TorrentRecord},
+    state::{
+        StateStore, StoredFile, StoredTrackerAuditProfile, StoredTrackerAuditStep, TorrentRecord,
+    },
 };
 
 #[test]
@@ -49,7 +51,7 @@ fn selected_file_boundaries_produce_required_piece_plan() {
 }
 
 #[test]
-fn sqlite_file_round_trip_restores_resume_state_without_tracker_secrets() {
+fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
@@ -58,6 +60,8 @@ fn sqlite_file_round_trip_restores_resume_state_without_tracker_secrets() {
     let database = root.join("state.sqlite3");
     let mut store = StateStore::open(&database).expect("open SQLite state");
     let record = TorrentRecord {
+        download_mode: peerlume::download_mode::DownloadMode::UploadRatio15,
+        freeze_after_bytes: 12345,
         id: "v1:integration".into(),
         name: "integration".into(),
         source: "fixture.torrent".into(),
@@ -81,6 +85,19 @@ fn sqlite_file_round_trip_restores_resume_state_without_tracker_secrets() {
         verified_pieces: vec![0, 2],
         downloaded_bytes: 50,
         uploaded_bytes: 5,
+        tracker_audit: Some(StoredTrackerAuditProfile {
+            allowed_host: "staging.tracker.test".into(),
+            port: 51_413,
+            started_only: true,
+            observation_seconds: 14_400,
+            steps: vec![StoredTrackerAuditStep {
+                delay_seconds: 15,
+                uploaded: 5,
+                downloaded: 50,
+                left: 50,
+                event: Some("started".into()),
+            }],
+        }),
     };
     store.save_torrent(&record).expect("save torrent state");
     drop(store);
@@ -94,8 +111,14 @@ fn sqlite_file_round_trip_restores_resume_state_without_tracker_secrets() {
     assert_eq!(restored.verified_pieces, record.verified_pieces);
     assert_eq!(restored.downloaded_bytes, 50);
     assert_eq!(restored.uploaded_bytes, 5);
-    assert!(!restored.trackers[0].contains("token=secret"));
-    assert!(!restored.trackers[0].contains("0123456789abcdef01234567"));
+    assert_eq!(restored.tracker_audit, record.tracker_audit);
+    #[cfg(windows)]
+    assert_eq!(restored.trackers, record.trackers);
+    #[cfg(not(windows))]
+    {
+        assert!(!restored.trackers[0].contains("token=secret"));
+        assert!(!restored.trackers[0].contains("0123456789abcdef01234567"));
+    }
 
     drop(store);
     fs::remove_dir_all(root).expect("remove temporary SQLite directory");

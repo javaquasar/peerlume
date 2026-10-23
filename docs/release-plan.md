@@ -5,10 +5,10 @@ BitTorrent client. Each milestone keeps formatting, strict Clippy, unit, propert
 integration, and container tests green. Network features remain disabled in the UI
 until deterministic local tests pass.
 
-Tracker passkeys are not stored in Windows Credential Manager. A full tracker URL
-with credentials exists only in memory for the running session. Logs, errors, UI
-status messages, and SQLite contain a structurally redacted URL. After a restart, a
-private tracker credential must be entered or imported again.
+Tracker passkeys are never stored as plaintext. On Windows, the full Tracker URL is
+protected with current-user DPAPI and restored for the matching user after restart.
+The ordinary SQLite URL column, logs, errors, and status messages contain only a
+structurally redacted URL.
 
 ## Milestone 0.2: hostile-input boundary
 
@@ -118,7 +118,8 @@ Done when bind, leak, rate, port mapping, and live blocklist tests pass.
 Use WAL, foreign keys, transactional migrations and checkpoints. Persist identity,
 source metadata, redacted trackers, file selection and priority, overrides, queue,
 counters, verified pieces, blocklist metadata, labels, schedules, and UI state.
-Never persist tracker passkeys.
+Never persist tracker passkeys in plaintext; protect the exact URL with an
+OS-user-bound secret mechanism and keep the ordinary tracker column redacted.
 
 Done when migration, rollback, cascade, concurrent read, and crash recovery pass.
 
@@ -181,7 +182,7 @@ acceptance criteria are specified in `tracker-audit-scenarios.md`.
 ## Release gates
 
 1. No parser panic or allocation outside configured limits.
-2. No tracker passkey in persistent state, logs, errors, or diagnostics.
+2. No plaintext tracker passkey in persistent state, logs, errors, or diagnostics.
 3. Private torrents emit no DHT, PEX, or LSD traffic.
 4. Every completed piece is verified before trusted resume state.
 5. SQLite migrations and checkpoints are transactional.

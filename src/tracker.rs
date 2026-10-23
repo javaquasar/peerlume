@@ -1,9 +1,9 @@
 use std::{
-    net::{ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket},
     time::Duration,
 };
 
-use url::Url;
+use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnounceEvent {
@@ -27,6 +27,75 @@ pub struct AnnounceRequest {
 pub struct AnnounceResponse {
     pub interval_seconds: u64,
     pub compact_peers: Vec<u8>,
+}
+
+pub fn announce_for_audit(
+    base: &str,
+    request: &AnnounceRequest,
+    allow_hosts: &[String],
+) -> Result<AnnounceResponse, String> {
+    let parsed = validate_audit_target(base, allow_hosts)?;
+    match parsed.scheme() {
+        "http" | "https" => announce_http(base, request),
+        "udp" => announce_udp(base, request),
+        _ => unreachable!("validated tracker scheme"),
+    }
+}
+
+pub fn validate_audit_target(tracker: &str, allow_hosts: &[String]) -> Result<Url, String> {
+    let parsed = Url::parse(tracker).map_err(|_| "invalid tracker URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "udp") {
+        return Err("tracker URL must use HTTP, HTTPS, or UDP".into());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "tracker URL has no hostname".to_owned())?;
+    let loopback = match parsed.host() {
+        Some(Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    let explicitly_allowed = allow_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host));
+    if !loopback && !explicitly_allowed {
+        return Err(format!(
+            "refusing non-loopback tracker host {host}; enter its exact staging hostname in the allowlist"
+        ));
+    }
+    Ok(parsed)
+}
+
+pub fn parse_info_hash_hex(value: &str) -> Result<[u8; 20], String> {
+    if value.len() != 40 {
+        return Err("info-hash must contain exactly 40 hexadecimal characters".into());
+    }
+    let mut output = [0_u8; 20];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Ok(output)
+}
+
+pub fn compact_ipv4_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>, String> {
+    if !bytes.len().is_multiple_of(6) {
+        return Err("compact IPv4 peers length must be divisible by six".into());
+    }
+    Ok(bytes
+        .chunks_exact(6)
+        .map(|peer| {
+            SocketAddrV4::new(
+                Ipv4Addr::new(peer[0], peer[1], peer[2], peer[3]),
+                u16::from_be_bytes([peer[4], peer[5]]),
+            )
+        })
+        .collect())
 }
 
 struct TrackerEndpoint {
@@ -326,6 +395,15 @@ fn percent_encode(bytes: &[u8]) -> String {
     output
 }
 
+fn hex_nibble(value: u8) -> Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err("info-hash contains a non-hexadecimal character".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +444,27 @@ mod tests {
             build_announce_url("https://tracker.test/announce", &completed)
                 .unwrap()
                 .contains("event=stopped")
+        );
+    }
+
+    #[test]
+    fn audit_helpers_restrict_targets_and_decode_identifiers_and_peers() {
+        assert!(validate_audit_target("http://localhost:8080/announce", &[]).is_ok());
+        assert!(validate_audit_target("udp://127.0.0.1:8080/announce", &[]).is_ok());
+        assert!(validate_audit_target("http://[::1]:8080/announce", &[]).is_ok());
+        assert!(validate_audit_target("https://tracker.example/announce", &[]).is_err());
+        assert!(
+            validate_audit_target(
+                "https://tracker.example/announce",
+                &["tracker.example".into()]
+            )
+            .is_ok()
+        );
+        assert!(parse_info_hash_hex("0123456789abcdef0123456789abcdef01234567").is_ok());
+        assert!(parse_info_hash_hex("abcd").is_err());
+        assert_eq!(
+            compact_ipv4_peers(&[127, 0, 0, 1, 0xc8, 0xd5]).unwrap(),
+            ["127.0.0.1:51413".parse().unwrap()]
         );
     }
 

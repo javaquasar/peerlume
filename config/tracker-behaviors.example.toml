@@ -1,0 +1,41 @@
+# Shared by egui and ratatui. Copy to %LOCALAPPDATA%/PeerLume/tracker-behaviors.toml
+# or set PEERLUME_TRACKER_BEHAVIORS to an explicit file path.
+version = 1
+download_modes = ["normal", "no_progress", "upload_ratio_1_5", "hide_downloaded", "freeze_after"]
+
+[[profiles]]
+id = "manual"
+label = "Manual audit / normal transfer"
+mode = "manual"
+[[profiles.steps]]
+event = "started"
+uploaded = 0
+downloaded = 0
+left = "full_size"
+
+[[profiles]]
+id = "started-only"
+label = "Started only, observe for 4 hours"
+mode = "started_only"
+observation_seconds = 14400
+
+[[profiles]]
+id = "periodic-test"
+label = "Started, two periodic announces, stopped"
+mode = "scenario"
+# Empty means loopback only. For an authorized staging tracker set its exact host.
+allowed_host = ""
+[[profiles.steps]]
+event = "started"
+left = "full_size"
+[[profiles.steps]]
+event = "none"
+delay_seconds = 1800
+repeat = 2
+uploaded = 0
+downloaded = 0
+left = "full_size"
+[[profiles.steps]]
+event = "stopped"
+delay_seconds = 1800
+left = "full_size"

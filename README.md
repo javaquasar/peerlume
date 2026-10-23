@@ -13,7 +13,8 @@ Keep protocol mechanisms separate from policy:
 - `scheduler`: piece selection, choking, retries, and connection limits.
 - `storage`: piece cache, verification, resume data, and file layout.
 - `policy`: replaceable behavior selected from configuration.
-- `app`: CLI now; TUI or HTTP API later.
+- `client`: UI-independent persistence and transfer-session facade.
+- `app` and `preferences`: optional eframe/egui frontend, compiled by the `gui` feature.
 
 Core behavior should be expressed behind traits such as `PeerSelectionPolicy`,
 `PieceSelectionPolicy`, and `ChokePolicy`. Configuration selects implementations;
@@ -62,14 +63,61 @@ protocol code remains independent from those choices.
 cargo run
 ```
 
+The default `gui` feature builds the desktop frontend. The reusable core can be
+compiled without any windowing or file-dialog dependencies, which is the contract
+used by the ratatui binary:
+
+```powershell
+cargo check --no-default-features --lib
+```
+
+A terminal frontend should own only terminal navigation/rendering state and use
+`client::ClientBackend` for restored torrent records, transfer commands, session
+events, and persistence. Protocol, settings, torrent, tracker, and storage modules
+are available without the `gui` feature.
+
+Run the terminal interface without compiling the GUI stack:
+
+```powershell
+cargo run --no-default-features --features tui --bin peerlume-tui
+```
+
+The shared component contract, parity rules, and TUI key map are documented in
+`docs/frontends.md`.
+
 The sample settings are in `config/peerlume.example.toml`.
 
 ## Private torrents
 
 Private torrent requirements and tracker accounting rules are documented in
-`docs/private-torrents.md`. Production tracker reporting supports `accurate` and
-`disabled` modes. Disabling reports also disables tracker communication and takes
+`docs/private-torrents.md`. Global tracker communication supports `accurate` and
+`disabled` settings. Disabling reports also disables tracker communication and takes
 effect after restarting the application.
+
+When adding a `.torrent`, choose Normal download (the default), Download without
+reporting progress, reported upload = downloaded × 1.5, hide downloaded only, or
+freeze metrics after a configurable received-byte threshold. All five
+download data from peers; the chosen mode is saved per torrent and restored after
+restart. The global `disabled` setting still disables all tracker communication.
+
+The selected torrent's **Log** tab shows real HTTP/HTTPS and UDP download announces:
+actual vs sent counters, checked disk bytes, events, tracker replies and returned
+peer addresses. JSONL is written continuously to
+`%LOCALAPPDATA%/PeerLume/announce-logs/`; exports read the full disk history rather
+than the bounded live tail. In egui use the export buttons; in ratatui use `e`
+(selected torrent) or `E` (session), and `v` to recheck files without deleting them.
+See [tracker audit scenarios](docs/tracker-audit-scenarios.md#real-announce-journal-and-jsonl)
+for accounting semantics, long-running tests, and journal limitations.
+
+The isolated long-running started-only audit mode is documented separately in
+`docs/started-only-observation.md`.
+
+Tracker audit modes and combinations can be defined in
+`%LOCALAPPDATA%/PeerLume/tracker-behaviors.toml`, shared by egui and ratatui. The
+default file is initialized from `config/tracker-behaviors.example.toml` when the
+catalog is first loaded. Set `PEERLUME_TRACKER_BEHAVIORS` to use another file.
+See `docs/tracker-audit-scenarios.md` for the format, reload controls, and snapshot
+semantics.
 
 ## Desktop UI
 
@@ -89,8 +137,22 @@ The current desktop prototype includes:
 - drag-and-drop import queue for local `.torrent` files, with a visible drop target,
   file-type validation, and sequential review before anything is added;
 - exact info hashes calculated from the original bencoded `info` bytes;
-- editable tracker URLs for reviewing or replacing account passkeys received from
-  another user, plus a generated and editable 20-byte peer ID;
+- one authoritative editable Tracker URL shared by audit and normal transfer, plus
+  a generated and editable 20-byte audit Peer ID;
+- an isolated tracker-audit panel directly below torrent metadata in the add dialog,
+  with editable `uploaded`, `downloaded`, `left`, event and port values plus the
+  returned compact IPv4 peer list;
+- a per-torrent audit scenario editor in the Trackers tab, with ordered steps,
+  per-step delays and accounting values, individual-step or full-scenario execution,
+  cancellation, and a `sent -> received` exchange log;
+- an optional started-only observation mode that sends one zero-counter `started`
+  announce with the full torrent size in `left`, then waits for up to seven days
+  without sending periodic, `completed`, or `stopped` audit announces; selecting it
+  in the add dialog forces the normal transfer to start paused and launches the
+  observation immediately after the torrent is added;
+- persistence of each torrent's audit steps, staging allowlist host, announced port,
+  and Tracker URL; on Windows the exact credential-bearing URL is protected with
+  current-user DPAPI while SQLite and logs expose only its redacted form;
 - Downloads, Queue, Speed, Connection, BitTorrent, Seeding, Privacy, Storage,
   and Automation preference tabs;
 - global and per-torrent limits, peer discovery switches, piece strategy,
@@ -164,6 +226,10 @@ counters and prints the returned compact IPv4 peer list as JSON. It accepts loop
 trackers by default; a non-loopback staging hostname must be repeated exactly in
 `--allow-host`. Use a dedicated test passkey and torrent.
 
+The same one-shot operation is available in the desktop add-torrent dialog under
+**Tracker audit**, immediately below the torrent summary. Its counters affect only
+that audit request and are not reused by the normal transfer session.
+
 ```powershell
 $env:PEERLUME_AUDIT_TRACKER_URL = "http://127.0.0.1:8080/announce"
 cargo run --bin tracker-audit -- `
@@ -183,7 +249,8 @@ cargo run --bin tracker-audit -- `
 
 Run the command repeatedly with the same peer ID and deliberately chosen counter
 transitions to exercise the scenarios in the audit document. The production desktop
-client remains limited to accurate reporting or complete tracker disablement.
+client uses accurate reporting by default; the separate per-torrent Download mode
+selector enables the four explicit download-time metric test modes.
 
 ## Memory behavior
 
@@ -200,3 +267,22 @@ client remains limited to accurate reporting or complete tracker disablement.
 The test suite includes a 100,000-file model, borrowed bencode slices, streaming
 gzip parsing, binary cache round trips and corruption handling, and incremental
 selection and progress accounting.
+
+## Repository language and publication checks
+
+All maintained source code, UI text, comments, documentation, configuration, and
+file names must be in English. Unicode punctuation and UI symbols are allowed.
+Before preparing a GitHub commit, run the language checker from PowerShell:
+
+```powershell
+powershell -NoProfile -File scripts/check-english.ps1 -SelfTest
+powershell -NoProfile -File scripts/check-english.ps1
+```
+
+The checker scans tracked and untracked publication files using the repository's
+Git ignore rules, rejects Cyrillic in paths or text, and reports invalid text
+encodings. It checks UTF-8 and BOM-marked Unicode text; binary resources are not
+interpreted as prose. Generated build output and local downloads remain ignored.
+Automated detection is a guard against Cyrillic, not a semantic language detector:
+review new prose to ensure it is English. This check does not replace a separate
+credentials, licensing, and release review before publishing a repository.

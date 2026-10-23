@@ -1,62 +1,11 @@
 use eframe::egui;
 
+pub use crate::ui_schema::PreferencesTab;
+
 use crate::settings::{
     ChokingAlgorithm, ClientSettings, ContentLayout, EncryptionMode, NoSpaceAction, PieceStrategy,
     PreallocationMode, TrackerReportingMode, VerifyMode,
 };
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PreferencesTab {
-    #[default]
-    Downloads,
-    Queue,
-    Speed,
-    Connection,
-    BitTorrent,
-    Seeding,
-    Privacy,
-    Storage,
-    Automation,
-}
-
-impl PreferencesTab {
-    pub const ALL: [Self; 9] = [
-        Self::Downloads,
-        Self::Queue,
-        Self::Speed,
-        Self::Connection,
-        Self::BitTorrent,
-        Self::Seeding,
-        Self::Privacy,
-        Self::Storage,
-        Self::Automation,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Downloads => "Downloads",
-            Self::Queue => "Queue",
-            Self::Speed => "Speed",
-            Self::Connection => "Connection",
-            Self::BitTorrent => "BitTorrent",
-            Self::Seeding => "Seeding",
-            Self::Privacy => "Privacy",
-            Self::Storage => "Disk and cache",
-            Self::Automation => "Automation",
-        }
-    }
-
-    pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(0)
-    }
-
-    pub fn from_index(index: usize) -> Self {
-        Self::ALL.get(index).copied().unwrap_or_default()
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct PreferencesActions {

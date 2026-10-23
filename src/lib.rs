@@ -1,7 +1,11 @@
+pub mod announce_journal;
+#[cfg(feature = "gui")]
 pub mod app;
 pub mod blocklist;
 pub mod buffer_pool;
+pub mod client;
 pub mod discovery;
+pub mod download_mode;
 pub mod engine;
 pub mod file_selection;
 pub mod identity;
@@ -10,6 +14,7 @@ pub mod magnet;
 pub mod metadata;
 pub mod metainfo;
 pub mod piece_map;
+#[cfg(feature = "gui")]
 pub mod preferences;
 pub mod protocol;
 pub mod rate_limit;
@@ -20,5 +25,9 @@ pub mod state;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
+pub mod tracker_behavior;
 pub mod transfer;
+#[cfg(feature = "tui")]
+pub mod tui;
+pub mod ui_schema;
 pub mod verify;
