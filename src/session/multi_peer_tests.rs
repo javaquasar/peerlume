@@ -325,6 +325,13 @@ struct TorrentFixture {
 }
 
 fn download_torrents_concurrently(specifications: &[(usize, DownloadMode)]) {
+    download_torrents_with_verification(specifications, false);
+}
+
+fn download_torrents_with_verification(
+    specifications: &[(usize, DownloadMode)],
+    verify_after_download: bool,
+) {
     let root = tempfile::tempdir().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let total_peers: usize = specifications.iter().map(|(peers, _)| peers).sum();
@@ -440,6 +447,7 @@ fn download_torrents_concurrently(specifications: &[(usize, DownloadMode)]) {
     for torrent in &torrents {
         runtime
             .try_send(SessionCommand::AddTorrent {
+                verify_after_download,
                 download_mode: torrent.mode,
                 freeze_after_bytes: 16384,
                 full_size: torrent.payload.len() as u64,
@@ -455,6 +463,8 @@ fn download_torrents_concurrently(specifications: &[(usize, DownloadMode)]) {
     }
     let deadline = Instant::now() + DEADLINE;
     let mut finished = HashSet::new();
+    let mut checking_seen = HashSet::new();
+    let mut verified_seen = HashSet::new();
     let mut last_stats = String::new();
     while Instant::now() < deadline {
         match runtime.recv_timeout(Duration::from_millis(200)) {
@@ -468,12 +478,38 @@ fn download_torrents_concurrently(specifications: &[(usize, DownloadMode)]) {
                     .iter()
                     .find(|torrent| torrent.id == torrent_id)
                     .expect("stats must belong to an added torrent");
+                if verify_after_download {
+                    assert!(
+                        checking_seen.contains(&torrent_id),
+                        "Done must follow a real disk check"
+                    );
+                    assert!(
+                        verified_seen.contains(&torrent_id),
+                        "Done must wait for successful verification"
+                    );
+                }
                 assert_eq!(downloaded_bytes, torrent.payload.len() as u64);
                 finished.insert(torrent_id);
                 if finished.len() == torrents.len() {
                     break;
                 }
             }
+            Ok(SessionEvent::Verification { id, status }) => match status {
+                crate::completion::CompletionStatus::Checking {
+                    checked_bytes,
+                    total_bytes,
+                } => {
+                    assert!(checked_bytes <= total_bytes);
+                    checking_seen.insert(id);
+                }
+                crate::completion::CompletionStatus::Verified => {
+                    verified_seen.insert(id);
+                }
+                crate::completion::CompletionStatus::Failed { message } => {
+                    panic!("verification: {message}")
+                }
+                _ => {}
+            },
             Ok(SessionEvent::Error { message, .. }) => panic!("transfer engine: {message}"),
             Ok(event @ SessionEvent::Stats { .. }) => last_stats = format!("{event:?}"),
             _ => {}
@@ -598,4 +634,12 @@ fn different_torrents_download_concurrently_in_one_session() {
     // Separate metainfo, hashes, trackers, peer sets, output directories, and modes.
     // The shared first-block and midpoint gates span all four peer connections.
     download_torrents_concurrently(&[(2, DownloadMode::Normal), (2, DownloadMode::NoProgress)]);
+}
+
+#[test]
+fn different_torrents_are_verified_after_parallel_download_before_done() {
+    download_torrents_with_verification(
+        &[(2, DownloadMode::Normal), (2, DownloadMode::NoProgress)],
+        true,
+    );
 }

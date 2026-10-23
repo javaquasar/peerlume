@@ -30,6 +30,28 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::Verification { id, status } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                match &status {
+                    crate::completion::CompletionStatus::Checking { .. } => {
+                        torrent.state = TorrentState::Checking;
+                        torrent.download_rate = 0;
+                        torrent.upload_rate = 0;
+                    }
+                    crate::completion::CompletionStatus::Failed { message } => {
+                        torrent.state = TorrentState::VerificationFailed;
+                        torrent.completion = status.clone();
+                        return SessionNotice::Error {
+                            id,
+                            message: message.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+                torrent.completion = status;
+            }
+            SessionNotice::None
+        }
         SessionEvent::Added { id } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id)
                 && torrent.state == TorrentState::WaitingForEngine
@@ -40,6 +62,9 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
         }
         SessionEvent::StateChanged { id, state } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                if state != "paused" {
+                    torrent.completion = crate::completion::CompletionStatus::Pending;
+                }
                 torrent.state = if state == "paused" {
                     TorrentState::Paused
                 } else {
@@ -60,6 +85,13 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             paused,
         } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                if matches!(
+                    torrent.completion,
+                    crate::completion::CompletionStatus::Checking { .. }
+                        | crate::completion::CompletionStatus::Failed { .. }
+                ) {
+                    return SessionNotice::None;
+                }
                 for (index, progress) in file_progress.into_iter().enumerate() {
                     torrent.files.set_file_downloaded(index, progress);
                 }
@@ -72,6 +104,11 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                 torrent.download_rate = download_rate;
                 torrent.upload_rate = upload_rate;
                 torrent.peers = peers;
+                if finished && torrent.selected_size() > 0 {
+                    torrent.completion = crate::completion::CompletionStatus::Verified;
+                } else {
+                    torrent.completion = crate::completion::CompletionStatus::Pending;
+                }
                 torrent.state = if paused {
                     TorrentState::Paused
                 } else if finished {
@@ -84,6 +121,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
         }
         SessionEvent::Error { id, message } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.completion = crate::completion::CompletionStatus::Pending;
                 torrent.state = TorrentState::Error;
                 torrent.download_rate = 0;
                 torrent.upload_rate = 0;
@@ -126,6 +164,7 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         .collect();
     let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
     SessionCommand::AddTorrent {
+        verify_after_download: torrent.overrides.verify_after_download,
         download_mode: torrent.overrides.download_mode,
         freeze_after_bytes: if torrent.overrides.freeze_after_bytes == 0 {
             crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES
@@ -143,7 +182,10 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         output_folder: effective.download_directory,
         only_files,
         trackers: torrent.trackers.clone(),
-        paused: matches!(torrent.state, TorrentState::Paused | TorrentState::Error),
+        paused: matches!(
+            torrent.state,
+            TorrentState::Paused | TorrentState::Error | TorrentState::VerificationFailed
+        ),
         peer_limit: (effective.max_peers > 0).then_some(effective.max_peers),
     }
 }
@@ -159,6 +201,7 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
+        verify_after_download: torrent.overrides.verify_after_download,
         download_mode: torrent.overrides.download_mode,
         freeze_after_bytes: torrent.overrides.freeze_after_bytes,
         id: torrent.info_hashes.join(";"),
@@ -210,6 +253,7 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
         info_hashes.push(format!("v2: {hash}"));
     }
     TorrentItem {
+        completion: crate::completion::CompletionStatus::Pending,
         name: record.name,
         source: record.source,
         info_hashes,
@@ -225,11 +269,14 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
         state: match record.state.as_str() {
             "seeding" => TorrentState::Seeding,
             "downloading" | "waiting for transfer engine" => TorrentState::WaitingForEngine,
+            "checking" => TorrentState::WaitingForEngine,
+            "verification failed" => TorrentState::VerificationFailed,
             "error" => TorrentState::Error,
             _ => TorrentState::Paused,
         },
         is_private: record.is_private,
         overrides: TorrentOverrides {
+            verify_after_download: record.verify_after_download,
             download_mode: record.download_mode,
             freeze_after_bytes: record.freeze_after_bytes,
             download_directory: record.download_directory,
@@ -313,8 +360,79 @@ impl ClientBackend {
 mod tests {
     use super::*;
 
+    fn completion_stats(finished: bool, paused: bool) -> SessionEvent {
+        SessionEvent::Stats {
+            id: "v1: abc".into(),
+            downloaded_bytes: 100,
+            uploaded_bytes: 7,
+            download_rate: 0,
+            upload_rate: 0,
+            file_progress: vec![100],
+            peers: 0,
+            finished,
+            paused,
+        }
+    }
+
+    #[test]
+    fn done_is_engine_confirmed_and_checking_has_its_own_progress() {
+        let mut torrents = vec![torrent()];
+        apply_session_event(&mut torrents, completion_stats(false, false));
+        assert_eq!(torrents[0].progress(), 1.0);
+        assert!(!torrents[0].completed_successfully());
+        apply_session_event(
+            &mut torrents,
+            SessionEvent::Verification {
+                id: "v1: abc".into(),
+                status: crate::completion::CompletionStatus::Checking {
+                    checked_bytes: 25,
+                    total_bytes: 100,
+                },
+            },
+        );
+        assert_eq!(torrents[0].display_progress(), 0.25);
+        assert_eq!(torrents[0].progress_text(), "Checking — 25%");
+        apply_session_event(&mut torrents, completion_stats(true, false));
+        assert!(
+            !torrents[0].completed_successfully(),
+            "stale completion cannot interrupt a check"
+        );
+        apply_session_event(
+            &mut torrents,
+            SessionEvent::Verification {
+                id: "v1: abc".into(),
+                status: crate::completion::CompletionStatus::Verified,
+            },
+        );
+        apply_session_event(&mut torrents, completion_stats(true, false));
+        assert!(torrents[0].completed_successfully());
+        assert_eq!(torrents[0].status_text(), "Done · Seeding");
+        apply_session_event(&mut torrents, completion_stats(true, true));
+        assert_eq!(torrents[0].status_text(), "Done · Paused");
+    }
+
+    #[test]
+    fn failed_verification_never_turns_green_from_stale_stats() {
+        let mut torrents = vec![torrent()];
+        let status = crate::completion::CompletionStatus::Failed {
+            message: "piece hash mismatch".into(),
+        };
+        apply_session_event(
+            &mut torrents,
+            SessionEvent::Verification {
+                id: "v1: abc".into(),
+                status,
+            },
+        );
+        apply_session_event(&mut torrents, completion_stats(true, false));
+        assert!(!torrents[0].completed_successfully());
+        assert_eq!(torrents[0].progress_text(), "Verification failed");
+        assert_eq!(torrents[0].state, TorrentState::VerificationFailed);
+    }
+
     fn torrent() -> TorrentItem {
         TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: "test".into(),
             source: "test.torrent".into(),
             info_hashes: vec!["v1: abc".into()],
@@ -337,6 +455,7 @@ mod tests {
     fn unavailable_optional_services_have_frontend_friendly_semantics() {
         let mut backend = ClientBackend::offline();
         let record = TorrentRecord {
+            verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
             id: "test".into(),
@@ -462,6 +581,7 @@ mod tests {
     #[test]
     fn shared_record_and_command_mapping_preserve_frontend_choices() {
         let mut torrent = torrent();
+        torrent.overrides.verify_after_download = true;
         torrent.files.set_selected(0, false);
         torrent.overrides.download_directory = Some("special".into());
         torrent.overrides.download_mode = crate::download_mode::DownloadMode::NoProgress;
@@ -469,6 +589,7 @@ mod tests {
 
         let command = add_torrent_command(&torrent, &settings);
         let SessionCommand::AddTorrent {
+            verify_after_download,
             download_mode,
             output_folder,
             only_files,
@@ -479,6 +600,7 @@ mod tests {
             panic!("expected add command");
         };
         assert_eq!(output_folder, "special");
+        assert!(verify_after_download);
         assert_eq!(
             download_mode,
             crate::download_mode::DownloadMode::NoProgress
@@ -488,6 +610,11 @@ mod tests {
 
         let record = torrent_to_record(&torrent, None);
         let restored = torrent_from_record(record, &settings);
+        assert!(restored.overrides.verify_after_download);
+        assert!(
+            !restored.completed_successfully(),
+            "restored progress is not a fresh integrity confirmation"
+        );
         assert_eq!(
             restored.overrides.download_mode,
             crate::download_mode::DownloadMode::NoProgress

@@ -91,6 +91,7 @@ pub struct TuiApp {
     last_download_directory: Option<String>,
     pending_add: Option<(PathBuf, TorrentMetainfo)>,
     show_tracker_identity: bool,
+    pending_verify_after_download: bool,
 }
 
 impl TuiApp {
@@ -144,6 +145,7 @@ impl TuiApp {
             last_download_directory: None,
             pending_add: None,
             show_tracker_identity: false,
+            pending_verify_after_download: false,
         }
     }
 
@@ -195,6 +197,10 @@ impl TuiApp {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if key.code == KeyCode::F(3) && self.pending_add.is_some() {
+            self.pending_verify_after_download = !self.pending_verify_after_download;
+            return;
+        }
         if key.code == KeyCode::F(2)
             && self.page == MainPage::Torrents
             && (matches!(
@@ -243,6 +249,18 @@ impl TuiApp {
                         }
                         Err(e) => e,
                     };
+                }
+            }
+            KeyCode::Char('V') if self.page == MainPage::Torrents => {
+                if let Some(torrent) = self.selected_mut() {
+                    torrent.overrides.verify_after_download =
+                        !torrent.overrides.verify_after_download;
+                    let command = SessionCommand::SetVerifyAfterDownload {
+                        id: torrent.info_hashes.join(";"),
+                        enabled: torrent.overrides.verify_after_download,
+                    };
+                    let _ = self.backend.send(command);
+                    self.persist_selected();
                 }
             }
             KeyCode::Char('e') if self.details_tab == TorrentDetailsTab::Log => {
@@ -530,6 +548,7 @@ impl TuiApp {
         }
         let metainfo = TorrentMetainfo::load(&path)?;
         self.pending_add = Some((path, metainfo));
+        self.pending_verify_after_download = false;
         self.behavior_catalog = BehaviorCatalog::load();
         let modes = self
             .behavior_catalog
@@ -645,6 +664,7 @@ impl TuiApp {
             .clone()
             .unwrap_or_else(|| self.settings.download.download_directory.clone());
         let torrent = TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: metainfo.name,
             source: path.display().to_string(),
             info_hashes: [
@@ -666,6 +686,7 @@ impl TuiApp {
             state,
             is_private: metainfo.is_private,
             overrides: TorrentOverrides {
+                verify_after_download: self.pending_verify_after_download,
                 download_mode,
                 freeze_after_bytes,
                 download_directory: Some(download_directory),
@@ -698,6 +719,7 @@ impl TuiApp {
             .display_name
             .unwrap_or_else(|| "Magnet metadata".into());
         let torrent = TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
             source: uri.trim().to_owned(),
             info_hashes: magnet.exact_topics,
@@ -1026,6 +1048,10 @@ impl TuiApp {
             let mode_prompt = prompt.kind == PromptKind::DownloadMode;
             let mut lines = vec![Line::from(prompt.value.as_str())];
             if mode_prompt {
+                lines.push(Line::from(format!(
+                    "Verify after download: {} · F3 toggles",
+                    self.pending_verify_after_download
+                )));
                 let modes = self
                     .behavior_catalog
                     .as_ref()
@@ -1072,15 +1098,19 @@ impl TuiApp {
             .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
             .split(area);
         let rows = self.torrents.iter().map(|torrent| {
-            let percent = if torrent.selected_size() == 0 {
-                0
+            let progress_style = if torrent.completed_successfully() {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else if torrent.state == TorrentState::Checking {
+                Style::default().fg(Color::Yellow)
+            } else if torrent.state == TorrentState::VerificationFailed {
+                Style::default().fg(Color::White).bg(Color::Red)
             } else {
-                torrent.downloaded_bytes.saturating_mul(100) / torrent.selected_size()
+                Style::default()
             };
             Row::new(vec![
                 Cell::from(torrent.name.clone()),
-                Cell::from(format!("{percent}%")),
-                Cell::from(torrent.state.label()),
+                Cell::from(torrent.progress_text()).style(progress_style),
+                Cell::from(torrent.status_text()),
                 Cell::from(format_size(torrent.download_rate)),
             ])
         });
@@ -1088,8 +1118,8 @@ impl TuiApp {
             rows,
             [
                 Constraint::Percentage(48),
-                Constraint::Length(6),
-                Constraint::Length(12),
+                Constraint::Length(20),
+                Constraint::Length(24),
                 Constraint::Length(10),
             ],
         )
@@ -1097,11 +1127,7 @@ impl TuiApp {
             Row::new(["Name", "%", "State", "Down/s"]).style(Style::default().fg(Color::Yellow)),
         )
         .block(Block::default().title(" Torrents ").borders(Borders::ALL))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
         let mut state = ratatui::widgets::TableState::default();
         if !self.torrents.is_empty() {
@@ -1166,6 +1192,12 @@ impl TuiApp {
             TorrentDetailsTab::Info => {
                 let mut lines = vec![
                     Line::from(format!("Name: {}", torrent.name)),
+                    Line::from(format!(
+                        "State: {} · {}",
+                        torrent.status_text(),
+                        torrent.progress_text()
+                    )),
+                    Line::from(format!("Integrity: {:?}", torrent.completion)),
                     Line::from(format!("Private: {}", torrent.is_private)),
                     Line::from(format!("Source: {}", torrent.source)),
                     Line::from(format!("Info hashes: {}", torrent.info_hashes.join(", "))),
@@ -1230,6 +1262,10 @@ impl TuiApp {
                         )),
                         Line::from(format!("Max peers: {}", effective.max_peers)),
                         Line::from(format!("Sequential: {}", effective.sequential_download)),
+                        Line::from(format!(
+                            "Verify after download: {} · V toggles",
+                            torrent.overrides.verify_after_download
+                        )),
                         Line::from("Press o to override the download directory."),
                     ])
                     .block(
@@ -1324,12 +1360,23 @@ impl TuiApp {
                     Gauge::default()
                         .block(
                             Block::default()
-                                .title(" Verified payload ")
+                                .title(if torrent.state == TorrentState::Checking {
+                                    " Integrity check "
+                                } else {
+                                    " Verified payload "
+                                })
                                 .borders(Borders::ALL),
                         )
-                        .ratio(ratio)
+                        .ratio(
+                            torrent
+                                .completion
+                                .checking_progress()
+                                .map(f64::from)
+                                .unwrap_or(ratio),
+                        )
                         .label(format!(
-                            "{} / {}",
+                            "{} · {} / {}",
+                            torrent.progress_text(),
                             format_size(torrent.downloaded_bytes),
                             format_size(total)
                         )),
@@ -1534,8 +1581,79 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn completed_checking_and_failed_rows_render_distinct_progress_states() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(220, 40)).unwrap();
+        for (state, completion, expected) in [
+            (
+                TorrentState::Seeding,
+                crate::completion::CompletionStatus::Verified,
+                "Done",
+            ),
+            (
+                TorrentState::Checking,
+                crate::completion::CompletionStatus::Checking {
+                    checked_bytes: 25,
+                    total_bytes: 100,
+                },
+                "Checking",
+            ),
+            (
+                TorrentState::VerificationFailed,
+                crate::completion::CompletionStatus::Failed {
+                    message: "mismatch".into(),
+                },
+                "Verification failed",
+            ),
+        ] {
+            app.torrents[0].state = state;
+            app.torrents[0].completion = completion;
+            app.torrents[0].downloaded_bytes = app.torrents[0].selected_size();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(
+                text.contains(expected),
+                "missing progress state: {expected}"
+            );
+            if state == TorrentState::Seeding {
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .any(|cell| cell.symbol() == "D" && cell.bg == Color::Green)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_toggle_updates_the_shared_torrent_setting() {
+        let mut app = app();
+        assert!(!app.torrents[0].overrides.verify_after_download);
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
+        assert!(app.torrents[0].overrides.verify_after_download);
+        let record = torrent_to_record(&app.torrents[0], None);
+        assert!(record.verify_after_download);
+    }
+
+    #[test]
+    fn pending_torrent_verification_can_be_enabled_before_addition() {
+        let mut app = app();
+        let metadata = TorrentMetainfo::parse(b"d4:infod6:lengthi1e4:name1:aee").unwrap();
+        app.pending_add = Some((PathBuf::from("fixture.torrent"), metadata));
+        app.open_prompt(PromptKind::DownloadMode, "Download mode", "1".into());
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.pending_verify_after_download);
+        assert_eq!(app.input.as_ref().unwrap().value, "1");
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(!app.pending_verify_after_download);
+    }
+
     fn test_torrent() -> TorrentItem {
         TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: "fixture".into(),
             source: "fixture.torrent".into(),
             info_hashes: vec!["v1: 0123456789abcdef0123456789abcdef01234567".into()],

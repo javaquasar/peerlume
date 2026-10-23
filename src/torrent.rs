@@ -9,6 +9,8 @@ pub enum TorrentState {
     WaitingForEngine,
     Paused,
     Seeding,
+    Checking,
+    VerificationFailed,
     Error,
 }
 
@@ -19,6 +21,8 @@ impl TorrentState {
             Self::WaitingForEngine => "Waiting for transfer engine",
             Self::Paused => "Paused",
             Self::Seeding => "Seeding",
+            Self::Checking => "Checking",
+            Self::VerificationFailed => "Verification failed",
             Self::Error => "Error",
         }
     }
@@ -34,6 +38,7 @@ pub enum TorrentPriority {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TorrentOverrides {
+    pub verify_after_download: bool,
     pub download_mode: crate::download_mode::DownloadMode,
     /// Zero means use the shared default (1 GiB); only relevant to FreezeAfter.
     pub freeze_after_bytes: u64,
@@ -116,6 +121,7 @@ impl EffectiveTorrentSettings {
 
 #[derive(Clone, Debug)]
 pub struct TorrentItem {
+    pub completion: crate::completion::CompletionStatus,
     pub name: String,
     pub source: String,
     pub info_hashes: Vec<String>,
@@ -134,6 +140,49 @@ pub struct TorrentItem {
 }
 
 impl TorrentItem {
+    pub fn completed_successfully(&self) -> bool {
+        self.completion == crate::completion::CompletionStatus::Verified
+            && self.selected_size() > 0
+            && self.downloaded_bytes >= self.selected_size()
+            && matches!(self.state, TorrentState::Seeding | TorrentState::Paused)
+    }
+
+    pub fn display_progress(&self) -> f32 {
+        self.completion
+            .checking_progress()
+            .unwrap_or_else(|| self.progress())
+    }
+
+    pub fn progress_text(&self) -> String {
+        if let Some(progress) = self.completion.checking_progress() {
+            format!("Checking — {:.0}%", progress * 100.0)
+        } else if self.completed_successfully() {
+            "Done".into()
+        } else if matches!(
+            self.completion,
+            crate::completion::CompletionStatus::Failed { .. }
+        ) {
+            "Verification failed".into()
+        } else {
+            // Do not round an unfinished download up to 100%.
+            let total = self.selected_size();
+            let percent = if total == 0 {
+                0
+            } else {
+                self.downloaded_bytes.min(total) as u128 * 100 / total as u128
+            };
+            format!("{percent}%")
+        }
+    }
+
+    pub fn status_text(&self) -> String {
+        if self.completed_successfully() {
+            format!("Done · {}", self.state.label())
+        } else {
+            self.state.label().into()
+        }
+    }
+
     pub fn selected_size(&self) -> u64 {
         self.files.selected_size()
     }
@@ -184,12 +233,14 @@ impl TorrentItem {
             TorrentState::WaitingForEngine => {}
             TorrentState::Paused => {}
             TorrentState::Error => {}
+            TorrentState::Checking | TorrentState::VerificationFailed => {}
         }
     }
 }
 
 pub fn demo_torrents() -> Vec<TorrentItem> {
     let mut first = TorrentItem {
+        completion: crate::completion::CompletionStatus::Pending,
         name: "Open Movie Collection".into(),
         source: "demo".into(),
         info_hashes: vec!["v1: demo-public-movie".into()],
@@ -216,6 +267,7 @@ pub fn demo_torrents() -> Vec<TorrentItem> {
     first.downloaded_bytes = first.files.selected_downloaded();
 
     let mut second = TorrentItem {
+        completion: crate::completion::CompletionStatus::Pending,
         name: "Linux Distribution 2026.09".into(),
         source: "demo".into(),
         info_hashes: vec!["v1: demo-linux-distribution".into()],
@@ -241,6 +293,7 @@ pub fn demo_torrents() -> Vec<TorrentItem> {
     second.downloaded_bytes = second.files.selected_downloaded();
 
     let mut third = TorrentItem {
+        completion: crate::completion::CompletionStatus::Pending,
         name: "Private Archive".into(),
         source: "demo".into(),
         info_hashes: vec!["v1: demo-private-archive".into()],

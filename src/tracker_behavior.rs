@@ -425,6 +425,7 @@ mod tests {
         assert_eq!(profile.steps[0].left, 512);
         let mut store = crate::state::StateStore::in_memory().unwrap();
         let record = crate::state::TorrentRecord {
+            verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
             id: "v1: abc".into(),

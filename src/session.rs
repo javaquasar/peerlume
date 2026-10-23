@@ -6,15 +6,19 @@ use std::{
     time::Duration,
 };
 
+use crate::completion::CompletionStatus;
 use crate::{announce_journal::AnnounceJournal, download_mode::DownloadMode};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
 use tokio::sync::mpsc as tokio_mpsc;
+mod verification;
+use verification::{CheckRun, restart_for_check};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
     AddTorrent {
+        verify_after_download: bool,
         download_mode: DownloadMode,
         freeze_after_bytes: u64,
         full_size: u64,
@@ -38,6 +42,10 @@ pub enum SessionCommand {
     Recheck {
         id: String,
     },
+    SetVerifyAfterDownload {
+        id: String,
+        enabled: bool,
+    },
     SetFiles {
         id: String,
         only_files: Vec<usize>,
@@ -47,6 +55,10 @@ pub enum SessionCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    Verification {
+        id: String,
+        status: crate::completion::CompletionStatus,
+    },
     Added {
         id: String,
     },
@@ -190,20 +202,63 @@ impl SessionRuntime {
                     let mut torrents: HashMap<String, Arc<ManagedTorrent>> = HashMap::new();
                     let mut reporting_policies = HashMap::new();
                     let mut added_commands: HashMap<String, SessionCommand> = HashMap::new();
+                    let mut checks = HashMap::<String, CheckRun>::new();
+                    let mut checked_after_download = std::collections::HashSet::<String>::new();
+                    let mut check_failed = std::collections::HashSet::<String>::new();
+                    let mut initializing = std::collections::HashSet::<String>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                     loop {
                         tokio::select! {
                             _ = ticker.tick() => {
-                                for (id, handle) in &torrents {
-                                    transfers(handle.info_hash().0);
-                                    let stats = handle.stats();
+                                let torrent_ids: Vec<_> = torrents.keys().cloned().collect();
+                                for id in torrent_ids {
+                                    let Some(handle) = torrents.get(&id).cloned() else { continue; };
+                                    if check_failed.contains(&id) { continue; }
+                                    let transfer_snapshot = transfers(handle.info_hash().0);
+                                    let mut stats = handle.stats();
                                     if let Some(message) = stats.error.clone() {
-                                        let _ = event_tx.try_send(SessionEvent::Error {
-                                            id: id.clone(),
-                                            message,
-                                        });
+                                        if checks.remove(&id).is_some() {
+                                            check_failed.insert(id.clone());
+                                            let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "Integrity check could not read or validate the files".into() } });
+                                        } else { let _ = event_tx.try_send(SessionEvent::Error { id, message }); }
+                                        continue;
+                                    }
+                                    if matches!(stats.state, TorrentStatsState::Initializing { .. }) {
+                                        initializing.insert(id.clone());
+                                        let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Checking { checked_bytes: stats.progress_bytes, total_bytes: stats.total_bytes } });
+                                        continue;
+                                    }
+                                    if let Some(run) = checks.remove(&id) {
+                                        initializing.remove(&id);
+                                        if run.require_complete && !stats.finished {
+                                            check_failed.insert(id.clone());
+                                            let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "One or more selected pieces are missing or failed their hash check. Repair the files and recheck, or resume to download them again.".into() } });
+                                            continue;
+                                        }
+                                        if stats.finished { checked_after_download.insert(id.clone()); }
+                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: if stats.finished { CompletionStatus::Verified } else { CompletionStatus::Pending } });
+                                        if run.resume {
+                                            if session.unpause(&handle).await.is_err() {
+                                                let _ = event_tx.try_send(SessionEvent::Error { id, message: "Integrity check succeeded, but the torrent could not resume".into() });
+                                                continue;
+                                            }
+                                            stats = handle.stats();
+                                        }
+                                        let _ = event_tx.try_send(SessionEvent::StateChanged { id: id.clone(), state: if run.resume { "downloading" } else { "paused" } });
+                                    } else if initializing.remove(&id) {
+                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
+                                    }
+                                    if check_failed.contains(&id) { continue; }
+                                    let verify_after_download = matches!(added_commands.get(&id), Some(SessionCommand::AddTorrent { verify_after_download: true, .. }));
+                                    if stats.finished && verify_after_download && !checked_after_download.contains(&id) {
+                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
+                                        let resume = !matches!(stats.state, TorrentStatsState::Paused);
+                                        match restart_for_check(&session, &handle, &added_commands[&id], &counters).await {
+                                            Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id, CheckRun { resume, require_complete: true }); }
+                                            Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
+                                        }
                                         continue;
                                     }
                                     let paused = matches!(
@@ -225,7 +280,7 @@ impl SessionRuntime {
                                     let _ = event_tx.try_send(SessionEvent::Stats {
                                         id: id.clone(),
                                         downloaded_bytes: stats.progress_bytes,
-                                        uploaded_bytes: stats.uploaded_bytes,
+                                        uploaded_bytes: transfer_snapshot.uploaded,
                                         download_rate,
                                         upload_rate,
                                         file_progress: stats.file_progress,
@@ -236,27 +291,26 @@ impl SessionRuntime {
                                 }
                             }
                             command = command_rx.recv() => {
-                                let Some(mut command) = command else { break };
+                                let Some(command) = command else { break };
                                 if let SessionCommand::Recheck { id } = &command {
-                                    let Some(handle) = torrents.get(id) else { continue; };
-                                    let paused = matches!(handle.stats().state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
+                                    if checks.contains_key(id) { continue; }
+                                    let Some(handle) = torrents.get(id).cloned() else { continue; };
+                                    let stats = handle.stats();
+                                    let resume = !matches!(stats.state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
+                                    let require_complete = stats.finished || check_failed.contains(id);
                                     transfers(handle.info_hash().0);
-                                    let final_sample = final_transfer_sampler(handle, &counters);
-                                    if let Err(error) = session.delete(handle.id().into(), false).await {
-                                        final_sample();
-                                        let _ = event_tx.try_send(SessionEvent::Error { id: id.clone(), message: format!("Recheck failed: {error:#}") });
-                                        continue;
+                                    let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
+                                    let Some(saved) = added_commands.get(id) else { continue; };
+                                    match restart_for_check(&session, &handle, saved, &counters).await {
+                                        Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.try_send(SessionEvent::Added { id: id.clone() }); }
+                                        Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
                                     }
-                                    final_sample();
-                                    torrents.remove(id);
-                                    reporting_policies.remove(id);
-                                    let Some(add) = added_commands.get(id) else { continue; };
-                                    command = add.clone();
-                                    if let SessionCommand::AddTorrent { paused: saved, .. } = &mut command { *saved = paused; }
+                                    continue;
                                 }
                                 let saved_command = command.clone();
                                 match command {
                                     SessionCommand::AddTorrent {
+                                        verify_after_download: _,
                                         download_mode,
                                         freeze_after_bytes,
                                         full_size,
@@ -323,6 +377,7 @@ impl SessionRuntime {
                                         }
                                     }
                                     SessionCommand::Pause { id } => {
+                                        if let Some(run) = checks.get_mut(&id) { run.resume = false; continue; }
                                         let result = if let Some(handle) = torrents.get(&id) {
                                             transfers(handle.info_hash().0);
                                             let final_sample = final_transfer_sampler(handle, &counters);
@@ -335,6 +390,8 @@ impl SessionRuntime {
                                         emit_state_result(&event_tx, id, result, "paused");
                                     }
                                     SessionCommand::Resume { id } => {
+                                        if let Some(run) = checks.get_mut(&id) { run.resume = true; continue; }
+                                        if check_failed.remove(&id) { checked_after_download.remove(&id); }
                                         let result = if let Some(handle) = torrents.get(&id) {
                                             session.unpause(handle).await.map_err(|error| format!("{error:#}"))
                                         } else {
@@ -357,6 +414,10 @@ impl SessionRuntime {
                                         };
                                         let event = match result {
                                             Ok(()) => {
+                                                checks.remove(&id);
+                                                checked_after_download.remove(&id);
+                                                check_failed.remove(&id);
+                                                initializing.remove(&id);
                                                 added_commands.remove(&id);
                                                 reporting_policies.remove(&id);
                                                 SessionEvent::Removed { id }
@@ -374,11 +435,20 @@ impl SessionRuntime {
                                         break;
                                     }
                                     SessionCommand::Recheck { .. } => unreachable!("recheck expanded above"),
+                                    SessionCommand::SetVerifyAfterDownload { id, enabled } => {
+                                        if let Some(SessionCommand::AddTorrent { verify_after_download, .. }) = added_commands.get_mut(&id) {
+                                            *verify_after_download = enabled;
+                                            if enabled { checked_after_download.remove(&id); }
+                                        }
+                                    }
                                     SessionCommand::SetFiles { id, only_files } => {
                                         if let Some(handle) = torrents.get(&id) {
                                             let selected = only_files.iter().copied().collect();
                                             match session.update_only_files(handle, &selected).await {
-                                                Ok(()) => if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files); },
+                                                Ok(()) => {
+                                                    checked_after_download.remove(&id);
+                                                    if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files); }
+                                                },
                                                 Err(error) => { let _ = event_tx.try_send(SessionEvent::Error { id, message: format!("File selection update failed: {error:#}") }); }
                                             }
                                         }
@@ -553,6 +623,9 @@ impl Drop for SessionRuntime {
 
 #[cfg(test)]
 mod multi_peer_tests;
+
+#[cfg(test)]
+mod verification_tests;
 
 #[cfg(test)]
 mod tests {
@@ -809,6 +882,7 @@ mod tests {
         .unwrap();
         runtime
             .try_send(SessionCommand::AddTorrent {
+                verify_after_download: false,
                 id: format!("v1: {info_hash}"),
                 source: source.display().to_string(),
                 output_folder: output.display().to_string(),
@@ -1026,6 +1100,7 @@ mod tests {
         let id = format!("v1: {hash}");
         runtime
             .try_send(SessionCommand::AddTorrent {
+                verify_after_download: false,
                 id: id.clone(),
                 source: source.display().to_string(),
                 output_folder: output.display().to_string(),
@@ -1232,6 +1307,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    verify_after_download: false,
                     id: format!("v1: {hash}"),
                     source: source.display().to_string(),
                     output_folder: dir.path().join("out").display().to_string(),
@@ -1345,6 +1421,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    verify_after_download: false,
                     id: format!("v1: {hash}"),
                     source: source.display().to_string(),
                     output_folder: dir.path().join("out").display().to_string(),

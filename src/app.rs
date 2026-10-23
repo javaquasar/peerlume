@@ -314,6 +314,7 @@ impl AddTrackerAudit {
 }
 
 struct AddTorrentDialog {
+    verify_after_download: bool,
     download_mode: DownloadMode,
     freeze_after_bytes: u64,
     source_path: PathBuf,
@@ -345,6 +346,7 @@ impl AddTorrentDialog {
         let audit_tracker_url = metainfo.trackers.first().cloned().unwrap_or_default();
         Self {
             source_path,
+            verify_after_download: false,
             download_mode: DownloadMode::Normal,
             freeze_after_bytes: crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES,
             peer_id: metainfo::generate_peer_id(&settings.bittorrent.peer_id_prefix),
@@ -881,11 +883,18 @@ impl PeerLumeApp {
                                         self.selected_torrent = index;
                                     }
                                     ui.add(
-                                        egui::ProgressBar::new(torrent.progress())
-                                            .desired_width(120.0)
-                                            .show_percentage(),
+                                        egui::ProgressBar::new(torrent.display_progress())
+                                            .desired_width(145.0)
+                                            .text(torrent.progress_text())
+                                            .fill(if torrent.completed_successfully() {
+                                                egui::Color32::from_rgb(32, 135, 65)
+                                            } else if matches!(torrent.completion, crate::completion::CompletionStatus::Failed { .. }) {
+                                                egui::Color32::from_rgb(170, 45, 45)
+                                            } else if torrent.state == TorrentState::Checking {
+                                                egui::Color32::from_rgb(170, 125, 25)
+                                            } else { ui.visuals().selection.bg_fill }),
                                     );
-                                    ui.label(torrent.state.label());
+                                    ui.label(torrent.status_text());
                                     ui.label(format_rate(torrent.download_rate));
                                     ui.label(format_rate(torrent.upload_rate));
                                     ui.label(format!("{} / {}", torrent.peers, torrent.seeds));
@@ -985,6 +994,7 @@ impl PeerLumeApp {
                     .unwrap_or_else(|| "Magnet metadata".into());
                 let id = magnet.exact_topics.join(";");
                 self.torrents.push(TorrentItem {
+                    completion: crate::completion::CompletionStatus::Pending,
                     name: name.clone(),
                     source: self.magnet_input.clone(),
                     info_hashes: magnet.exact_topics,
@@ -1129,6 +1139,8 @@ impl PeerLumeApp {
                     }
                 });
                 ui.label("Files from this torrent will be written under this directory.");
+                ui.checkbox(&mut dialog.verify_after_download, "Verify after download");
+                ui.label("Optional full on-disk hash check before showing Done. Pieces are always checked during download.");
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1271,6 +1283,7 @@ impl PeerLumeApp {
             TorrentState::Paused
         };
         self.torrents.push(TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
             source: dialog.source_path.display().to_string(),
             info_hashes: [
@@ -1292,6 +1305,7 @@ impl PeerLumeApp {
             state,
             is_private: dialog.is_private,
             overrides: TorrentOverrides {
+                verify_after_download: dialog.verify_after_download,
                 download_mode: dialog.download_mode,
                 freeze_after_bytes: dialog.freeze_after_bytes,
                 download_directory: Some(dialog.download_directory),
@@ -1428,7 +1442,23 @@ impl PeerLumeApp {
                 }
             }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
-            DetailsTab::Settings => Self::show_torrent_settings(ui, torrent, &self.settings),
+            DetailsTab::Settings => {
+                let before = torrent.overrides.verify_after_download;
+                Self::show_torrent_settings(ui, torrent, &self.settings);
+                if before != torrent.overrides.verify_after_download {
+                    let id = torrent.info_hashes.join(";");
+                    let _ = self.backend.send(SessionCommand::SetVerifyAfterDownload {
+                        id: id.clone(),
+                        enabled: torrent.overrides.verify_after_download,
+                    });
+                    if let Err(error) = self
+                        .backend
+                        .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
+                    {
+                        self.add_status = error.to_string();
+                    }
+                }
+            }
             DetailsTab::Peers => {
                 ui.label(format!(
                     "Connected peers: {}; known seeds: {}",
@@ -1683,6 +1713,13 @@ impl PeerLumeApp {
         global: &ClientSettings,
     ) {
         let overrides = &mut torrent.overrides;
+        ui.checkbox(
+            &mut overrides.verify_after_download,
+            "Verify after download",
+        );
+        ui.label(
+            "Full on-disk hash check before Done; does not replace normal piece verification.",
+        );
         ui.label(
             "Overrides apply only to this torrent. Unchecked values inherit global preferences.",
         );
@@ -3286,6 +3323,7 @@ mod tests {
         let mut settings = ClientSettings::default();
         settings.download.download_directory = root.display().to_string();
         let torrent = TorrentItem {
+            completion: crate::completion::CompletionStatus::Pending,
             name: "Movie".into(),
             source: root.join("Movie.torrent").display().to_string(),
             info_hashes: vec!["v1: test".into()],

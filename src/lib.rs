@@ -4,6 +4,7 @@ pub mod app;
 pub mod blocklist;
 pub mod buffer_pool;
 pub mod client;
+pub mod completion;
 pub mod discovery;
 pub mod download_mode;
 pub mod engine;

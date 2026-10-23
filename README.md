@@ -87,6 +87,39 @@ The shared component contract, parity rules, and TUI key map are documented in
 
 The sample settings are in `config/peerlume.example.toml`.
 
+## Completion and integrity checking
+
+Both frontends distinguish downloaded bytes from confirmed completion. During a
+real disk scan, the progress column switches to `Checking` with its own percentage.
+The download percentage is retained separately. Green `Done` appears only after
+the engine confirms every selected piece; activity remains explicit as
+`Done · Seeding` or `Done · Paused`. An empty selection or a rounded percentage
+does not count as successful completion.
+
+Pieces are always hash-checked while downloading. The optional **Verify after
+download** setting performs an additional full on-disk check before showing Done.
+It defaults to disabled and is persisted independently for each torrent. Enable
+it in the egui add-torrent dialog or the torrent's Settings tab. In ratatui, use
+`F3` while reviewing the download mode before adding, or `V` on an existing torrent.
+Use **Recheck files** in egui's Log tab or `v` in ratatui for a manual scan.
+
+The extra check reuses resolved metadata, closes the old transfer state, and
+reopens the torrent paused so the engine reads and hashes disk contents without
+fetching missing data. On success it restores the requested paused/seeding state.
+Checked disk bytes do not increase network transfer counters. Larger torrents may
+take significant disk time; tiny checks can finish between UI refreshes. The check
+is a real operation, not an animated delay, and does not repeat on every stats tick.
+
+Missing or corrupt selected pieces produce a red **Verification failed** state,
+never Done. Files are kept. Repair them and recheck, or resume the torrent to
+download the missing/corrupt pieces again. The selected-file rules still apply:
+unselected missing files do not by themselves prevent completion of the selection.
+This does not provide a guarantee against changes to files after verification.
+
+Tests cover independent check progress, stale completion events, success/failure
+rendering, per-torrent setting persistence and migration, corruption and recovery,
+pause preservation, and post-download verification of two concurrent torrents.
+
 ## Private torrents
 
 Private torrent requirements and tracker accounting rules are documented in

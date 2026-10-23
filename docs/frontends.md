@@ -46,6 +46,8 @@ TUI keys:
 - `p`, `r`, `P`, `R`: pause/resume one or all torrents;
 - `d`: remove the selected torrent while keeping downloaded data;
 - `v`: recheck the selected torrent's files, keeping data and session transfer totals;
+- `V`: toggle the selected torrent's persistent Verify after download setting;
+- `F3`: toggle Verify after download while reviewing a pending torrent's mode;
 - `e` / `E` in Log: export selected-torrent / entire-session JSONL to a new file;
 - up/down in Log: scroll real announces and returned peer addresses;
 - `Space`: toggle the selected file or the primary option on a preference page;
