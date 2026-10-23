@@ -970,6 +970,8 @@ mod tests {
         assert!(!redacted_url.contains("token=secret"));
         #[cfg(windows)]
         assert!(protected_url.is_some());
+        #[cfg(not(windows))]
+        assert!(protected_url.is_none());
         let stored = store.load_torrent(&record.id).unwrap().unwrap();
         #[cfg(windows)]
         assert_eq!(stored.trackers, record.trackers);
