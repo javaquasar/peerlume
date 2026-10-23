@@ -193,6 +193,34 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## GitHub Actions
+
+The [Tests workflow](https://github.com/javaquasar/peerlume/actions/workflows/ci.yml)
+runs on pushes to `main` or `master`, including merge commits, and on pull requests
+targeting either branch. The current default branch is `main`.
+
+To start a run manually, open **Actions > Tests > Run workflow**, select a branch,
+and confirm **Run workflow**. With GitHub CLI, use:
+
+```powershell
+gh workflow run ci.yml --repo javaquasar/peerlume --ref main
+gh run list --repo javaquasar/peerlume --workflow ci.yml
+```
+
+CI checks formatting, strict Clippy lints, and repository language. The test matrix
+covers both GUI and TUI features on Windows and separate core-only and TUI builds
+on Linux, including the vendored tracker library's tests and documentation tests.
+Linux GUI builds are not included because the GUI dependency does not currently
+enable Linux window-system features. A separate Ubuntu job runs the four ignored
+Docker tracker/peer integration tests against local synthetic fixtures; it does
+not use production trackers or private torrent credentials.
+
+Dependencies are resolved from `Cargo.lock`. Actions are pinned to commit hashes,
+workflow permissions are read-only, and superseded runs for the same branch or
+pull request are canceled. A failed matrix entry does not cancel other entries.
+
+## Integration tests
+
 Run the Docker integration suite with Docker Desktop or another compatible Docker
 daemon running. The suite uses `testcontainers` and pulls `python:3.13-alpine`:
 

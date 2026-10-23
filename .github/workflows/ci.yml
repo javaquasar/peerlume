@@ -1,0 +1,113 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: Formatting, Clippy, and repository language
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install stable Rust and quality tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-quality-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Run strict Clippy checks for both frontends
+        run: cargo +stable clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test the repository language checker
+        shell: pwsh
+        run: ./scripts/check-english.ps1 -SelfTest
+      - name: Check repository language
+        shell: pwsh
+        run: ./scripts/check-english.ps1
+
+  tests:
+    name: Tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows GUI and TUI
+            os: windows-latest
+            features: --all-features
+            cache: all
+          - name: Linux core
+            os: ubuntu-latest
+            features: --no-default-features
+            cache: core
+          - name: Linux TUI
+            os: ubuntu-latest
+            features: --no-default-features --features tui
+            cache: tui
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-tests-${{ matrix.cache }}-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+      - name: Run application and vendored tracker unit and integration tests
+        run: cargo +stable test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
+      - name: Run documentation tests
+        run: cargo +stable test --locked ${{ matrix.features }} --doc -p peerlume -p librqbit-tracker-comms
+
+  docker-tests:
+    name: Docker tracker and peer integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-docker-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+      - name: Verify Docker is available
+        run: docker info
+      - name: Pull the local tracker and peer fixture image
+        run: docker pull python:3.13-alpine
+      - name: Run all four Docker integration tests
+        run: cargo +stable test --locked --no-default-features --test container_network -- --ignored --test-threads=1
