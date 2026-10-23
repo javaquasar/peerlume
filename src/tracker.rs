@@ -77,7 +77,7 @@ pub fn parse_info_hash_hex(value: &str) -> Result<[u8; 20], String> {
         return Err("info-hash must contain exactly 40 hexadecimal characters".into());
     }
     let mut output = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         output[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(output)
@@ -88,7 +88,9 @@ pub fn compact_ipv4_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>, String> {
         return Err("compact IPv4 peers length must be divisible by six".into());
     }
     Ok(bytes
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|peer| {
             SocketAddrV4::new(
                 Ipv4Addr::new(peer[0], peer[1], peer[2], peer[3]),
@@ -465,6 +467,35 @@ mod tests {
         assert_eq!(
             compact_ipv4_peers(&[127, 0, 0, 1, 0xc8, 0xd5]).unwrap(),
             ["127.0.0.1:51413".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn info_hash_chunks_preserve_all_bytes_and_reject_invalid_hex() {
+        let value = "000102030405060708090a0b0c0d0e0f10111213";
+        let expected = std::array::from_fn(|index| index as u8);
+        assert_eq!(parse_info_hash_hex(value).unwrap(), expected);
+        assert_eq!(
+            parse_info_hash_hex(&value.to_uppercase()).unwrap(),
+            expected
+        );
+        assert!(parse_info_hash_hex(&"zz".repeat(20)).is_err());
+        assert!(parse_info_hash_hex(&"0".repeat(39)).is_err());
+        assert!(parse_info_hash_hex(&"0".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn compact_peers_reject_partial_chunks_and_preserve_each_address() {
+        assert!(compact_ipv4_peers(&[]).unwrap().is_empty());
+        for length in [1, 2, 3, 4, 5, 7, 11, 13] {
+            assert!(compact_ipv4_peers(&vec![0; length]).is_err());
+        }
+        assert_eq!(
+            compact_ipv4_peers(&[127, 0, 0, 1, 0xc8, 0xd5, 192, 0, 2, 1, 0, 80]).unwrap(),
+            [
+                "127.0.0.1:51413".parse().unwrap(),
+                "192.0.2.1:80".parse().unwrap(),
+            ]
         );
     }
 

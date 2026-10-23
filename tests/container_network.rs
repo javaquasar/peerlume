@@ -49,8 +49,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-print('READY', flush=True)
-HTTPServer(('0.0.0.0', 18080), Handler).serve_forever()
+with HTTPServer(('0.0.0.0', 18080), Handler) as server:
+    # Report readiness only after the socket has been bound and is listening.
+    print('READY', flush=True)
+    server.serve_forever()
 "#;
 
 const PEER_SCRIPT: &str = r#"
