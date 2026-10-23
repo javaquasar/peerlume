@@ -28,10 +28,11 @@ pub enum TorrentDetailsTab {
     Trackers,
     Pieces,
     Log,
+    Status,
 }
 
 impl TorrentDetailsTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Files,
         Self::Info,
         Self::Settings,
@@ -39,6 +40,7 @@ impl TorrentDetailsTab {
         Self::Trackers,
         Self::Pieces,
         Self::Log,
+        Self::Status,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -50,6 +52,7 @@ impl TorrentDetailsTab {
             Self::Trackers => "Trackers",
             Self::Pieces => "Pieces",
             Self::Log => "Log",
+            Self::Status => "Status",
         }
     }
 
@@ -125,6 +128,7 @@ impl PreferencesTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ComponentId {
+    RuntimeStatus,
     TorrentTable,
     AddTorrent,
     AddMagnet,
@@ -148,7 +152,12 @@ pub struct ComponentSpec {
     pub interactive: bool,
 }
 
-pub const COMPONENTS: [ComponentSpec; 14] = [
+pub const COMPONENTS: [ComponentSpec; 15] = [
+    ComponentSpec {
+        id: ComponentId::RuntimeStatus,
+        label: "Runtime status",
+        interactive: false,
+    },
     ComponentSpec {
         id: ComponentId::TorrentTable,
         label: "Torrent table",

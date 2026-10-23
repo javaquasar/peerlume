@@ -23,6 +23,7 @@ pub struct ClientBackend {
 pub enum SessionNotice {
     None,
     Added { id: String },
+    SettingsApplied { id: String },
     Error { id: String, message: String },
     Removed { id: String },
     Stopped,
@@ -30,6 +31,50 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::Mode { id, application } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.mode = application.clone();
+                match application {
+                    crate::runtime_status::ModeApplication::Active { config, .. } => {
+                        torrent.overrides.download_mode = config.mode;
+                        torrent.overrides.freeze_after_bytes = config.freeze_after_bytes;
+                        torrent.runtime.mode_draft = None;
+                        return SessionNotice::SettingsApplied { id };
+                    }
+                    crate::runtime_status::ModeApplication::Failed { message, .. } => {
+                        return SessionNotice::Error { id, message };
+                    }
+                    _ => {}
+                }
+            }
+            SessionNotice::None
+        }
+        SessionEvent::RepairPolicy { id, policy } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.overrides.repair_policy = policy;
+                if policy.enabled {
+                    torrent.overrides.verify_after_download = true;
+                }
+            }
+            SessionNotice::SettingsApplied { id }
+        }
+        SessionEvent::Repair { id, status } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.repair = status;
+            }
+            SessionNotice::None
+        }
+        SessionEvent::NetworkTotals {
+            id,
+            uploaded,
+            downloaded,
+        } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.network_uploaded = uploaded;
+                torrent.runtime.network_downloaded = downloaded;
+            }
+            SessionNotice::None
+        }
         SessionEvent::Verification { id, status } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 match &status {
@@ -164,7 +209,9 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         .collect();
     let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
     SessionCommand::AddTorrent {
-        verify_after_download: torrent.overrides.verify_after_download,
+        repair_policy: torrent.overrides.repair_policy,
+        verify_after_download: torrent.overrides.verify_after_download
+            || torrent.overrides.repair_policy.enabled,
         download_mode: torrent.overrides.download_mode,
         freeze_after_bytes: if torrent.overrides.freeze_after_bytes == 0 {
             crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES
@@ -201,7 +248,9 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
-        verify_after_download: torrent.overrides.verify_after_download,
+        repair_policy: torrent.overrides.repair_policy,
+        verify_after_download: torrent.overrides.verify_after_download
+            || torrent.overrides.repair_policy.enabled,
         download_mode: torrent.overrides.download_mode,
         freeze_after_bytes: torrent.overrides.freeze_after_bytes,
         id: torrent.info_hashes.join(";"),
@@ -235,6 +284,38 @@ pub fn torrent_to_record(
     }
 }
 
+/// A draft becomes a saved setting only after the engine acknowledges it.
+pub fn mode_change_command(
+    torrent: &mut TorrentItem,
+    config: crate::runtime_status::ModeConfig,
+) -> Result<SessionCommand, String> {
+    config.mode.validate_threshold(config.freeze_after_bytes)?;
+    config.mode.validate_metadata(
+        torrent.info_hashes.iter().any(|h| h.starts_with("v1: ")),
+        torrent.files.files().iter().map(|f| f.size_bytes).sum(),
+    )?;
+    torrent.runtime.mode = crate::runtime_status::ModeApplication::Applying {
+        requested: config,
+        active: torrent.runtime.mode.active(),
+    };
+    Ok(SessionCommand::SetDownloadMode {
+        id: torrent.info_hashes.join(";"),
+        config,
+    })
+}
+
+pub fn mode_submission_failed(
+    torrent: &mut TorrentItem,
+    config: crate::runtime_status::ModeConfig,
+    message: String,
+) {
+    torrent.runtime.mode = crate::runtime_status::ModeApplication::Failed {
+        requested: config,
+        active: torrent.runtime.mode.active(),
+        message,
+    };
+}
+
 pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> TorrentItem {
     let files = FileSelectionModel::from_snapshot(record.files.into_iter().map(|file| {
         (
@@ -253,6 +334,7 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
         info_hashes.push(format!("v2: {hash}"));
     }
     TorrentItem {
+        runtime: Default::default(),
         completion: crate::completion::CompletionStatus::Pending,
         name: record.name,
         source: record.source,
@@ -276,7 +358,8 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
         },
         is_private: record.is_private,
         overrides: TorrentOverrides {
-            verify_after_download: record.verify_after_download,
+            verify_after_download: record.verify_after_download || record.repair_policy.enabled,
+            repair_policy: record.repair_policy,
             download_mode: record.download_mode,
             freeze_after_bytes: record.freeze_after_bytes,
             download_directory: record.download_directory,
@@ -357,7 +440,7 @@ impl ClientBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn completion_stats(finished: bool, paused: bool) -> SessionEvent {
@@ -430,8 +513,9 @@ mod tests {
         assert_eq!(torrents[0].state, TorrentState::VerificationFailed);
     }
 
-    fn torrent() -> TorrentItem {
+    pub(crate) fn torrent() -> TorrentItem {
         TorrentItem {
+            runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: "test".into(),
             source: "test.torrent".into(),
@@ -455,6 +539,7 @@ mod tests {
     fn unavailable_optional_services_have_frontend_friendly_semantics() {
         let mut backend = ClientBackend::offline();
         let record = TorrentRecord {
+            repair_policy: Default::default(),
             verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
@@ -624,5 +709,58 @@ mod tests {
             restored.overrides.download_directory.as_deref(),
             Some("special")
         );
+    }
+    #[test]
+    fn mode_is_saved_only_after_ack_and_restart_requires_fresh_confirmation() {
+        use crate::runtime_status::{ModeApplication, ModeConfig, RepairPolicy};
+        let mut item = torrent();
+        let id = item.info_hashes.join(";");
+        let config = ModeConfig {
+            mode: crate::download_mode::DownloadMode::NoProgress,
+            freeze_after_bytes: 123,
+        };
+        item.runtime.mode = ModeApplication::Active {
+            config: ModeConfig::default(),
+            tracker_enabled: true,
+        };
+        let command = mode_change_command(&mut item, config).unwrap();
+        assert!(matches!(command, SessionCommand::SetDownloadMode { .. }));
+        assert_eq!(
+            item.overrides.download_mode,
+            crate::download_mode::DownloadMode::Normal
+        );
+        mode_submission_failed(&mut item, config, "Queue unavailable".into());
+        assert_eq!(item.runtime.mode.active(), Some(ModeConfig::default()));
+        assert_eq!(
+            item.overrides.download_mode,
+            crate::download_mode::DownloadMode::Normal
+        );
+        let mut items = vec![item];
+        assert_eq!(
+            apply_session_event(
+                &mut items,
+                SessionEvent::Mode {
+                    id: id.clone(),
+                    application: ModeApplication::Active {
+                        config,
+                        tracker_enabled: true
+                    }
+                }
+            ),
+            SessionNotice::SettingsApplied { id: id.clone() }
+        );
+        let policy = RepairPolicy {
+            enabled: true,
+            max_attempts: 4,
+        };
+        apply_session_event(&mut items, SessionEvent::RepairPolicy { id, policy });
+        assert!(items[0].overrides.verify_after_download);
+        let restored = torrent_from_record(
+            torrent_to_record(&items[0], None),
+            &ClientSettings::default(),
+        );
+        assert_eq!(restored.mode_config(), config);
+        assert_eq!(restored.overrides.repair_policy, policy);
+        assert_eq!(restored.runtime.mode, ModeApplication::AwaitingEngine);
     }
 }

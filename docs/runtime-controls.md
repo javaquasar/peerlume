@@ -1,0 +1,95 @@
+# Runtime controls, completion and bounded repair
+
+These controls belong to each torrent. Both egui and ratatui use the same command,
+event reducer, persisted configuration and status-card model. They do not change
+the standalone tracker-audit scenario editor.
+
+## Changing an existing download mode
+
+In egui, select the torrent, open **Torrent settings**, select a download mode and
+press **Apply download mode**. Freeze mode also requires a positive byte threshold.
+In ratatui, press **M** and enter a mode number and optional threshold, for example
+`5 1048576`. Numbers are 1 normal, 2 no progress, 3 upload x1.5, 4 hide downloaded,
+and 5 freeze. Existing-torrent numbers always follow this order, independently of
+the external add-dialog mode list.
+
+Changing the dropdown edits a draft, not the saved configuration. The UI displays:
+
+- **Awaiting engine** after loading a saved torrent, until registration succeeds.
+- **Applying**, with the requested mode and last confirmed active mode.
+- **Active** only after the engine confirms the policy. Only then is it saved.
+- **Failed**, retaining the previous saved/confirmed mode and an error message.
+
+The engine validates the request, briefly pauses a running transport, replaces its
+session-scoped policy and resumes it. A paused torrent stays paused. During a disk
+check, the change is applied after initialization and before the check resumes
+peer traffic. Resuming while a mode request is pending waits for its application.
+Unresolved metadata can delay application. Files, file selection and cumulative
+actual network counters are retained. If policy application succeeds but resuming
+fails, the policy is still reported as active and a separate transfer error appears.
+
+This is an application-policy confirmation, not an acknowledgement from the
+tracker. Previously transmitted/in-flight requests cannot be recalled and may
+still appear with the old mode in the journal. The Status tab therefore reports
+the active policy separately from the mode of the last observed real announce.
+When tracker communication is disabled, the policy acknowledgement says so.
+
+Freeze snapshots survive pause, recheck and repair. Explicitly applying a mode
+(even the same freeze mode) replaces the policy and clears its snapshot. Restarting
+the application also creates a new snapshot; the byte threshold itself is saved.
+
+## Automatic repair
+
+Automatic repair is **off by default**. Enable it when adding a torrent or in its
+settings. The limit defaults to **3 attempts** and is configurable from **1 to 10**.
+In ratatui use **F4** in the add dialog, **H** on an existing torrent to toggle, and
+**L** to set its limit. Enabling repair also enables the full post-download check;
+that check cannot be disabled while repair is enabled. Disabling repair leaves
+post-download verification enabled until explicitly changed.
+
+After a completed active download fails a full disk hash check, the engine resumes
+the checked torrent, whose piece map now identifies the missing/corrupt pieces.
+Only missing required pieces are requested; already valid pieces are retained.
+The existing reporting policy remains installed throughout repair. Checked disk
+bytes are not counted as newly received network bytes.
+
+Each recovery download consumes one attempt. After completion, a fresh full disk
+check is mandatory before **Done**. If no additional verified payload appears for
+120 seconds during an active repair, the engine pauses and checks again; another
+attempt is allowed only within the remaining budget. User-paused time does not
+consume the stall timeout. Read/storage errors stop the check instead of blindly
+starting downloads. The UI shows downloading/checking, attempt/limit, success or
+exhaustion. Exhaustion leaves the torrent stopped with a verification failure; it
+does not delete the payload or retry forever.
+
+A torrent checked while user-paused stays paused even if corruption is detected.
+Pausing during a check suppresses automatic continuation. Explicit **Resume** after
+a failed check starts a new user-requested recovery episode and budget. Pausing
+and resuming an ongoing episode retains its consumed attempts. Changing the mode
+does not reset the repair budget. Settings survive restart; an in-flight repair
+budget and completion confirmation do not. Restored files are checked afresh.
+
+## Shared Status tab
+
+The Status tab in both interfaces shows the saved mode, engine-confirmed mode,
+application phase/error, transfer/completion progress, session network totals,
+verified selected payload and repair status. Its last-announce section shows the
+actual and sent uploaded/downloaded/left values, event, outcome, timestamp and
+mode of the latest real exchange. No observed exchange is clearly distinguished
+from an exchange with zero counters. Tracker credentials, userinfo, path and query
+are always hidden in this card. In ratatui use up/down to scroll the card.
+
+The existing Log tab retains detailed replies, received peers and JSONL export
+for long-running tests. Session network totals are not lifetime account statistics.
+
+## Regression coverage
+
+Tests exercise all 25 mode-to-mode transitions on a paused real engine, invalid
+threshold rejection, unchanged payload and pause state, active transport changes
+observed by a local HTTP tracker, and retained actual network totals. A local peer
+fixture repairs one damaged piece while proving that the healthy piece is not
+requested and no-progress metrics remain in force. Other tests cover user pause,
+bounded attempts/stall timing, registry session isolation and snapshot replacement,
+SQLite migration/round trips, engine acknowledgement before persistence, restored
+unconfirmed mode, shared frontend rendering and tracker credential redaction.
+All network fixtures are loopback-only; no private production tracker is contacted.

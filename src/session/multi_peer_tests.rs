@@ -127,7 +127,7 @@ impl Drop for Fixture {
     }
 }
 
-fn accept_before_deadline(
+pub(super) fn accept_before_deadline(
     listener: &TcpListener,
     stop: &AtomicBool,
 ) -> Result<Option<TcpStream>, String> {
@@ -158,7 +158,7 @@ fn accept_before_deadline(
     Ok(None)
 }
 
-fn serve_tracker(
+pub(super) fn serve_tracker(
     listener: TcpListener,
     peers: Vec<SocketAddr>,
     stop: Arc<AtomicBool>,
@@ -447,6 +447,7 @@ fn download_torrents_with_verification(
     for torrent in &torrents {
         runtime
             .try_send(SessionCommand::AddTorrent {
+                repair_policy: Default::default(),
                 verify_after_download,
                 download_mode: torrent.mode,
                 freeze_after_bytes: 16384,

@@ -314,6 +314,7 @@ impl AddTrackerAudit {
 }
 
 struct AddTorrentDialog {
+    repair_policy: crate::runtime_status::RepairPolicy,
     verify_after_download: bool,
     download_mode: DownloadMode,
     freeze_after_bytes: u64,
@@ -347,6 +348,7 @@ impl AddTorrentDialog {
         Self {
             source_path,
             verify_after_download: false,
+            repair_policy: Default::default(),
             download_mode: DownloadMode::Normal,
             freeze_after_bytes: crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES,
             peer_id: metainfo::generate_peer_id(&settings.bittorrent.peer_id_prefix),
@@ -490,6 +492,16 @@ impl PeerLumeApp {
             let event = self.backend.try_recv();
             let Some(event) = event else { break };
             match apply_session_event(&mut self.torrents, event) {
+                SessionNotice::SettingsApplied { id } => {
+                    if let Some(torrent) =
+                        self.torrents.iter().find(|t| t.info_hashes.join(";") == id)
+                        && let Err(error) = self
+                            .backend
+                            .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
+                    {
+                        self.add_status = error;
+                    }
+                }
                 SessionNotice::Added { .. } => {
                     self.add_status = "Transfer engine started the torrent".into();
                 }
@@ -994,6 +1006,7 @@ impl PeerLumeApp {
                     .unwrap_or_else(|| "Magnet metadata".into());
                 let id = magnet.exact_topics.join(";");
                 self.torrents.push(TorrentItem {
+                    runtime: Default::default(),
                     completion: crate::completion::CompletionStatus::Pending,
                     name: name.clone(),
                     source: self.magnet_input.clone(),
@@ -1140,6 +1153,11 @@ impl PeerLumeApp {
                 });
                 ui.label("Files from this torrent will be written under this directory.");
                 ui.checkbox(&mut dialog.verify_after_download, "Verify after download");
+                ui.checkbox(&mut dialog.repair_policy.enabled, "Automatically repair failed integrity checks");
+                if dialog.repair_policy.enabled {
+                    dialog.verify_after_download = true;
+                    ui.add(egui::DragValue::new(&mut dialog.repair_policy.max_attempts).range(1..=10).prefix("Maximum repair attempts: "));
+                }
                 ui.label("Optional full on-disk hash check before showing Done. Pieces are always checked during download.");
 
                 ui.separator();
@@ -1283,6 +1301,7 @@ impl PeerLumeApp {
             TorrentState::Paused
         };
         self.torrents.push(TorrentItem {
+            runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
             source: dialog.source_path.display().to_string(),
@@ -1306,6 +1325,7 @@ impl PeerLumeApp {
             is_private: dialog.is_private,
             overrides: TorrentOverrides {
                 verify_after_download: dialog.verify_after_download,
+                repair_policy: dialog.repair_policy,
                 download_mode: dialog.download_mode,
                 freeze_after_bytes: dialog.freeze_after_bytes,
                 download_directory: Some(dialog.download_directory),
@@ -1428,8 +1448,22 @@ impl PeerLumeApp {
                 DetailsTab::Log,
                 DetailsTab::Log.label(),
             );
+            ui.selectable_value(
+                &mut self.details_tab,
+                DetailsTab::Status,
+                DetailsTab::Status.label(),
+            );
         });
         match self.details_tab {
+            DetailsTab::Status => {
+                let last = self.backend.journal().and_then(|j| {
+                    torrent
+                        .info_hashes
+                        .iter()
+                        .find_map(|h| j.latest(h.strip_prefix("v1: ")?))
+                });
+                show_runtime_status(ui, torrent, last.as_ref());
+            }
             DetailsTab::Files => {
                 if Self::show_file_tree(ui, torrent) {
                     let _ = self
@@ -1443,6 +1477,68 @@ impl PeerLumeApp {
             }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
             DetailsTab::Settings => {
+                let mut draft = torrent
+                    .runtime
+                    .mode_draft
+                    .unwrap_or_else(|| torrent.mode_config());
+                egui::ComboBox::from_id_salt("existing_download_mode")
+                    .selected_text(draft.mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in crate::download_mode::DownloadMode::ALL {
+                            ui.selectable_value(&mut draft.mode, mode, mode.label());
+                        }
+                    });
+                if draft.mode == crate::download_mode::DownloadMode::FreezeAfter {
+                    ui.add(
+                        egui::DragValue::new(&mut draft.freeze_after_bytes)
+                            .range(1..=u64::MAX)
+                            .prefix("Freeze after bytes: "),
+                    );
+                }
+                torrent.runtime.mode_draft = Some(draft);
+                ui.label(torrent.runtime.mode.label());
+                if ui
+                    .add_enabled(
+                        !matches!(
+                            torrent.runtime.mode,
+                            crate::runtime_status::ModeApplication::Applying { .. }
+                        ),
+                        egui::Button::new("Apply download mode"),
+                    )
+                    .clicked()
+                {
+                    match crate::client::mode_change_command(torrent, draft) {
+                        Ok(command) => {
+                            if let Err(error) = self.backend.send(command) {
+                                crate::client::mode_submission_failed(torrent, draft, error);
+                            }
+                        }
+                        Err(error) => self.add_status = error,
+                    }
+                }
+                ui.small("Applying briefly pauses and resumes active transfers. Already transmitted announces cannot be recalled.");
+                let mut repair = torrent.overrides.repair_policy;
+                let mut repair_changed = ui
+                    .checkbox(
+                        &mut repair.enabled,
+                        "Automatically repair failed integrity checks",
+                    )
+                    .changed();
+                repair_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut repair.max_attempts)
+                            .range(1..=10)
+                            .prefix("Maximum repair attempts: "),
+                    )
+                    .changed();
+                if repair_changed
+                    && let Err(error) = self.backend.send(SessionCommand::SetRepairPolicy {
+                        id: torrent.info_hashes.join(";"),
+                        policy: repair,
+                    })
+                {
+                    self.add_status = error;
+                }
                 let before = torrent.overrides.verify_after_download;
                 Self::show_torrent_settings(ui, torrent, &self.settings);
                 if before != torrent.overrides.verify_after_download {
@@ -1713,10 +1809,12 @@ impl PeerLumeApp {
         global: &ClientSettings,
     ) {
         let overrides = &mut torrent.overrides;
-        ui.checkbox(
-            &mut overrides.verify_after_download,
-            "Verify after download",
-        );
+        ui.add_enabled_ui(!overrides.repair_policy.enabled, |ui| {
+            ui.checkbox(
+                &mut overrides.verify_after_download,
+                "Verify after download",
+            );
+        });
         ui.label(
             "Full on-disk hash check before Done; does not replace normal piece verification.",
         );
@@ -2977,6 +3075,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 fn validate_add_dialog(dialog: &AddTorrentDialog) -> Result<Vec<String>, String> {
+    dialog.repair_policy.validate()?;
     dialog
         .download_mode
         .validate_threshold(dialog.freeze_after_bytes)?;
@@ -3119,9 +3218,71 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
+fn show_runtime_status(
+    ui: &mut egui::Ui,
+    torrent: &TorrentItem,
+    last: Option<&crate::announce_journal::JournalEntry>,
+) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("shared_runtime_status")
+            .striped(true)
+            .show(ui, |ui| {
+                for (label, value) in crate::runtime_status::status_card(torrent, last) {
+                    ui.label(label);
+                    ui.label(value);
+                    ui.end_row();
+                }
+            });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_status_renders_the_shared_unconfirmed_and_active_policy_model() {
+        use crate::runtime_status::{ModeApplication, ModeConfig};
+        let mut torrent = crate::client::tests::torrent();
+        for application in [
+            ModeApplication::AwaitingEngine,
+            ModeApplication::Active {
+                config: ModeConfig::default(),
+                tracker_enabled: true,
+            },
+        ] {
+            torrent.runtime.mode = application;
+            let expected = crate::runtime_status::status_card(&torrent, None);
+            let context = egui::Context::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1600.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_runtime_status(ui, &torrent, None);
+                    });
+                },
+            );
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (label, value) in expected {
+                assert!(text.contains(&label), "missing label: {label}");
+                assert!(text.contains(&value), "missing value: {value}");
+            }
+        }
+    }
 
     #[test]
     fn tracker_account_ui_masks_by_default_reveals_explicitly_and_resets_on_url_change() {
@@ -3323,6 +3484,7 @@ mod tests {
         let mut settings = ClientSettings::default();
         settings.download.download_directory = root.display().to_string();
         let torrent = TorrentItem {
+            runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: "Movie".into(),
             source: root.join("Movie.torrent").display().to_string(),

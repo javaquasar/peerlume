@@ -107,6 +107,17 @@ pub struct ReportingRegistration {
     key: Key,
 }
 
+impl ReportingRegistration {
+    /// Replace the registry entry while transports are paused. Existing in-flight
+    /// requests retain their old snapshot; newly started transports use this policy.
+    pub fn replace(&self, policy: ReportingPolicy) -> Result<(), &'static str> {
+        let mut policies = POLICIES.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = policies.get_mut(&self.key).ok_or("Reporting registration is no longer active")?;
+        *entry = Arc::new(policy);
+        Ok(())
+    }
+}
+
 impl Drop for ReportingRegistration {
     fn drop(&mut self) {
         POLICIES
@@ -137,4 +148,39 @@ pub(crate) fn policy_for(info_hash: [u8; 20], peer_id: [u8; 20]) -> Arc<Reportin
         .get(&(info_hash, peer_id))
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    #[test]
+    fn replacement_is_session_scoped_and_old_workers_keep_their_snapshot() {
+        let hash = [201; 20]; let peer = [202; 20]; let other = [203; 20];
+        let guard = register_reporting_policy(hash, peer, ReportingPolicy::new(ReportingMode::FrozenProgress, 100, 10)).unwrap();
+        let other_guard = register_reporting_policy(hash, other, ReportingPolicy::default()).unwrap();
+        let old_worker = policy_for(hash, peer);
+        guard.replace(ReportingPolicy::new(ReportingMode::HideDownloaded, 100, 10)).unwrap();
+        let actual = crate::AnnounceMetrics { uploaded: 7, downloaded: 20, left: 80 };
+        assert_eq!(old_worker.apply_metrics(actual).uploaded, 0);
+        assert_eq!(policy_for(hash, peer).apply_metrics(actual).uploaded, 7);
+        assert_eq!(policy_for(hash, peer).apply_metrics(actual).downloaded, 0);
+        assert_eq!(policy_for(hash, other).apply_metrics(actual), actual);
+        drop(guard); drop(other_guard);
+        assert_eq!(policy_for(hash, peer).apply_metrics(actual), actual);
+    }
+
+    #[test]
+    fn explicit_replacement_resets_a_frozen_snapshot() {
+        let hash = [204; 20]; let peer = [205; 20];
+        let policy = || ReportingPolicy::new(ReportingMode::FreezeAfter, 100, 10);
+        let guard = register_reporting_policy(hash, peer, policy()).unwrap();
+        let old = policy_for(hash, peer);
+        let first = crate::AnnounceMetrics { uploaded: 3, downloaded: 10, left: 90 };
+        let next = crate::AnnounceMetrics { uploaded: 9, downloaded: 30, left: 70 };
+        assert_eq!(old.apply_metrics(first), first);
+        assert_eq!(old.apply_metrics(next), first);
+        guard.replace(policy()).unwrap();
+        assert_eq!(policy_for(hash, peer).apply_metrics(next), next);
+        assert_eq!(old.apply_metrics(next), first);
+    }
 }

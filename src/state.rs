@@ -32,6 +32,7 @@ pub struct StoredTrackerAuditProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TorrentRecord {
+    pub repair_policy: crate::runtime_status::RepairPolicy,
     pub verify_after_download: bool,
     pub download_mode: crate::download_mode::DownloadMode,
     pub freeze_after_bytes: u64,
@@ -206,7 +207,7 @@ impl StateStore {
                  PRAGMA user_version = 4;",
             )?;
             transaction.commit()?;
-        } else if !matches!(version, 4..=7) {
+        } else if !matches!(version, 4..=8) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         if version < 5 {
@@ -223,16 +224,25 @@ impl StateStore {
         if version < 7 {
             self.connection.execute_batch("ALTER TABLE torrents ADD COLUMN verify_after_download INTEGER NOT NULL DEFAULT 0; PRAGMA user_version = 7;")?;
         }
+        if version < 8 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch("ALTER TABLE torrents ADD COLUMN repair_automatically INTEGER NOT NULL DEFAULT 0; ALTER TABLE torrents ADD COLUMN repair_max_attempts INTEGER NOT NULL DEFAULT 3; PRAGMA user_version = 8;")?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
     pub fn save_torrent(&mut self, torrent: &TorrentRecord) -> rusqlite::Result<()> {
+        torrent
+            .repair_policy
+            .validate()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO torrents (
                 id, name, source, info_hash_v1, info_hash_v2, is_private, state,
-                queue_position, download_directory, downloaded_bytes, uploaded_bytes, download_mode, freeze_after_bytes, verify_after_download
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                queue_position, download_directory, downloaded_bytes, uploaded_bytes, download_mode, freeze_after_bytes, verify_after_download, repair_automatically, repair_max_attempts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, source=excluded.source,
                 info_hash_v1=excluded.info_hash_v1, info_hash_v2=excluded.info_hash_v2,
@@ -242,7 +252,8 @@ impl StateStore {
                 downloaded_bytes=excluded.downloaded_bytes,
                 uploaded_bytes=excluded.uploaded_bytes,
                 download_mode=excluded.download_mode, freeze_after_bytes=excluded.freeze_after_bytes,
-                verify_after_download=excluded.verify_after_download",
+                verify_after_download=excluded.verify_after_download,
+                repair_automatically=excluded.repair_automatically, repair_max_attempts=excluded.repair_max_attempts",
             params![
                 torrent.id,
                 torrent.name,
@@ -258,6 +269,8 @@ impl StateStore {
                 torrent.download_mode.id(),
                 to_sql_u64(torrent.freeze_after_bytes)?,
                 torrent.verify_after_download,
+                torrent.repair_policy.enabled,
+                torrent.repair_policy.max_attempts,
             ],
         )?;
         transaction.execute("DELETE FROM trackers WHERE torrent_id=?1", [&torrent.id])?;
@@ -374,12 +387,13 @@ impl StateStore {
             .connection
             .query_row(
                 "SELECT name, source, info_hash_v1, info_hash_v2, is_private, state,
-                        queue_position, download_directory, downloaded_bytes, uploaded_bytes, download_mode, freeze_after_bytes, verify_after_download
+                        queue_position, download_directory, downloaded_bytes, uploaded_bytes, download_mode, freeze_after_bytes, verify_after_download, repair_automatically, repair_max_attempts
                  FROM torrents WHERE id=?1",
                 [id],
                 |row| {
                     Ok(TorrentRecord {
                         verify_after_download: row.get(12)?,
+                        repair_policy: crate::runtime_status::RepairPolicy { enabled: row.get(13)?, max_attempts: row.get(14)? },
                         freeze_after_bytes: from_sql_u64(row.get(11)?)?,
                         download_mode: crate::download_mode::DownloadMode::from_id(&row.get::<_, String>(10)?)
                             .map_err(|error| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, std::io::Error::new(std::io::ErrorKind::InvalidData, error).into()))?,
@@ -405,6 +419,10 @@ impl StateStore {
         let Some(torrent) = torrent.as_mut() else {
             return Ok(None);
         };
+        torrent
+            .repair_policy
+            .validate()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let mut tracker_statement = self.connection.prepare(
             "SELECT url, secret_ref FROM trackers WHERE torrent_id=?1 ORDER BY position",
         )?;
@@ -714,6 +732,7 @@ mod tests {
 
     fn record() -> TorrentRecord {
         TorrentRecord {
+            repair_policy: Default::default(),
             verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
@@ -789,6 +808,43 @@ mod tests {
     }
 
     #[test]
+    fn repair_policy_round_trip_migration_and_validation() {
+        let mut store = StateStore::in_memory().unwrap();
+        let mut record = record();
+        record.download_mode = crate::download_mode::DownloadMode::NoProgress;
+        record.verify_after_download = true;
+        record.repair_policy = crate::runtime_status::RepairPolicy {
+            enabled: true,
+            max_attempts: 4,
+        };
+        store.save_torrent(&record).unwrap();
+        assert_eq!(store.load_torrent(&record.id).unwrap().unwrap(), record);
+        record.repair_policy.max_attempts = 0;
+        assert!(store.save_torrent(&record).is_err());
+        assert_eq!(
+            store
+                .load_torrent(&record.id)
+                .unwrap()
+                .unwrap()
+                .repair_policy
+                .max_attempts,
+            4
+        );
+        store.connection.execute_batch("ALTER TABLE torrents DROP COLUMN repair_automatically; ALTER TABLE torrents DROP COLUMN repair_max_attempts; PRAGMA user_version=7;").unwrap();
+        let store = StateStore::from_connection(store.connection).unwrap();
+        let restored = store.load_torrent(&record.id).unwrap().unwrap();
+        assert_eq!(restored.repair_policy, Default::default());
+        assert_eq!(restored.download_mode, record.download_mode);
+        assert!(restored.verify_after_download);
+        assert_eq!(restored.files, record.files);
+        store
+            .connection
+            .execute("UPDATE torrents SET repair_max_attempts=11", [])
+            .unwrap();
+        assert!(store.load_torrent(&record.id).is_err());
+    }
+
+    #[test]
     fn v6_migration_defaults_verification_to_disabled_and_preserves_payload_state() {
         let mut store = StateStore::in_memory().unwrap();
         let torrent = record();
@@ -796,7 +852,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE torrents DROP COLUMN verify_after_download; PRAGMA user_version=6;",
+                "ALTER TABLE torrents DROP COLUMN repair_automatically; ALTER TABLE torrents DROP COLUMN repair_max_attempts; ALTER TABLE torrents DROP COLUMN verify_after_download; PRAGMA user_version=6;",
             )
             .unwrap();
         store.migrate().unwrap();
@@ -852,7 +908,7 @@ mod tests {
         store.save_torrent(&torrent).unwrap();
         store
             .connection
-            .execute_batch("ALTER TABLE torrents DROP COLUMN verify_after_download; ALTER TABLE torrents DROP COLUMN download_mode; ALTER TABLE torrents DROP COLUMN freeze_after_bytes; PRAGMA user_version=4;")
+            .execute_batch("ALTER TABLE torrents DROP COLUMN repair_automatically; ALTER TABLE torrents DROP COLUMN repair_max_attempts; ALTER TABLE torrents DROP COLUMN verify_after_download; ALTER TABLE torrents DROP COLUMN download_mode; ALTER TABLE torrents DROP COLUMN freeze_after_bytes; PRAGMA user_version=4;")
             .unwrap();
         let migrated = StateStore::from_connection(store.connection).unwrap();
         let restored = migrated.load_torrent(&torrent.id).unwrap().unwrap();
@@ -873,7 +929,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE torrents DROP COLUMN verify_after_download; ALTER TABLE torrents DROP COLUMN freeze_after_bytes; PRAGMA user_version=5;",
+                "ALTER TABLE torrents DROP COLUMN repair_automatically; ALTER TABLE torrents DROP COLUMN repair_max_attempts; ALTER TABLE torrents DROP COLUMN verify_after_download; ALTER TABLE torrents DROP COLUMN freeze_after_bytes; PRAGMA user_version=5;",
             )
             .unwrap();
         store.migrate().unwrap();
@@ -1043,7 +1099,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(column_count, 1);
     }
 
@@ -1073,7 +1129,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(store.child_row_count("tracker_audit_profiles").unwrap(), 0);
         assert_eq!(store.child_row_count("tracker_audit_steps").unwrap(), 0);
     }
@@ -1106,7 +1162,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(new_column_count, 2);
     }
 }

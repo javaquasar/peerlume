@@ -38,6 +38,7 @@ pub enum TorrentPriority {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TorrentOverrides {
+    pub repair_policy: crate::runtime_status::RepairPolicy,
     pub verify_after_download: bool,
     pub download_mode: crate::download_mode::DownloadMode,
     /// Zero means use the shared default (1 GiB); only relevant to FreezeAfter.
@@ -121,6 +122,7 @@ impl EffectiveTorrentSettings {
 
 #[derive(Clone, Debug)]
 pub struct TorrentItem {
+    pub runtime: crate::runtime_status::RuntimeStatus,
     pub completion: crate::completion::CompletionStatus,
     pub name: String,
     pub source: String,
@@ -140,6 +142,16 @@ pub struct TorrentItem {
 }
 
 impl TorrentItem {
+    pub fn mode_config(&self) -> crate::runtime_status::ModeConfig {
+        crate::runtime_status::ModeConfig {
+            mode: self.overrides.download_mode,
+            freeze_after_bytes: if self.overrides.freeze_after_bytes == 0 {
+                crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES
+            } else {
+                self.overrides.freeze_after_bytes
+            },
+        }
+    }
     pub fn completed_successfully(&self) -> bool {
         self.completion == crate::completion::CompletionStatus::Verified
             && self.selected_size() > 0
@@ -240,6 +252,7 @@ impl TorrentItem {
 
 pub fn demo_torrents() -> Vec<TorrentItem> {
     let mut first = TorrentItem {
+        runtime: Default::default(),
         completion: crate::completion::CompletionStatus::Pending,
         name: "Open Movie Collection".into(),
         source: "demo".into(),
@@ -267,6 +280,7 @@ pub fn demo_torrents() -> Vec<TorrentItem> {
     first.downloaded_bytes = first.files.selected_downloaded();
 
     let mut second = TorrentItem {
+        runtime: Default::default(),
         completion: crate::completion::CompletionStatus::Pending,
         name: "Linux Distribution 2026.09".into(),
         source: "demo".into(),
@@ -293,6 +307,7 @@ pub fn demo_torrents() -> Vec<TorrentItem> {
     second.downloaded_bytes = second.files.selected_downloaded();
 
     let mut third = TorrentItem {
+        runtime: Default::default(),
         completion: crate::completion::CompletionStatus::Pending,
         name: "Private Archive".into(),
         source: "demo".into(),

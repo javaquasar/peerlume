@@ -60,6 +60,7 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
     let database = root.join("state.sqlite3");
     let mut store = StateStore::open(&database).expect("open SQLite state");
     let record = TorrentRecord {
+        repair_policy: Default::default(),
         verify_after_download: false,
         download_mode: peerlume::download_mode::DownloadMode::UploadRatio15,
         freeze_after_bytes: 12345,

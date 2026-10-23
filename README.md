@@ -89,6 +89,11 @@ The sample settings are in `config/peerlume.example.toml`.
 
 ## Completion and integrity checking
 
+Existing torrents now support live mode changes with engine acknowledgements,
+optional bounded automatic repair, and a shared **Status** tab in egui/ratatui.
+See [Runtime controls and repair](docs/runtime-controls.md) for controls, defaults,
+pause/restart semantics and regression coverage.
+
 Both frontends distinguish downloaded bytes from confirmed completion. During a
 real disk scan, the progress column switches to `Checking` with its own percentage.
 The download percentage is retained separately. Green `Done` appears only after

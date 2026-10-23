@@ -101,7 +101,7 @@ impl DownloadMode {
                 "Download normally; announce downloaded=0 while uploaded and left remain actual. Existing files and checked progress are logged separately from network bytes."
             }
             Self::FreezeAfter => {
-                "Announce actual metrics until the first announce at or above the received-byte threshold. Keep that entire uploaded/downloaded/left snapshot for subsequent announces; peer transfer continues. Reset the snapshot on application restart or recheck."
+                "Announce actual metrics until the first announce at or above the received-byte threshold. Keep that uploaded/downloaded/left snapshot across pause, recheck and repair. Explicitly applying a mode or restarting the application resets the snapshot."
             }
         }
     }

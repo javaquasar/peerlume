@@ -139,6 +139,16 @@ impl AnnounceJournal {
             .cloned()
             .collect()
     }
+    pub fn latest(&self, hash: &str) -> Option<JournalEntry> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.announce.info_hash == hash)
+            .cloned()
+    }
     pub fn path(&self) -> Option<PathBuf> {
         self.inner
             .lock()

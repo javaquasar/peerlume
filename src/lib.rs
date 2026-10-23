@@ -19,6 +19,7 @@ pub mod piece_map;
 pub mod preferences;
 pub mod protocol;
 pub mod rate_limit;
+pub mod runtime_status;
 pub mod scheduler;
 pub mod session;
 pub mod settings;

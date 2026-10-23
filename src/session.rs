@@ -13,11 +13,16 @@ use librqbit::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 mod verification;
+use crate::runtime_status::{
+    ModeApplication, ModeConfig, RepairBudget, RepairPolicy, RepairStatus,
+};
 use verification::{CheckRun, restart_for_check};
+mod controls;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
     AddTorrent {
+        repair_policy: RepairPolicy,
         verify_after_download: bool,
         download_mode: DownloadMode,
         freeze_after_bytes: u64,
@@ -50,11 +55,36 @@ pub enum SessionCommand {
         id: String,
         only_files: Vec<usize>,
     },
+    SetDownloadMode {
+        id: String,
+        config: ModeConfig,
+    },
+    SetRepairPolicy {
+        id: String,
+        policy: RepairPolicy,
+    },
     Shutdown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    Mode {
+        id: String,
+        application: ModeApplication,
+    },
+    RepairPolicy {
+        id: String,
+        policy: RepairPolicy,
+    },
+    Repair {
+        id: String,
+        status: RepairStatus,
+    },
+    NetworkTotals {
+        id: String,
+        uploaded: u64,
+        downloaded: u64,
+    },
     Verification {
         id: String,
         status: crate::completion::CompletionStatus,
@@ -151,6 +181,7 @@ impl SessionRuntime {
                     let session_peer_id = options.peer_id.unwrap_or_else(||
                         librqbit::generate_azereus_style(*b"rQ", (9, 0, 1, 0)));
                     options.peer_id = Some(session_peer_id);
+                    let tracker_enabled = !options.disable_trackers;
                     let session = match Session::new_with_opts(
                         default_output_folder,
                         options,
@@ -206,6 +237,10 @@ impl SessionRuntime {
                     let mut checked_after_download = std::collections::HashSet::<String>::new();
                     let mut check_failed = std::collections::HashSet::<String>::new();
                     let mut initializing = std::collections::HashSet::<String>::new();
+                    let mut active_modes = HashMap::<String, ModeConfig>::new();
+                    let mut pending_modes = HashMap::<String, ModeConfig>::new();
+                    let mut pending_resume = std::collections::HashSet::<String>::new();
+                    let mut repairs = HashMap::<String, RepairBudget>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -215,8 +250,9 @@ impl SessionRuntime {
                                 let torrent_ids: Vec<_> = torrents.keys().cloned().collect();
                                 for id in torrent_ids {
                                     let Some(handle) = torrents.get(&id).cloned() else { continue; };
-                                    if check_failed.contains(&id) { continue; }
+                                    if check_failed.contains(&id) && !pending_modes.contains_key(&id) { continue; }
                                     let transfer_snapshot = transfers(handle.info_hash().0);
+                                    let _ = event_tx.try_send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded });
                                     let mut stats = handle.stats();
                                     if let Some(message) = stats.error.clone() {
                                         if checks.remove(&id).is_some() {
@@ -230,14 +266,45 @@ impl SessionRuntime {
                                         let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Checking { checked_bytes: stats.progress_bytes, total_bytes: stats.total_bytes } });
                                         continue;
                                     }
+                                    if let Some(config) = pending_modes.remove(&id) {
+                                        match controls::apply_mode(&session, &handle, session_peer_id.0, config, reporting_policies.get(&id), &counters).await {
+                                            Ok((guard, resume_error)) => {
+                                                if let Some(guard) = guard { reporting_policies.insert(id.clone(), guard); }
+                                                active_modes.insert(id.clone(), config);
+                                                if let Some(SessionCommand::AddTorrent { download_mode, freeze_after_bytes, .. }) = added_commands.get_mut(&id) { *download_mode = config.mode; *freeze_after_bytes = config.freeze_after_bytes; }
+                                                let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
+                                                if pending_resume.remove(&id) && !checks.contains_key(&id) {
+                                                    let result = session.unpause(&handle).await.map_err(|_| "Mode applied, but resuming failed".to_owned());
+                                                    emit_state_result(&event_tx, id.clone(), result, "downloading");
+                                                }
+                                                if let Some(message) = resume_error { let _ = event_tx.try_send(SessionEvent::Error { id: id.clone(), message }); }
+                                                stats = handle.stats();
+                                            }
+                                            Err(message) => { let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Failed { requested: config, active: active_modes.get(&id).copied(), message } }); }
+                                        }
+                                    }
+                                    if check_failed.contains(&id) { continue; }
                                     if let Some(run) = checks.remove(&id) {
                                         initializing.remove(&id);
                                         if run.require_complete && !stats.finished {
+                                            let policy = controls::repair_policy(added_commands.get(&id));
+                                            let budget = repairs.entry(id.clone()).or_insert_with(|| RepairBudget::new(std::time::Instant::now()));
+                                            if run.resume && budget.start(policy, stats.progress_bytes, std::time::Instant::now()) && session.unpause(&handle).await.is_ok() {
+                                                    checked_after_download.remove(&id);
+                                                    let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
+                                                    let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
+                                                    let _ = event_tx.try_send(SessionEvent::StateChanged { id: id.clone(), state: "downloading" });
+                                                    continue;
+                                            }
+                                            if policy.enabled && run.resume { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Exhausted { attempts: budget.used, limit: policy.max_attempts, message: "Automatic recovery stopped; inspect peers and files before resuming".into() } }); }
                                             check_failed.insert(id.clone());
                                             let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "One or more selected pieces are missing or failed their hash check. Repair the files and recheck, or resume to download them again.".into() } });
                                             continue;
                                         }
-                                        if stats.finished { checked_after_download.insert(id.clone()); }
+                                        if stats.finished {
+                                            checked_after_download.insert(id.clone());
+                                            if let Some(budget) = repairs.remove(&id) && budget.used > 0 { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Succeeded { attempts: budget.used } }); }
+                                        }
                                         let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: if stats.finished { CompletionStatus::Verified } else { CompletionStatus::Pending } });
                                         if run.resume {
                                             if session.unpause(&handle).await.is_err() {
@@ -252,7 +319,9 @@ impl SessionRuntime {
                                     }
                                     if check_failed.contains(&id) { continue; }
                                     let verify_after_download = matches!(added_commands.get(&id), Some(SessionCommand::AddTorrent { verify_after_download: true, .. }));
-                                    if stats.finished && verify_after_download && !checked_after_download.contains(&id) {
+                                    let repair_stalled = !matches!(stats.state, TorrentStatsState::Paused) && repairs.get_mut(&id).is_some_and(|budget| budget.used > 0 && budget.stalled(stats.progress_bytes, std::time::Instant::now()));
+                                    if (stats.finished && (verify_after_download || repairs.contains_key(&id)) && !checked_after_download.contains(&id)) || repair_stalled {
+                                        if let Some(budget) = repairs.get(&id) { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Checking { attempt: budget.used, limit: controls::repair_policy(added_commands.get(&id)).max_attempts } }); }
                                         let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                         let resume = !matches!(stats.state, TorrentStatsState::Paused);
                                         match restart_for_check(&session, &handle, &added_commands[&id], &counters).await {
@@ -307,9 +376,29 @@ impl SessionRuntime {
                                     }
                                     continue;
                                 }
-                                let saved_command = command.clone();
+                                let mut saved_command = command.clone();
+                                if let SessionCommand::AddTorrent { repair_policy, verify_after_download, .. } = &mut saved_command { *verify_after_download |= repair_policy.enabled; }
                                 match command {
+                                    SessionCommand::SetDownloadMode { id, config } => {
+                                        let active = active_modes.get(&id).copied();
+                                        if !torrents.contains_key(&id) || config.mode.validate_threshold(config.freeze_after_bytes).is_err() {
+                                            let _ = event_tx.try_send(SessionEvent::Mode { id, application: ModeApplication::Failed { requested: config, active, message: "Torrent unavailable or invalid freeze threshold".into() } });
+                                        } else {
+                                            pending_modes.insert(id.clone(), config);
+                                            // Failed verification remains paused, but does not block settings.
+                                            let _ = event_tx.try_send(SessionEvent::Mode { id, application: ModeApplication::Applying { requested: config, active } });
+                                        }
+                                    }
+                                    SessionCommand::SetRepairPolicy { id, policy } => {
+                                        if policy.validate().is_err() { continue; }
+                                        if let Some(SessionCommand::AddTorrent { repair_policy, verify_after_download, .. }) = added_commands.get_mut(&id) {
+                                            *repair_policy = policy;
+                                            if policy.enabled { *verify_after_download = true; checked_after_download.remove(&id); }
+                                            let _ = event_tx.try_send(SessionEvent::RepairPolicy { id, policy });
+                                        }
+                                    }
                                     SessionCommand::AddTorrent {
+                                        repair_policy,
                                         verify_after_download: _,
                                         download_mode,
                                         freeze_after_bytes,
@@ -326,6 +415,7 @@ impl SessionRuntime {
                                             let _ = event_tx.try_send(SessionEvent::Error { id, message: "Torrent is already registered".into() });
                                             continue;
                                         }
+                                        if let Err(message) = repair_policy.validate() { let _ = event_tx.try_send(SessionEvent::Error { id, message }); continue; }
                                         let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes) {
                                             Ok(registration) => registration,
                                             Err(message) => {
@@ -369,6 +459,9 @@ impl SessionRuntime {
                                                     reporting_policies.insert(id.clone(), registration);
                                                 }
                                                 torrents.insert(id.clone(), handle);
+                                                let config = ModeConfig { mode: download_mode, freeze_after_bytes };
+                                                active_modes.insert(id.clone(), config);
+                                                let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
                                                 let _ = event_tx.try_send(SessionEvent::Added { id });
                                             }
                                             Err(message) => {
@@ -377,6 +470,7 @@ impl SessionRuntime {
                                         }
                                     }
                                     SessionCommand::Pause { id } => {
+                                        pending_resume.remove(&id);
                                         if let Some(run) = checks.get_mut(&id) { run.resume = false; continue; }
                                         let result = if let Some(handle) = torrents.get(&id) {
                                             transfers(handle.info_hash().0);
@@ -390,8 +484,18 @@ impl SessionRuntime {
                                         emit_state_result(&event_tx, id, result, "paused");
                                     }
                                     SessionCommand::Resume { id } => {
+                                        if let Some(budget) = repairs.get_mut(&id) { budget.resume(std::time::Instant::now()); }
                                         if let Some(run) = checks.get_mut(&id) { run.resume = true; continue; }
-                                        if check_failed.remove(&id) { checked_after_download.remove(&id); }
+                                        if check_failed.remove(&id) {
+                                            checked_after_download.remove(&id);
+                                            let policy = controls::repair_policy(added_commands.get(&id));
+                                            let mut budget = RepairBudget::new(std::time::Instant::now());
+                                            if policy.enabled && budget.start(policy, torrents.get(&id).map(|h| h.stats().progress_bytes).unwrap_or(0), std::time::Instant::now()) {
+                                                let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
+                                                repairs.insert(id.clone(), budget);
+                                            }
+                                        }
+                                        if pending_modes.contains_key(&id) { pending_resume.insert(id); continue; }
                                         let result = if let Some(handle) = torrents.get(&id) {
                                             session.unpause(handle).await.map_err(|error| format!("{error:#}"))
                                         } else {
@@ -420,6 +524,10 @@ impl SessionRuntime {
                                                 initializing.remove(&id);
                                                 added_commands.remove(&id);
                                                 reporting_policies.remove(&id);
+                                                active_modes.remove(&id);
+                                                pending_modes.remove(&id);
+                                                pending_resume.remove(&id);
+                                                repairs.remove(&id);
                                                 SessionEvent::Removed { id }
                                             },
                                             Err(message) => SessionEvent::Error { id, message },
@@ -436,8 +544,8 @@ impl SessionRuntime {
                                     }
                                     SessionCommand::Recheck { .. } => unreachable!("recheck expanded above"),
                                     SessionCommand::SetVerifyAfterDownload { id, enabled } => {
-                                        if let Some(SessionCommand::AddTorrent { verify_after_download, .. }) = added_commands.get_mut(&id) {
-                                            *verify_after_download = enabled;
+                                        if let Some(SessionCommand::AddTorrent { verify_after_download, repair_policy, .. }) = added_commands.get_mut(&id) {
+                                            *verify_after_download = enabled || repair_policy.enabled;
                                             if enabled { checked_after_download.remove(&id); }
                                         }
                                     }
@@ -882,6 +990,7 @@ mod tests {
         .unwrap();
         runtime
             .try_send(SessionCommand::AddTorrent {
+                repair_policy: Default::default(),
                 verify_after_download: false,
                 id: format!("v1: {info_hash}"),
                 source: source.display().to_string(),
@@ -1100,6 +1209,7 @@ mod tests {
         let id = format!("v1: {hash}");
         runtime
             .try_send(SessionCommand::AddTorrent {
+                repair_policy: Default::default(),
                 verify_after_download: false,
                 id: id.clone(),
                 source: source.display().to_string(),
@@ -1307,6 +1417,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    repair_policy: Default::default(),
                     verify_after_download: false,
                     id: format!("v1: {hash}"),
                     source: source.display().to_string(),
@@ -1421,6 +1532,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    repair_policy: Default::default(),
                     verify_after_download: false,
                     id: format!("v1: {hash}"),
                     source: source.display().to_string(),
