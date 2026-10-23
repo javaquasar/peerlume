@@ -1,11 +1,13 @@
 use std::{
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket},
     time::Duration,
 };
 
 use url::{Host, Url};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnnounceEvent {
     Started,
     Completed,
@@ -223,9 +225,25 @@ pub fn announce_http(base: &str, request: &AnnounceRequest) -> Result<AnnounceRe
             response.status().as_u16()
         ));
     }
-    let body = response
-        .bytes()
-        .map_err(|_| "tracker response read failed".to_owned())?;
+    let limit = librqbit_tracker_comms::MAX_TRACKER_RESPONSE_BYTES;
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err("tracker response exceeds the 1 MiB limit".into());
+    }
+    let mut body = Vec::new();
+    let mut reader = response;
+    let mut chunk = [0; 8192];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| "tracker response read failed".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        if count > limit.saturating_sub(body.len()) {
+            return Err("tracker response exceeds the 1 MiB limit".into());
+        }
+        body.extend_from_slice(&chunk[..count]);
+    }
     parse_announce_response(&body)
 }
 
@@ -447,6 +465,40 @@ mod tests {
                 .unwrap()
                 .contains("event=stopped")
         );
+    }
+
+    #[test]
+    fn audit_http_rejects_large_advertised_and_unframed_bodies() {
+        use std::io::{BufRead, BufReader};
+        for advertised in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/announce", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n").unwrap();
+                let length = librqbit_tracker_comms::MAX_TRACKER_RESPONSE_BYTES + 1;
+                if advertised {
+                    write!(stream, "Content-Length: {length}\r\n").unwrap();
+                }
+                write!(stream, "\r\n").unwrap();
+                if !advertised {
+                    let _ = stream.write_all(&vec![b'x'; length]);
+                }
+            });
+            let error = announce_http(&url, &request()).unwrap_err();
+            worker.join().unwrap();
+            assert!(error.contains("1 MiB"), "{error}");
+        }
     }
 
     #[test]

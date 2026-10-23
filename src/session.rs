@@ -1,16 +1,12 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, mpsc},
-    thread,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use crate::completion::CompletionStatus;
 use crate::{announce_journal::AnnounceJournal, download_mode::DownloadMode};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
+#[cfg(test)]
+use std::sync::mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
 mod verification;
 use crate::runtime_status::{
@@ -18,6 +14,7 @@ use crate::runtime_status::{
 };
 use verification::{CheckRun, restart_for_check};
 mod controls;
+mod events;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
@@ -120,7 +117,7 @@ pub enum SessionEvent {
 pub struct SessionRuntime {
     pub journal: AnnounceJournal,
     commands: tokio_mpsc::Sender<SessionCommand>,
-    events: mpsc::Receiver<SessionEvent>,
+    events: events::Receiver,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -165,7 +162,7 @@ impl SessionRuntime {
             return Err("channel capacity must be greater than zero".into());
         }
         let (commands, mut command_rx) = tokio_mpsc::channel(capacity);
-        let (event_tx, events) = mpsc::sync_channel(capacity);
+        let (event_tx, events) = events::channel(capacity);
         let thread_journal = journal.clone();
         let thread = thread::Builder::new()
             .name("peerlume-session".into())
@@ -252,18 +249,18 @@ impl SessionRuntime {
                                     let Some(handle) = torrents.get(&id).cloned() else { continue; };
                                     if check_failed.contains(&id) && !pending_modes.contains_key(&id) { continue; }
                                     let transfer_snapshot = transfers(handle.info_hash().0);
-                                    let _ = event_tx.try_send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded });
+                                    let _ = event_tx.send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded });
                                     let mut stats = handle.stats();
                                     if let Some(message) = stats.error.clone() {
                                         if checks.remove(&id).is_some() {
                                             check_failed.insert(id.clone());
-                                            let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "Integrity check could not read or validate the files".into() } });
-                                        } else { let _ = event_tx.try_send(SessionEvent::Error { id, message }); }
+                                            let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "Integrity check could not read or validate the files".into() } });
+                                        } else { let _ = event_tx.send(SessionEvent::Error { id, message }); }
                                         continue;
                                     }
                                     if matches!(stats.state, TorrentStatsState::Initializing { .. }) {
                                         initializing.insert(id.clone());
-                                        let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Checking { checked_bytes: stats.progress_bytes, total_bytes: stats.total_bytes } });
+                                        let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Checking { checked_bytes: stats.progress_bytes, total_bytes: stats.total_bytes } });
                                         continue;
                                     }
                                     if let Some(config) = pending_modes.remove(&id) {
@@ -272,15 +269,15 @@ impl SessionRuntime {
                                                 if let Some(guard) = guard { reporting_policies.insert(id.clone(), guard); }
                                                 active_modes.insert(id.clone(), config);
                                                 if let Some(SessionCommand::AddTorrent { download_mode, freeze_after_bytes, .. }) = added_commands.get_mut(&id) { *download_mode = config.mode; *freeze_after_bytes = config.freeze_after_bytes; }
-                                                let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
+                                                let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
                                                 if pending_resume.remove(&id) && !checks.contains_key(&id) {
                                                     let result = session.unpause(&handle).await.map_err(|_| "Mode applied, but resuming failed".to_owned());
                                                     emit_state_result(&event_tx, id.clone(), result, "downloading");
                                                 }
-                                                if let Some(message) = resume_error { let _ = event_tx.try_send(SessionEvent::Error { id: id.clone(), message }); }
+                                                if let Some(message) = resume_error { let _ = event_tx.send(SessionEvent::Error { id: id.clone(), message }); }
                                                 stats = handle.stats();
                                             }
-                                            Err(message) => { let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Failed { requested: config, active: active_modes.get(&id).copied(), message } }); }
+                                            Err(message) => { let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Failed { requested: config, active: active_modes.get(&id).copied(), message } }); }
                                         }
                                     }
                                     if check_failed.contains(&id) { continue; }
@@ -291,42 +288,42 @@ impl SessionRuntime {
                                             let budget = repairs.entry(id.clone()).or_insert_with(|| RepairBudget::new(std::time::Instant::now()));
                                             if run.resume && budget.start(policy, stats.progress_bytes, std::time::Instant::now()) && session.unpause(&handle).await.is_ok() {
                                                     checked_after_download.remove(&id);
-                                                    let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
-                                                    let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
-                                                    let _ = event_tx.try_send(SessionEvent::StateChanged { id: id.clone(), state: "downloading" });
+                                                    let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
+                                                    let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
+                                                    let _ = event_tx.send(SessionEvent::StateChanged { id: id.clone(), state: "downloading" });
                                                     continue;
                                             }
-                                            if policy.enabled && run.resume { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Exhausted { attempts: budget.used, limit: policy.max_attempts, message: "Automatic recovery stopped; inspect peers and files before resuming".into() } }); }
+                                            if policy.enabled && run.resume { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Exhausted { attempts: budget.used, limit: policy.max_attempts, message: "Automatic recovery stopped; inspect peers and files before resuming".into() } }); }
                                             check_failed.insert(id.clone());
-                                            let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "One or more selected pieces are missing or failed their hash check. Repair the files and recheck, or resume to download them again.".into() } });
+                                            let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "One or more selected pieces are missing or failed their hash check. Repair the files and recheck, or resume to download them again.".into() } });
                                             continue;
                                         }
                                         if stats.finished {
                                             checked_after_download.insert(id.clone());
-                                            if let Some(budget) = repairs.remove(&id) && budget.used > 0 { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Succeeded { attempts: budget.used } }); }
+                                            if let Some(budget) = repairs.remove(&id) && budget.used > 0 { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Succeeded { attempts: budget.used } }); }
                                         }
-                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: if stats.finished { CompletionStatus::Verified } else { CompletionStatus::Pending } });
+                                        let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: if stats.finished { CompletionStatus::Verified } else { CompletionStatus::Pending } });
                                         if run.resume {
                                             if session.unpause(&handle).await.is_err() {
-                                                let _ = event_tx.try_send(SessionEvent::Error { id, message: "Integrity check succeeded, but the torrent could not resume".into() });
+                                                let _ = event_tx.send(SessionEvent::Error { id, message: "Integrity check succeeded, but the torrent could not resume".into() });
                                                 continue;
                                             }
                                             stats = handle.stats();
                                         }
-                                        let _ = event_tx.try_send(SessionEvent::StateChanged { id: id.clone(), state: if run.resume { "downloading" } else { "paused" } });
+                                        let _ = event_tx.send(SessionEvent::StateChanged { id: id.clone(), state: if run.resume { "downloading" } else { "paused" } });
                                     } else if initializing.remove(&id) {
-                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
+                                        let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Pending });
                                     }
                                     if check_failed.contains(&id) { continue; }
                                     let verify_after_download = matches!(added_commands.get(&id), Some(SessionCommand::AddTorrent { verify_after_download: true, .. }));
                                     let repair_stalled = !matches!(stats.state, TorrentStatsState::Paused) && repairs.get_mut(&id).is_some_and(|budget| budget.used > 0 && budget.stalled(stats.progress_bytes, std::time::Instant::now()));
                                     if (stats.finished && (verify_after_download || repairs.contains_key(&id)) && !checked_after_download.contains(&id)) || repair_stalled {
-                                        if let Some(budget) = repairs.get(&id) { let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Checking { attempt: budget.used, limit: controls::repair_policy(added_commands.get(&id)).max_attempts } }); }
-                                        let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
+                                        if let Some(budget) = repairs.get(&id) { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Checking { attempt: budget.used, limit: controls::repair_policy(added_commands.get(&id)).max_attempts } }); }
+                                        let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                         let resume = !matches!(stats.state, TorrentStatsState::Paused);
                                         match restart_for_check(&session, &handle, &added_commands[&id], &counters).await {
                                             Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id, CheckRun { resume, require_complete: true }); }
-                                            Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.try_send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
+                                            Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
                                         }
                                         continue;
                                     }
@@ -346,7 +343,7 @@ impl SessionRuntime {
                                             )
                                         })
                                         .unwrap_or_default();
-                                    let _ = event_tx.try_send(SessionEvent::Stats {
+                                    let _ = event_tx.send(SessionEvent::Stats {
                                         id: id.clone(),
                                         downloaded_bytes: stats.progress_bytes,
                                         uploaded_bytes: transfer_snapshot.uploaded,
@@ -368,11 +365,11 @@ impl SessionRuntime {
                                     let resume = !matches!(stats.state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
                                     let require_complete = stats.finished || check_failed.contains(id);
                                     transfers(handle.info_hash().0);
-                                    let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
+                                    let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                     let Some(saved) = added_commands.get(id) else { continue; };
                                     match restart_for_check(&session, &handle, saved, &counters).await {
-                                        Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.try_send(SessionEvent::Added { id: id.clone() }); }
-                                        Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.try_send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
+                                        Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.send(SessionEvent::Added { id: id.clone() }); }
+                                        Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
                                     }
                                     continue;
                                 }
@@ -382,11 +379,11 @@ impl SessionRuntime {
                                     SessionCommand::SetDownloadMode { id, config } => {
                                         let active = active_modes.get(&id).copied();
                                         if !torrents.contains_key(&id) || config.mode.validate_threshold(config.freeze_after_bytes).is_err() {
-                                            let _ = event_tx.try_send(SessionEvent::Mode { id, application: ModeApplication::Failed { requested: config, active, message: "Torrent unavailable or invalid freeze threshold".into() } });
+                                            let _ = event_tx.send(SessionEvent::Mode { id, application: ModeApplication::Failed { requested: config, active, message: "Torrent unavailable or invalid freeze threshold".into() } });
                                         } else {
                                             pending_modes.insert(id.clone(), config);
                                             // Failed verification remains paused, but does not block settings.
-                                            let _ = event_tx.try_send(SessionEvent::Mode { id, application: ModeApplication::Applying { requested: config, active } });
+                                            let _ = event_tx.send(SessionEvent::Mode { id, application: ModeApplication::Applying { requested: config, active } });
                                         }
                                     }
                                     SessionCommand::SetRepairPolicy { id, policy } => {
@@ -394,7 +391,7 @@ impl SessionRuntime {
                                         if let Some(SessionCommand::AddTorrent { repair_policy, verify_after_download, .. }) = added_commands.get_mut(&id) {
                                             *repair_policy = policy;
                                             if policy.enabled { *verify_after_download = true; checked_after_download.remove(&id); }
-                                            let _ = event_tx.try_send(SessionEvent::RepairPolicy { id, policy });
+                                            let _ = event_tx.send(SessionEvent::RepairPolicy { id, policy });
                                         }
                                     }
                                     SessionCommand::AddTorrent {
@@ -412,14 +409,14 @@ impl SessionRuntime {
                                         peer_limit,
                                     } => {
                                         if torrents.contains_key(&id) {
-                                            let _ = event_tx.try_send(SessionEvent::Error { id, message: "Torrent is already registered".into() });
+                                            let _ = event_tx.send(SessionEvent::Error { id, message: "Torrent is already registered".into() });
                                             continue;
                                         }
-                                        if let Err(message) = repair_policy.validate() { let _ = event_tx.try_send(SessionEvent::Error { id, message }); continue; }
+                                        if let Err(message) = repair_policy.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
                                         let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes) {
                                             Ok(registration) => registration,
                                             Err(message) => {
-                                                let _ = event_tx.try_send(SessionEvent::Error { id, message });
+                                                let _ = event_tx.send(SessionEvent::Error { id, message });
                                                 continue;
                                             }
                                         };
@@ -461,11 +458,11 @@ impl SessionRuntime {
                                                 torrents.insert(id.clone(), handle);
                                                 let config = ModeConfig { mode: download_mode, freeze_after_bytes };
                                                 active_modes.insert(id.clone(), config);
-                                                let _ = event_tx.try_send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
-                                                let _ = event_tx.try_send(SessionEvent::Added { id });
+                                                let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
+                                                let _ = event_tx.send(SessionEvent::Added { id });
                                             }
                                             Err(message) => {
-                                                let _ = event_tx.try_send(SessionEvent::Error { id, message });
+                                                let _ = event_tx.send(SessionEvent::Error { id, message });
                                             }
                                         }
                                     }
@@ -491,7 +488,7 @@ impl SessionRuntime {
                                             let policy = controls::repair_policy(added_commands.get(&id));
                                             let mut budget = RepairBudget::new(std::time::Instant::now());
                                             if policy.enabled && budget.start(policy, torrents.get(&id).map(|h| h.stats().progress_bytes).unwrap_or(0), std::time::Instant::now()) {
-                                                let _ = event_tx.try_send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
+                                                let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
                                                 repairs.insert(id.clone(), budget);
                                             }
                                         }
@@ -532,7 +529,7 @@ impl SessionRuntime {
                                             },
                                             Err(message) => SessionEvent::Error { id, message },
                                         };
-                                        let _ = event_tx.try_send(event);
+                                        let _ = event_tx.send(event);
                                     }
                                     SessionCommand::Shutdown => {
                                         let final_samples: Vec<_> = torrents.values().map(|h| final_transfer_sampler(h, &counters)).collect();
@@ -557,7 +554,7 @@ impl SessionRuntime {
                                                     checked_after_download.remove(&id);
                                                     if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files); }
                                                 },
-                                                Err(error) => { let _ = event_tx.try_send(SessionEvent::Error { id, message: format!("File selection update failed: {error:#}") }); }
+                                                Err(error) => { let _ = event_tx.send(SessionEvent::Error { id, message: format!("File selection update failed: {error:#}") }); }
                                             }
                                         }
                                     }
@@ -593,6 +590,9 @@ impl SessionRuntime {
     }
 
     pub fn shutdown(mut self) -> Result<(), String> {
+        // Shutdown consumes the receiver. Release control-event backpressure
+        // before joining the worker, even if the UI has stopped polling.
+        self.events.close();
         self.commands
             .blocking_send(SessionCommand::Shutdown)
             .map_err(|error| error.to_string())?;
@@ -708,7 +708,7 @@ impl TransferCounter {
 }
 
 fn emit_state_result(
-    sender: &mpsc::SyncSender<SessionEvent>,
+    sender: &events::Sender,
     id: String,
     result: Result<(), String>,
     state: &'static str,
@@ -717,11 +717,12 @@ fn emit_state_result(
         Ok(()) => SessionEvent::StateChanged { id, state },
         Err(message) => SessionEvent::Error { id, message },
     };
-    let _ = sender.try_send(event);
+    let _ = sender.send(event);
 }
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
+        self.events.close();
         let _ = self.commands.blocking_send(SessionCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1092,6 +1093,42 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_releases_full_control_queue_without_a_polling_frontend() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = SessionRuntime::start_with_options(
+            1,
+            root.path().into(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                ..session_options(true)
+            },
+        )
+        .unwrap();
+        runtime
+            .try_send(SessionCommand::Pause {
+                id: "missing-one".into(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runtime.events.pending_controls() != 1 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        runtime
+            .try_send(SessionCommand::Pause {
+                id: "missing-two".into(),
+            })
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(runtime.shutdown()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn disabled_reporting_is_applied_to_the_whole_transfer_session() {
         assert!(session_options(true).disable_trackers);
         assert!(!session_options(false).disable_trackers);
@@ -1099,18 +1136,18 @@ mod tests {
 
     #[test]
     fn state_result_reports_success_and_failure() {
-        let (tx, rx) = mpsc::sync_channel(2);
+        let (tx, rx) = events::channel(2);
         emit_state_result(&tx, "ok".into(), Ok(()), "paused");
         emit_state_result(&tx, "bad".into(), Err("failure".into()), "paused");
         assert_eq!(
-            rx.recv().unwrap(),
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             SessionEvent::StateChanged {
                 id: "ok".into(),
                 state: "paused"
             }
         );
         assert_eq!(
-            rx.recv().unwrap(),
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             SessionEvent::Error {
                 id: "bad".into(),
                 message: "failure".into()
@@ -1344,6 +1381,11 @@ mod tests {
         for (status, body, expected) in [
             (Some(403), Vec::new(), "http_error"),
             (Some(200), b"not bencode".to_vec(), "invalid_response"),
+            (
+                Some(200),
+                vec![b'x'; librqbit_tracker_comms::MAX_TRACKER_RESPONSE_BYTES + 1],
+                "response_read_error",
+            ),
             (Some(200), failure, "tracker_failure"),
             (Some(200), warning, "ok"),
             (None, Vec::new(), "cancelled"),
@@ -1398,7 +1440,7 @@ mod tests {
                         body.len()
                     )
                     .unwrap();
-                    stream.write_all(&body).unwrap();
+                    let _ = stream.write_all(&body);
                 } else {
                     while !server_stop.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(5));

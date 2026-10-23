@@ -89,6 +89,9 @@ The sample settings are in `config/peerlume.example.toml`.
 
 ## Completion and integrity checking
 
+Memory retention, paged journals, telemetry coalescing and HTTP response limits
+are documented in [Memory behavior](docs/memory-behavior.md).
+
 Existing torrents now support live mode changes with engine acknowledgements,
 optional bounded automatic repair, and a shared **Status** tab in egui/ratatui.
 See [Runtime controls and repair](docs/runtime-controls.md) for controls, defaults,

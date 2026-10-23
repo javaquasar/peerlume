@@ -132,7 +132,12 @@ impl Attempt {
         if let Some(observer) = self.observer.take() {
             self.record.elapsed_ms =
                 self.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            observer(self.record.clone());
+            // Move the potentially large peer vector into the journal. A cheap
+            // empty replacement keeps Drop cancellation logging exactly-once.
+            let peers = std::mem::take(&mut self.record.reply.peers);
+            let mut emitted = self.record.clone();
+            emitted.reply.peers = peers;
+            observer(emitted);
         }
     }
 }

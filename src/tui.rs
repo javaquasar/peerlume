@@ -42,9 +42,7 @@ use crate::{
     settings::ClientSettings,
     state::{StoredTrackerAuditProfile, StoredTrackerAuditStep},
     torrent::{EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentState},
-    tracker::{
-        AnnounceEvent, AnnounceRequest, announce_for_audit, compact_ipv4_peers, parse_info_hash_hex,
-    },
+    tracker::{AnnounceEvent, AnnounceRequest, parse_info_hash_hex},
     tracker_behavior::BehaviorCatalog,
     ui_schema::{COMPONENTS, MainPage, PreferencesTab, TorrentDetailsTab},
 };
@@ -74,6 +72,7 @@ struct InputPrompt {
 }
 
 pub struct TuiApp {
+    journal_page: usize,
     settings: ClientSettings,
     backend: ClientBackend,
     torrents: Vec<TorrentItem>,
@@ -137,6 +136,7 @@ impl TuiApp {
             details_tab: TorrentDetailsTab::Files,
             preferences_tab,
             selected_torrent: 0,
+            journal_page: 0,
             selected_file: 0,
             input: None,
             status: "Ready".into(),
@@ -410,6 +410,14 @@ impl TuiApp {
                 self.preferences_tab = self.preferences_tab.previous();
             }
             KeyCode::Down => self.move_selection(1),
+            KeyCode::PageDown if self.details_tab == TorrentDetailsTab::Log => {
+                self.journal_page = self.journal_page.saturating_add(1);
+                self.selected_file = 0;
+            }
+            KeyCode::PageUp if self.details_tab == TorrentDetailsTab::Log => {
+                self.journal_page = self.journal_page.saturating_sub(1);
+                self.selected_file = 0;
+            }
             KeyCode::Up => self.move_selection(-1),
             _ => {}
         }
@@ -502,10 +510,13 @@ impl TuiApp {
                 TorrentDetailsTab::Log | TorrentDetailsTab::Status
             )
         {
-            self.selected_file = self
-                .selected_file
-                .saturating_add_signed(direction)
-                .min(u16::MAX as usize);
+            self.selected_file = self.selected_file.saturating_add_signed(direction).min(
+                if self.details_tab == TorrentDetailsTab::Log {
+                    usize::MAX
+                } else {
+                    u16::MAX as usize
+                },
+            );
             return;
         }
         if self.page == MainPage::Torrents
@@ -979,10 +990,15 @@ impl TuiApp {
             steps.len()
         );
         std::thread::spawn(move || {
-            let mut messages = Vec::new();
+            let mut messages = crate::live_history::LiveHistory::default();
             for (index, step) in steps.iter().enumerate() {
                 if !crate::tracker_behavior::wait_for_delay(step.delay_seconds, &worker_cancel) {
-                    let _ = sender.send("Tracker scenario cancelled".into());
+                    let text = if messages.is_empty() && messages.recorded() == 0 {
+                        "Tracker scenario cancelled".into()
+                    } else {
+                        format!("Tracker scenario cancelled · {}", messages.status())
+                    };
+                    let _ = sender.send(text);
                     return;
                 }
                 let event = match step.event.as_deref() {
@@ -1000,27 +1016,12 @@ impl TuiApp {
                     left: step.left,
                     event,
                 };
-                let message = announce_for_audit(&tracker_url, &request, &allow_hosts)
-                    .and_then(|response| {
-                        compact_ipv4_peers(&response.compact_peers).map(|peers| {
-                            format!(
-                                "step {}: up={} down={} left={} event={} -> interval={}s peers={}",
-                                index + 1,
-                                step.uploaded,
-                                step.downloaded,
-                                step.left,
-                                step.event.as_deref().unwrap_or("none"),
-                                response.interval_seconds,
-                                peers
-                                    .iter()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        })
-                    })
-                    .unwrap_or_else(|error| format!("step {} failed: {error}", index + 1));
-                messages.push(message);
+                messages.push(crate::live_history::AuditExchange::execute(
+                    &tracker_url,
+                    &allow_hosts,
+                    request,
+                    index,
+                ));
             }
             if profile.started_only
                 && !crate::tracker_behavior::wait_for_delay(
@@ -1028,9 +1029,19 @@ impl TuiApp {
                     &worker_cancel,
                 )
             {
-                messages.push("Observation cancelled".into());
+                let _ = sender.send(format!("Observation cancelled · {}", messages.status()));
+                return;
             }
-            let _ = sender.send(messages.join("\n"));
+            let summary = messages
+                .iter()
+                .rev()
+                .take(8)
+                .map(|entry| entry.summary())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = format!("{}\n{summary}", messages.status());
+            messages.clear();
+            let _ = sender.send(result);
         });
     }
 
@@ -1269,7 +1280,7 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
-        let Some(torrent) = self.selected() else {
+        let Some(torrent) = self.torrents.get(self.selected_torrent) else {
             frame.render_widget(
                 Paragraph::new("No torrents. Press a to add a .torrent or m for a magnet.")
                     .block(Block::default().borders(Borders::ALL)),
@@ -1285,7 +1296,7 @@ impl TuiApp {
                         .iter()
                         .find_map(|h| j.latest(h.strip_prefix("v1: ")?))
                 });
-                let lines: Vec<_> = crate::runtime_status::status_card(torrent, last.as_ref())
+                let lines: Vec<_> = crate::runtime_status::status_card(torrent, last.as_deref())
                     .into_iter()
                     .map(|(key, value)| Line::from(format!("{key}: {value}")))
                     .collect();
@@ -1545,17 +1556,27 @@ impl TuiApp {
                         lines.push(Line::from(error));
                     }
                     let hash = crate::announce_journal::torrent_hash(&torrent.info_hashes);
-                    let entries = hash
-                        .map(|hash| journal.entries(Some(hash)))
-                        .unwrap_or_default();
-                    for entry in entries.iter().rev() {
-                        lines.push(Line::from(entry.summary()));
-                        lines.push(Line::from(format!("info_hash={} transport={} full_size={} selected_bytes={:?} request_transmitted={:?}", entry.announce.info_hash, entry.announce.transport, entry.announce.full_size, entry.announce.selected_bytes, entry.announce.request_transmitted)));
-                        lines.push(Line::from(format!("mode={} peer_id={} port={} response: HTTP={:?}, interval={:?}, min={:?}, seeders={:?}, leechers={:?}, warning={:?}, failure={:?}", entry.announce.mode, entry.announce.peer_id_hex, entry.announce.port, entry.announce.reply.http_status, entry.announce.reply.interval, entry.announce.reply.min_interval, entry.announce.reply.seeders, entry.announce.reply.leechers, entry.announce.reply.warning, entry.announce.reply.failure)));
-                        for peer in &entry.announce.reply.peers {
-                            lines.push(Line::from(format!("  peer {peer}")));
-                        }
-                    }
+                    let page = journal.page(
+                        Some(hash.unwrap_or_default()),
+                        self.journal_page
+                            .saturating_mul(crate::announce_journal::PAGE_SIZE),
+                        crate::announce_journal::PAGE_SIZE,
+                    );
+                    let last_page =
+                        page.total.saturating_sub(1) / crate::announce_journal::PAGE_SIZE;
+                    self.journal_page = self.journal_page.min(last_page);
+                    let page = journal.page(
+                        Some(hash.unwrap_or_default()),
+                        self.journal_page * crate::announce_journal::PAGE_SIZE,
+                        crate::announce_journal::PAGE_SIZE,
+                    );
+                    lines.push(Line::from(format!("Page {}/{} · {} live entries · {} / {} retained bytes · {} oversized on disk only", self.journal_page + 1, last_page + 1, page.total, page.retained_bytes, crate::announce_journal::LIVE_BYTE_BUDGET, page.skipped_oversize)));
+                    let available = areas[1].height.saturating_sub(2 + lines.len() as u16) as usize;
+                    lines.extend(journal_visible_lines(
+                        &page.entries,
+                        self.selected_file,
+                        available,
+                    ));
                 }
                 if lines.is_empty() {
                     lines.push(Line::from(
@@ -1566,11 +1587,10 @@ impl TuiApp {
                     Paragraph::new(lines)
                         .block(
                             Block::default()
-                                .title(" Real announces · e/E export torrent/session · v recheck · ↑↓ scroll ")
+                                .title(" Real announces · e/E export · v recheck · PgUp/PgDn page · up/down lines ")
                                 .borders(Borders::ALL),
                         )
-                        .wrap(Wrap { trim: false })
-                        .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0)),
+                        .wrap(Wrap { trim: false }),
                     areas[1],
                 );
             }
@@ -1658,6 +1678,52 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Format only the viewport, including when a tracker returns thousands of peers.
+fn journal_visible_lines(
+    entries: &[Arc<crate::announce_journal::JournalEntry>],
+    mut offset: usize,
+    limit: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(limit);
+    for entry in entries {
+        let length = 3 + entry.announce.reply.peers.len();
+        if offset >= length {
+            offset -= length;
+            continue;
+        }
+        for index in offset..length {
+            if lines.len() == limit {
+                return lines;
+            }
+            let a = &entry.announce;
+            let text = match index {
+                0 => entry.summary().to_owned(),
+                1 => format!(
+                    "info_hash={} transport={} full_size={} selected_bytes={:?} request_transmitted={:?}",
+                    a.info_hash, a.transport, a.full_size, a.selected_bytes, a.request_transmitted
+                ),
+                2 => format!(
+                    "mode={} peer_id={} port={} HTTP={:?}, interval={:?}, min={:?}, seeds={:?}, leechers={:?}, warning={:?}, failure={:?}",
+                    a.mode,
+                    a.peer_id_hex,
+                    a.port,
+                    a.reply.http_status,
+                    a.reply.interval,
+                    a.reply.min_interval,
+                    a.reply.seeders,
+                    a.reply.leechers,
+                    a.reply.warning,
+                    a.reply.failure
+                ),
+                _ => format!("  peer {}", a.reply.peers[index - 3]),
+            };
+            lines.push(Line::from(text));
+        }
+        offset = 0;
+    }
+    lines
+}
+
 fn default_audit(total_size: u64, port: u16) -> StoredTrackerAuditProfile {
     StoredTrackerAuditProfile {
         allowed_host: String::new(),
@@ -1732,6 +1798,32 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+
+    #[test]
+    fn journal_formats_only_the_viewport_of_a_large_peer_reply() {
+        let journal = crate::announce_journal::AnnounceJournal::memory();
+        let mut observation = crate::announce_journal::tests::observation("a");
+        observation.reply.peers = (0..100_000)
+            .map(|i| std::net::SocketAddr::from(([127, 0, 0, 1], (i % 60000 + 1024) as u16)))
+            .collect();
+        journal.record(observation);
+        let page = journal.page(Some("a"), 0, 32);
+        let lines = journal_visible_lines(&page.entries, 100_001, 4);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1].spans[0]
+                .content
+                .contains(&page.entries[0].announce.reply.peers[99_999].to_string())
+        );
+        assert!(journal_visible_lines(&page.entries, usize::MAX, 4).is_empty());
+        assert!(journal_visible_lines(&page.entries, 0, 0).is_empty());
+        let mut app = app();
+        app.details_tab = TorrentDetailsTab::Log;
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.journal_page, 1);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.journal_page, 0);
+    }
 
     #[test]
     fn existing_mode_does_not_claim_success_when_backend_is_offline() {

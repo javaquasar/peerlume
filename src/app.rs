@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use eframe::egui;
@@ -31,10 +31,7 @@ use crate::{
     torrent::{
         EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentPriority, TorrentState,
     },
-    tracker::{
-        AnnounceEvent, AnnounceRequest, announce_for_audit, compact_ipv4_peers,
-        parse_info_hash_hex, validate_audit_target,
-    },
+    tracker::{AnnounceEvent, AnnounceRequest, parse_info_hash_hex, validate_audit_target},
     tracker_behavior::BehaviorCatalog,
     ui_schema::{MainPage, TorrentDetailsTab as DetailsTab},
 };
@@ -84,22 +81,7 @@ struct TrashRequest {
     paths: Vec<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
-struct TrackerAuditExchange {
-    timestamp_unix_ms: u128,
-    step_index: usize,
-    tracker_host: String,
-    info_hash_hex: String,
-    peer_id: String,
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-    event: Option<AnnounceEvent>,
-    interval_seconds: Option<u64>,
-    peers: Vec<String>,
-    error: Option<String>,
-}
+use crate::live_history::AuditExchange as TrackerAuditExchange;
 
 #[derive(Clone, Debug)]
 struct TrackerAuditStep {
@@ -135,7 +117,7 @@ struct TorrentTrackerAudit {
     started_only: bool,
     observation_seconds: u64,
     steps: Vec<TrackerAuditStep>,
-    exchanges: Vec<TrackerAuditExchange>,
+    exchanges: crate::live_history::LiveHistory<TrackerAuditExchange>,
     status: String,
     run: Option<TrackerAuditRun>,
 }
@@ -155,7 +137,7 @@ impl TorrentTrackerAudit {
                 left: total_size,
                 event: Some(AnnounceEvent::Started),
             }],
-            exchanges: Vec::new(),
+            exchanges: Default::default(),
             status: String::new(),
             run: None,
         }
@@ -197,7 +179,7 @@ impl TorrentTrackerAudit {
             started_only: stored.started_only,
             observation_seconds: stored.observation_seconds,
             steps,
-            exchanges: Vec::new(),
+            exchanges: Default::default(),
             status: String::new(),
             run: None,
         }
@@ -236,7 +218,7 @@ struct AddTrackerAudit {
     observation_seconds: u64,
     status: String,
     peers: Vec<String>,
-    exchanges: Vec<TrackerAuditExchange>,
+    exchanges: crate::live_history::LiveHistory<TrackerAuditExchange>,
     pending: Option<Receiver<TrackerAuditExchange>>,
     preset_steps: Vec<TrackerAuditStep>,
 }
@@ -255,7 +237,7 @@ impl AddTrackerAudit {
             observation_seconds: 14_400,
             status: String::new(),
             peers: Vec::new(),
-            exchanges: Vec::new(),
+            exchanges: Default::default(),
             pending: None,
             preset_steps: Vec::new(),
         }
@@ -371,6 +353,8 @@ impl AddTorrentDialog {
 }
 
 pub struct PeerLumeApp {
+    log_offset: usize,
+    log_torrent: String,
     page: MainPage,
     details_tab: DetailsTab,
     preferences_tab: PreferencesTab,
@@ -449,6 +433,8 @@ impl Default for PeerLumeApp {
         let mut app = Self {
             page: MainPage::Torrents,
             details_tab: DetailsTab::Files,
+            log_offset: 0,
+            log_torrent: String::new(),
             preferences_tab,
             torrents,
             selected_torrent: 0,
@@ -1462,7 +1448,7 @@ impl PeerLumeApp {
                         .iter()
                         .find_map(|h| j.latest(h.strip_prefix("v1: ")?))
                 });
-                show_runtime_status(ui, torrent, last.as_ref());
+                show_runtime_status(ui, torrent, last.as_deref());
             }
             DetailsTab::Files => {
                 if Self::show_file_tree(ui, torrent) {
@@ -1629,18 +1615,84 @@ impl PeerLumeApp {
                             }
                         }
                     });
-                    let entries = hash
-                        .map(|hash| journal.entries(Some(hash)))
-                        .unwrap_or_default();
-                    ui.label(format!("{} entries in live tail (session limit {}); export reads full disk history", entries.len(), crate::announce_journal::LIVE_CAPACITY));
+                    if self.log_torrent != hash.unwrap_or_default() {
+                        self.log_torrent = hash.unwrap_or_default().into();
+                        self.log_offset = 0;
+                    }
+                    let page = journal.page(
+                        Some(hash.unwrap_or_default()),
+                        self.log_offset,
+                        crate::announce_journal::PAGE_SIZE,
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(self.log_offset > 0, egui::Button::new("Newer"))
+                            .clicked()
+                        {
+                            self.log_offset = self
+                                .log_offset
+                                .saturating_sub(crate::announce_journal::PAGE_SIZE);
+                        }
+                        if ui
+                            .add_enabled(
+                                self.log_offset + crate::announce_journal::PAGE_SIZE < page.total,
+                                egui::Button::new("Older"),
+                            )
+                            .clicked()
+                        {
+                            self.log_offset += crate::announce_journal::PAGE_SIZE;
+                        }
+                    });
+                    if self.log_offset >= page.total {
+                        self.log_offset = page.total.saturating_sub(1)
+                            / crate::announce_journal::PAGE_SIZE
+                            * crate::announce_journal::PAGE_SIZE;
+                    }
+                    let page = journal.page(
+                        Some(hash.unwrap_or_default()),
+                        self.log_offset,
+                        crate::announce_journal::PAGE_SIZE,
+                    );
+                    ui.label(format!("{} live entries; {} / {} retained bytes; {} oversized entries on disk only. Export reads full disk history.", page.total, page.retained_bytes, crate::announce_journal::LIVE_BYTE_BUDGET, page.skipped_oversize));
                     egui::ScrollArea::vertical()
                         .id_salt("real_announce_log")
                         .show(ui, |ui| {
-                            for entry in entries.iter().rev() {
+                            for entry in &page.entries {
                                 ui.collapsing(entry.summary(), |ui| {
-                                    if let Ok(json) = serde_json::to_string_pretty(entry) {
-                                        ui.monospace(json);
+                                    ui.monospace(format!("info_hash={} peer_id={} port={} transport={} full_size={} selected={:?} request_transmitted={:?}", entry.announce.info_hash, entry.announce.peer_id_hex, entry.announce.port, entry.announce.transport, entry.announce.full_size, entry.announce.selected_bytes, entry.announce.request_transmitted));
+                                    ui.label(format!(
+                                        "Mode: {} · event: {:?} · reply: {} · HTTP {:?}",
+                                        entry.announce.mode,
+                                        entry.announce.event,
+                                        entry.announce.outcome,
+                                        entry.announce.reply.http_status
+                                    ));
+                                    ui.label(format!(
+                                        "Interval {:?} s · min {:?} s · seeds {:?} · leechers {:?}",
+                                        entry.announce.reply.interval,
+                                        entry.announce.reply.min_interval,
+                                        entry.announce.reply.seeders,
+                                        entry.announce.reply.leechers
+                                    ));
+                                    if let Some(value) = &entry.announce.reply.warning {
+                                        ui.label(format!("Warning: {value}"));
                                     }
+                                    if let Some(value) = &entry.announce.reply.failure {
+                                        ui.label(format!("Failure: {value}"));
+                                    }
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("announce_peers", entry.sequence))
+                                        .max_height(180.0)
+                                        .show_rows(
+                                            ui,
+                                            20.0,
+                                            entry.announce.reply.peers.len(),
+                                            |ui, rows| {
+                                                for peer in &entry.announce.reply.peers[rows] {
+                                                    ui.monospace(peer.to_string());
+                                                }
+                                            },
+                                        );
                                 });
                             }
                         });
@@ -2836,6 +2888,7 @@ fn show_torrent_tracker_audit(
 
     ui.separator();
     ui.strong(format!("Tracker exchange log ({})", audit.exchanges.len()));
+    ui.label(audit.exchanges.status());
     if audit.exchanges.is_empty() {
         ui.label("No audit announces have been sent for this torrent.");
     }
@@ -2869,9 +2922,18 @@ fn show_torrent_tracker_audit(
                     exchange.interval_seconds.unwrap_or_default()
                 ));
                 ui.label(format!("Received peers: {}", exchange.peers.len()));
-                for peer in &exchange.peers {
-                    ui.monospace(peer);
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt((
+                        "audit_peers",
+                        exchange.timestamp_unix_ms,
+                        exchange.step_index,
+                    ))
+                    .max_height(180.0)
+                    .show_rows(ui, 20.0, exchange.peers.len(), |ui, rows| {
+                        for peer in &exchange.peers[rows] {
+                            ui.monospace(peer);
+                        }
+                    });
             }
         });
     }
@@ -2923,7 +2985,7 @@ fn start_torrent_tracker_audit(
     let port = audit.port;
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(4);
     audit.status = if observation_seconds == 0 {
         format!("Running {} audit step(s)...", steps.len())
     } else {
@@ -2982,7 +3044,8 @@ fn poll_torrent_tracker_audit(audit: &mut TorrentTrackerAudit) {
             match run.receiver.try_recv() {
                 Ok(TrackerAuditWorkerEvent::Exchange(exchange)) => {
                     audit.exchanges.push(exchange);
-                    audit.status = format!("Completed {} audit step(s)", audit.exchanges.len());
+                    audit.status =
+                        format!("Completed {} audit step(s)", audit.exchanges.recorded());
                 }
                 Ok(TrackerAuditWorkerEvent::ObservationStarted(seconds)) => {
                     audit.status = format!(
@@ -3026,52 +3089,7 @@ fn execute_tracker_audit(
     request: AnnounceRequest,
     step_index: usize,
 ) -> TrackerAuditExchange {
-    let timestamp_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let tracker_host = validate_audit_target(tracker_url, allow_hosts)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "invalid target".into());
-    let mut exchange = TrackerAuditExchange {
-        timestamp_unix_ms,
-        step_index,
-        tracker_host,
-        info_hash_hex: hex_bytes(&request.info_hash),
-        peer_id: String::from_utf8_lossy(&request.peer_id).into_owned(),
-        port: request.port,
-        uploaded: request.uploaded,
-        downloaded: request.downloaded,
-        left: request.left,
-        event: request.event,
-        interval_seconds: None,
-        peers: Vec::new(),
-        error: None,
-    };
-    match announce_for_audit(tracker_url, &request, allow_hosts).and_then(|response| {
-        let peers = compact_ipv4_peers(&response.compact_peers)?
-            .into_iter()
-            .map(|peer| peer.to_string())
-            .collect();
-        Ok((response.interval_seconds, peers))
-    }) {
-        Ok((interval_seconds, peers)) => {
-            exchange.interval_seconds = Some(interval_seconds);
-            exchange.peers = peers;
-        }
-        Err(error) => exchange.error = Some(error),
-    }
-    exchange
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
+    TrackerAuditExchange::execute(tracker_url, allow_hosts, request, step_index)
 }
 
 fn validate_add_dialog(dialog: &AddTorrentDialog) -> Result<Vec<String>, String> {
@@ -3418,7 +3436,10 @@ mod tests {
 
     #[test]
     fn audit_log_info_hash_uses_lowercase_hex() {
-        assert_eq!(hex_bytes(&[0x00, 0xab, 0xff]), "00abff");
+        assert_eq!(
+            crate::live_history::hex_bytes(&[0x00, 0xab, 0xff]),
+            "00abff"
+        );
     }
 
     #[test]

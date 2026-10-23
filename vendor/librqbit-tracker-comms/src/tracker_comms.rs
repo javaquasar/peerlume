@@ -23,6 +23,57 @@ use url::Url;
 
 use crate::tracker_comms_http;
 use crate::tracker_comms_udp;
+
+/// Cap decoded HTTP bodies before bencode parsing or peer-list allocation.
+pub const MAX_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
+
+async fn bounded_response_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    if response.content_length().is_some_and(|n| n > MAX_TRACKER_RESPONSE_BYTES as u64) { anyhow::bail!("Tracker response exceeds the 1 MiB limit"); }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_TRACKER_RESPONSE_BYTES.saturating_sub(body.len()) { anyhow::bail!("Tracker response exceeds the 1 MiB limit"); }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod response_limit_tests {
+    use super::*;
+    use std::{io::{BufRead, BufReader, Write}, net::TcpListener};
+    #[test]
+    fn http_body_limit_covers_advertised_chunked_and_exact_size_responses() {
+        for (length, chunked, advertised, accepted) in [
+            (0, false, Some(MAX_TRACKER_RESPONSE_BYTES + 1), false),
+            (MAX_TRACKER_RESPONSE_BYTES + 1, false, None, false),
+            (MAX_TRACKER_RESPONSE_BYTES + 1, true, None, false),
+            (MAX_TRACKER_RESPONSE_BYTES, false, Some(MAX_TRACKER_RESPONSE_BYTES), true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/announce", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&stream);
+                loop { let mut line = String::new(); if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; } }
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n").unwrap();
+                if let Some(n) = advertised { write!(stream, "Content-Length: {n}\r\n").unwrap(); }
+                if chunked { write!(stream, "Transfer-Encoding: chunked\r\n").unwrap(); }
+                write!(stream, "\r\n").unwrap();
+                if chunked { let _ = write!(stream, "{length:x}\r\n"); }
+                let _ = stream.write_all(&vec![b'x'; length]);
+                if chunked { let _ = stream.write_all(b"\r\n0\r\n\r\n"); }
+            });
+            let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let response = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap().get(url).send().await.unwrap();
+                bounded_response_body(response).await
+            });
+            worker.join().unwrap();
+            assert_eq!(result.is_ok(), accepted, "length={length}, chunked={chunked}");
+            if let Ok(bytes) = result { assert_eq!(bytes.len(), MAX_TRACKER_RESPONSE_BYTES); }
+        }
+    }
+}
 use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::hash_id::Id20;
 
@@ -372,7 +423,15 @@ impl TrackerComms {
                 anyhow::bail!("tracker responded with {:?}", response.status());
             }
             log.record.outcome = "invalid_response".into();
-            let bytes = response.bytes().await?;
+            let bytes = match bounded_response_body(response).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log.record.outcome = "response_read_error".into();
+                    // Fixed wording: never propagate an HTTP error containing a credential URL.
+                    log.record.reply.failure = Some("Tracker response could not be read within the 1 MiB limit".into());
+                    return Err(error);
+                }
+            };
             if let Ok((error, _)) =
                 bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
             {

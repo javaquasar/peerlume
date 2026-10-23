@@ -11,6 +11,8 @@ pub mod engine;
 pub mod file_selection;
 pub mod identity;
 pub mod limits;
+#[cfg(any(feature = "gui", feature = "tui"))]
+mod live_history;
 pub mod magnet;
 pub mod metadata;
 pub mod metainfo;
