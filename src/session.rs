@@ -552,6 +552,9 @@ impl Drop for SessionRuntime {
 }
 
 #[cfg(test)]
+mod multi_peer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -234,6 +234,22 @@ separate `core_workflows` integration suite covers synthetic metainfo preview,
 selective piece planning, and file-backed SQLite resume state without requiring
 Docker.
 
+The `session::multi_peer_tests` suite runs the real transfer backend against two
+or three local peers, each advertising a disjoint set of multi-block pieces.
+Every peer withholds its first block until all peers have outstanding requests:
+serial peer downloads cannot pass this synchronization gate. Tests verify each
+peer's payload contribution, completion, exact output bytes, and every piece hash,
+in normal and no-progress reporting modes. These tests require no Docker or public
+tracker and run automatically in every CI test-matrix entry:
+
+```powershell
+cargo test --locked --all-features --lib session::multi_peer_tests
+```
+
+This proves concurrent peer transfers, not one operating-system thread per peer
+or a particular throughput improvement. The backend uses asynchronous tasks on a
+multi-threaded Tokio runtime.
+
 Desktop rows now show live values from the `librqbit` multi-peer transfer session.
 The internal protocol modules also contain tested HTTP and UDP announces, tracker
 tiers and retry state, peer handshake/messages and extension messages,
