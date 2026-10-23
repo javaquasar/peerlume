@@ -209,6 +209,20 @@ impl Controller {
         self.agent.as_mut()
     }
 
+    /// Trusted frontend preferences for subsequent agent adds. Sandbox roots remain
+    /// fixed for the lifetime of this configured service and cannot be changed by IPC.
+    pub fn set_agent_settings(
+        &mut self,
+        settings: &crate::settings::ClientSettings,
+    ) -> Result<(), wire::ErrorCode> {
+        if !settings.validate().is_empty() {
+            return Err(wire::ErrorCode::InvalidRequest);
+        }
+        let agent = self.agent.as_mut().ok_or(wire::ErrorCode::Disabled)?;
+        agent.client_settings = settings.clone();
+        Ok(())
+    }
+
     pub fn handle_request(&mut self, request: wire::Request) -> wire::Response {
         let Some(mut service) = self.agent.take() else {
             return wire::Response::error(wire::ErrorCode::Disabled);

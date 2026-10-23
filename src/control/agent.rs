@@ -29,6 +29,7 @@ pub struct AgentService {
     pub import_root: PathBuf,
     pub export_root: PathBuf,
     pub download_root: PathBuf,
+    pub(crate) client_settings: crate::settings::ClientSettings,
 }
 
 impl AgentService {
@@ -65,6 +66,7 @@ impl AgentService {
             import_root: directory.join("imports"),
             export_root: directory.join("exports"),
             download_root,
+            client_settings: Default::default(),
         })
     }
 
@@ -590,7 +592,7 @@ impl AgentService {
                 }
                 let meta = crate::metainfo::TorrentMetainfo::load(&path)
                     .map_err(|_| ErrorCode::InvalidRequest)?;
-                let settings = crate::settings::ClientSettings::default();
+                let settings = self.client_settings.clone();
                 let mut item = crate::torrent::TorrentItem {
                     runtime: Default::default(),
                     completion: crate::completion::CompletionStatus::Pending,
@@ -623,6 +625,9 @@ impl AgentService {
                 };
                 if *start {
                     item.state = crate::torrent::TorrentState::WaitingForEngine;
+                }
+                if !settings.download.select_all_files {
+                    item.files.select_all(false);
                 }
                 pending.operation.torrent_id = item.info_hashes.join(";");
                 self.store.save(&pending.operation)?;

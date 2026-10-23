@@ -1088,11 +1088,13 @@ impl TuiApp {
             }
         }
         self.status = "Preference changed; press s to validate and save".into();
+        let _ = self.control.set_agent_settings(&self.settings);
     }
 
     fn save_preferences(&mut self) {
         let issues = self.settings.validate();
         if issues.is_empty() {
+            let _ = self.control.set_agent_settings(&self.settings);
             self.settings.ui.last_preferences_tab = self.preferences_tab.index();
             self.status = match self.settings.save() {
                 Ok(()) => "Preferences saved; restart may be required".into(),
@@ -1636,6 +1638,7 @@ pub fn run() -> io::Result<()> {
     app.control
         .configure_agents(&directory, download_root)
         .map_err(|e| io::Error::other(format!("Agent initialization failed: {e:?}")))?;
+    let _ = app.control.set_agent_settings(&app.settings);
     let owner = Arc::new(std::sync::Mutex::new(app));
     let _host =
         crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;

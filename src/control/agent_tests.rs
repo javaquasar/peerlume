@@ -713,6 +713,31 @@ fn removal_without_persistence_cannot_claim_success_or_erase_the_model() {
     assert_eq!(control.torrents.len(), 1);
 }
 
+#[test]
+fn applied_client_defaults_are_validated_without_changing_granted_roots() {
+    let (root, mut control, _) = setup();
+    let mut settings = crate::settings::ClientSettings::default();
+    settings.connection.max_connections_per_torrent = 9;
+    settings.download.download_directory = "another-ui-directory".into();
+    control.set_agent_settings(&settings).unwrap();
+    assert_eq!(control.agent_access().unwrap().download_root, root.path());
+    assert_eq!(control.agent_access().unwrap().client_settings, settings);
+    settings.bittorrent.peer_id_prefix = "too-long-prefix".into();
+    assert_eq!(
+        control.set_agent_settings(&settings),
+        Err(ErrorCode::InvalidRequest)
+    );
+    assert_ne!(
+        control
+            .agent_access()
+            .unwrap()
+            .client_settings
+            .bittorrent
+            .peer_id_prefix,
+        "too-long-prefix"
+    );
+}
+
 #[cfg(feature = "tui")]
 #[test]
 fn tui_trusted_access_panel_defaults_readonly_and_is_not_a_log() {
@@ -860,6 +885,11 @@ fn live_preview_and_add_use_confined_paths_and_same_engine() {
         .controller
         .configure_agents(fixture.root.path(), fixture.root.path().into())
         .unwrap();
+    let mut settings = crate::settings::ClientSettings::default();
+    settings.bittorrent.peer_id_prefix = "-ZZ1234-".into();
+    settings.download.select_all_files = false;
+    settings.connection.max_connections_per_torrent = 7;
+    fixture.controller.set_agent_settings(&settings).unwrap();
     let agent = fixture.controller.agent_access().unwrap();
     agent.enabled = true;
     let token = agent
@@ -903,6 +933,16 @@ fn live_preview_and_add_use_confined_paths_and_same_engine() {
             == OperationState::Succeeded
     });
     assert_eq!(fixture.controller.torrents.len(), 2);
+    let added = &fixture.controller.torrents[1];
+    assert!(added.peer_id.starts_with("-ZZ1234-"));
+    assert!(!added.files.files()[0].selected);
+    assert!(matches!(
+        crate::client::add_torrent_command(added, &settings),
+        crate::session::SessionCommand::AddTorrent {
+            peer_limit: Some(7),
+            ..
+        }
+    ));
     assert_eq!(
         request(&mut fixture.controller, &token, method)
             .result

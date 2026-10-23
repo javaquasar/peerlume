@@ -99,6 +99,12 @@ Tool errors use `isError: true`. Stdout is JSON-RPC only. MCP cancellation or
 bridge exit does not stop downloads or cancel an already accepted operation.
 No shell, remote-listener, tracker-credential readout, or direct database tool exists.
 
+Agent adds inherit the application's applied client defaults (including file
+selection, client identity prefix and peer limit), rather than constructing an
+independent default configuration. The explicitly granted download root remains
+fixed for this service lifetime; changing preferences does not silently expand an
+agent's filesystem boundary.
+
 ## Commands, retries and ordering
 
 For a mutation, pass the discovered `instance_id`, the torrent's current

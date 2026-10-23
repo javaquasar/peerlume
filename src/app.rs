@@ -402,6 +402,7 @@ impl HostedGui {
             .map_err(|e| {
                 std::io::Error::other(format!("Agent control initialization failed: {e:?}"))
             })?;
+        let _ = app.control.set_agent_settings(&app.settings);
         let owner = Arc::new(std::sync::Mutex::new(app));
         let host =
             crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
@@ -2101,6 +2102,7 @@ impl PeerLumeApp {
         }
         let diff = self.engine.apply_settings(&self.settings_draft);
         self.settings = self.settings_draft.clone();
+        let _ = self.control.set_agent_settings(&self.settings);
         if persist {
             match self.settings.save() {
                 Ok(()) => {
