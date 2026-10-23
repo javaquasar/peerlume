@@ -240,7 +240,18 @@ Every peer withholds its first block until all peers have outstanding requests:
 serial peer downloads cannot pass this synchronization gate. Tests verify each
 peer's payload contribution, completion, exact output bytes, and every piece hash,
 in normal and no-progress reporting modes. These tests require no Docker or public
-tracker and run automatically in every CI test-matrix entry:
+tracker and run automatically in every CI test-matrix entry.
+
+The same suite also adds two different `.torrent` files to one `SessionRuntime`,
+with distinct content hashes, payloads, local trackers, peer sets, and output
+directories. One uses normal reporting and the other hides progress. A shared
+first-block gate and a second gate halfway through each peer's payload require
+all four connections across both torrents to make progress before any can finish.
+Downloading the torrents one after another cannot pass. Both torrents must report
+completion independently, and both output files and all piece hashes are checked.
+The first-block and midpoint gates also protect the single-torrent tests.
+Negative controls verify that an incomplete peer group cannot pass the first
+gate and one torrent alone cannot open the midpoint gate. Run the suite with:
 
 ```powershell
 cargo test --locked --all-features --lib session::multi_peer_tests
