@@ -5,6 +5,8 @@ pub mod blocklist;
 pub mod buffer_pool;
 pub mod client;
 pub mod completion;
+#[doc(hidden)]
+pub mod control;
 pub mod discovery;
 pub mod download_mode;
 pub mod engine;

@@ -10,9 +10,11 @@ protected with current-user DPAPI and restored for the matching user after resta
 The ordinary SQLite URL column, logs, errors, and status messages contain only a
 structurally redacted URL.
 
-This is a living plan with two independent tracks: the client milestones below and
-the [library publication track](#library-publication-track). A working application
-or green application CI does not by itself establish library release readiness.
+This is a living plan covering the client milestones, the
+[installed application agent control track](#installed-application-agent-control-track),
+and the deferred [library publication track](#library-publication-track).
+A working application or green application CI does not by itself establish library
+release readiness. Local agent control does not depend on publishing a library.
 Add new requirements as they emerge, and mark work complete only with linked
 implementation and verification evidence.
 
@@ -175,10 +177,260 @@ Done when one documented command runs the deterministic release suite.
 The tracker accounting threat model, anomaly matrix, false-positive controls, and
 acceptance criteria are specified in `tracker-audit-scenarios.md`.
 
+## Installed application agent control track
+
+Status: in progress; the AGENT 1 foundation and existing-torrent command gateway
+are implemented, but installed-agent
+access is not yet available. Decision recorded on 2026-10-23: implement agent
+control as an isolated internal module in this project. Do not publish the core as
+a library, create a standalone SDK, or require a crates.io release for this work.
+The library track remains a future roadmap, not a prerequisite or current delivery
+commitment. All six capabilities below remain in scope; read-only access is the
+first delivery slice, not the final feature set.
+
+The installed application must expose its existing session to authorized agents.
+Agents must not create a second transfer engine, independently edit SQLite, or
+compete with the UI for the session's single event receiver. GUI, TUI, CLI and MCP
+must use one controller and observe the same confirmed state.
+
+### Internal module boundary
+
+Use a provisional `src/control/` module, private to the application crate where
+possible. Keep controller/state ownership, wire contracts, operations, permissions,
+IPC and agent adapters behind a small internal facade. Split responsibilities into
+submodules as needed; this is not a commitment to the final filenames or a public
+Rust API. Existing transfer and persistence components remain behind the controller.
+
+GUI and TUI call that facade. CLI and MCP adapters translate external requests into
+the same commands; they do not contain separate download or persistence logic.
+Packaging an installed CLI or MCP bridge binary is allowed within this repository
+without extracting or publishing a library crate. Code extraction can be reconsidered
+later without making it part of the agent-control acceptance gates.
+
+### AGENT 1 Establish one authoritative controller
+
+- [x] Move authoritative torrent models and session-event reduction out of UI-owned
+  state into one controller around the existing session and persistence services.
+- [x] Give the controller one transfer session and one session-event consumer.
+- [ ] Route GUI, TUI and external commands through the same validation, application,
+  confirmation and persistence path.
+- [ ] Expose snapshots and bounded per-client subscriptions instead of allowing
+  multiple clients to consume the original session receiver.
+- [ ] Define revisions and ordering so simultaneous user and agent changes have
+  explicit conflict behavior rather than silently overwriting each other.
+- [ ] Coalesce telemetry for slow subscribers, expose event gaps, and permit
+  snapshot recovery. A stalled agent must not block the UI or grow memory without
+  bound; terminal operation results must remain queryable separately.
+
+Done when GUI and an attached control client see the same confirmed torrent state,
+only one engine owns each download, and disconnecting one observer does not steal
+events from or stall another observer.
+
+Implementation slice, 2026-10-23: the [controller](../src/control/mod.rs) owns the
+backend and torrent models for egui and ratatui. Each running frontend owns one
+controller; cross-process GUI/TUI attachment still requires the future IPC layer.
+Both frontends poll notices from their controller rather
+than consuming raw session events or applying the reducer themselves. The existing
+canonical reducer remains shared; observations project its results rather than
+implementing separate completion or file-selection accounting rules.
+
+The internal `ReadHandle` retains one latest compact observation, with independent
+reader cursors, monotonic revisions, explicit resynchronization, revision-pinned
+pagination (at most 128 torrents per page), and controller-unavailable reporting
+after shutdown. It has no event/history queue per observer and publishes nothing
+for unchanged observations. Confirmed engine observations exclude local mode drafts,
+restored-but-unconfirmed counters, tracker URLs, paths, names, peer addresses and
+free-form errors. This minimal projection is not yet the full AGENT 3 contract.
+Payload progress uses the canonical model's current local file selection; it is
+not an acknowledgement of a selection-change command. Network totals are separate.
+
+Verification: [controller tests](../src/control/tests.rs) cover concurrent/slow/dropped observers,
+pagination bounds and conflicts, JSON safety, integrity-check states, selected-file
+accounting, mode acknowledgements and a real isolated session continuing after one
+reader disconnects. The fixture uses local files with trackers and discovery off.
+
+Command gateway slice, 2026-10-23: [existing-torrent commands](../src/control/commands.rs)
+now route GUI and TUI pause/resume, recheck, reporting-mode, repair-policy,
+post-download verification and file-selection requests through shared validation
+and typed transport errors. A successful submission returns `AcceptedCommand`, not
+an applied setting, a completed operation or a verified download. Both UIs leave
+confirmed state unchanged while a request is queued. A mode draft may display
+Applying or a submission failure, but does not replace the saved active setting.
+
+Optional per-torrent `command_revision` preconditions reject stale submissions
+before enqueueing. Tokens advance on registration and accepted commands, not
+telemetry or commands for another torrent. Reconciled removal/re-registration gets
+a new token. These in-process tokens are distinct from observation revisions and
+do not provide restart-safe operation IDs, idempotency or result correlation.
+Callers must not reuse them across controller lifetimes. Legacy import/removal
+paths are not yet covered by this precondition contract.
+
+The engine now explicitly acknowledges successful file-selection and
+post-download-verification changes. The canonical reducer updates the model only
+after those acknowledgements. GUI and TUI share controller-side persistence for
+confirmed settings. Persistence requires a confirmed-settings marker and a real
+state store; errors retain the marker for retry rather than claiming success.
+Repair-enabled downloads retain required verification even if disabling it was
+requested. Changing selected files invalidates a previous Done confirmation until
+fresh engine progress arrives.
+
+Batch pause/resume uses the same validated path, reports partial acceptance and
+publishes one compact snapshot per batch. GUI file selection builds a request from
+viewport edits without mutating or cloning the full file model on each frame.
+Owner-side `poll_next` and `publish` also support in-project headless drivers;
+read observers still cannot consume the session stream.
+
+Verification: [command tests](../src/control/commands/tests.rs), frontend tests,
+file-selection tests and checked-transport tests cover all seven command kinds,
+alias normalization, conflicts, invalid metadata/indices, queue errors, bounded
+batch publication, confirmation-gated SQLite persistence and persistence failure.
+Property tests exercise arbitrary file selections. Local engine fixtures cover
+pause/resume, mode/repair/verification/file acknowledgements and rechecking corrupt
+data without inventing new network downloads. Frontend integration tests exercise
+both successful and rejected dispatch rather than only mock engine events.
+
+Remaining AGENT 1 work: imports, removal, lifecycle ownership and other local
+frontend preferences/audit persistence still use transitional crate-local access.
+Authorization, durable command/result correlation, idempotency and coordinated
+restart handling must be implemented before external mutations are enabled.
+Frontend polling still drives reduction;
+an independently driven controller lifecycle is not implemented. The read handles
+are in-process polling observers, not IPC subscriptions or a durable operation
+history. There is no Named Pipe listener, external CLI/MCP access, authorization
+service or library publication in these slices. These unchecked gates remain open.
+
+### AGENT 2 Add local IPC and installed client adapters
+
+- [ ] Start with a Windows Named Pipe endpoint restricted to the intended OS user.
+  Define equivalent local transports for additional supported platforms separately.
+- [ ] Add instance ownership, endpoint discovery and a versioned handshake. Detect
+  stale discovery records and refuse to attach to an incompatible instance.
+- [ ] Make external control explicitly enabled by the user; do not expose an
+  unauthenticated network listener by default.
+- [ ] Add a scriptable CLI with structured JSON output and documented exit codes.
+- [ ] Add a thin MCP adapter with discoverable tool schemas. A stdio bridge may
+  attach to IPC but must not create another SessionRuntime or own the download
+  lifecycle. Keep protocol output on stdout and diagnostic output on stderr.
+- [ ] Return an explicit not-running result when no instance exists. Starting the
+  application must be a separate, authorized action rather than a side effect of
+  a read-only query.
+- [ ] Keep background/headless operation optional: attaching to an already running
+  GUI is sufficient for the first slice; a system service is not required.
+
+Done when installed CLI and MCP adapters attach to the same running application,
+without repository source paths, a second engine, or direct database mutation.
+
+### AGENT 3 Define a machine-readable control contract
+
+- [ ] Version the protocol and publish capability discovery, request/response
+  schemas, typed errors, stable torrent IDs, units and timestamp conventions.
+- [ ] Support listing torrents and reading status, file selection, mode application,
+  verification, recovery and operation results.
+- [ ] Distinguish tracker-returned peers from currently connected peers, actual
+  counters from sent counters, and downloaded payload from verified completion.
+- [ ] Support add/preview, pause, resume, recheck, mode changes, repair settings and
+  journal export through the same controller used by the UI.
+- [ ] Keep data deletion separate from removing a torrent from the application.
+  Do not expose arbitrary shell commands as an automation shortcut.
+- [ ] Return acceptance separately from application: enqueueing a command must not
+  be represented as successful completion or an active reporting policy.
+- [ ] Bound request sizes, result sizes, subscriptions and pagination. Let clients
+  filter journals and peer lists without receiving an entire multi-hour history.
+- [ ] Expose only supported capabilities; do not advertise unimplemented settings
+  or invent successful values for unavailable data.
+
+Done when a client can complete the documented workflow using structured values,
+without parsing UI labels, scraping screenshots, or inferring success from a timeout.
+
+### AGENT 4 Make long-running operations and retries reliable
+
+- [ ] Return an operation ID for rechecks, recovery and other asynchronous work,
+  with explicit queued, running, succeeded, failed and cancelled outcomes.
+- [ ] Provide progress, result lookup, deadlines and cancellation semantics. State
+  whether cancelling an observation also cancels the underlying operation.
+- [ ] Add idempotency keys bound to caller identity, command and normalized
+  arguments. Reject reuse with different arguments rather than repeating writes.
+- [ ] Use expected revisions or equivalent conflict checks for competing mutations.
+- [ ] Persist the operation records needed for reconnect/restart behavior, with
+  bounded retention and explicit semantics for expired keys and interrupted work.
+- [ ] Do not automatically replay destructive or externally visible commands when
+  their previous result is unknown. Return a reconciliation-required outcome.
+- [ ] Keep the application's transfer lifecycle independent of a bridge process:
+  agent exit, pipe loss or MCP disconnect must not stop ongoing downloads.
+
+Done when connection loss and retries cannot silently duplicate mutations, and a
+client can distinguish completion, failure, interruption and an unknown result.
+
+### AGENT 5 Enforce permissions and human approvals
+
+- [ ] Default attached agents to read-only access and require explicit grants for
+  managing downloads, changing test/reporting policies, exporting data or deleting
+  payload files. Treat experimental audit traffic as a separately granted capability.
+- [ ] Authenticate local clients and enforce authorization in the controller, not
+  solely in adapter descriptions or MCP tool annotations.
+- [ ] Require a real user approval for destructive actions through a trusted UI or
+  equivalent human-controlled channel. An agent-supplied `confirmed=true` is not
+  consent; bind any approval to the exact operation and reject altered requests.
+- [ ] Restrict import, download and export paths, revalidate filesystem boundaries,
+  and apply input/resource limits to every external entry point.
+- [ ] Redact passkeys, tokens and secret Tracker URL fields from agent responses,
+  operation errors and logs. Use secret references rather than returning credentials.
+- [ ] Treat torrent names, filenames and tracker messages as untrusted data, not
+  instructions or authorization to invoke another tool.
+- [ ] Record agent mutations with authenticated client identity, operation/request
+  IDs, authorization decision and confirmed outcome, without persisting secrets.
+- [ ] Make granted access visible and revocable in the application. Do not install
+  agent-host configuration or enable remote access without user approval.
+
+Done when denied actions have no side effects, destructive actions cannot bypass
+human approval, and privacy/resource limits hold for hostile local requests and
+untrusted tracker metadata as well as ordinary interactive use.
+
+### AGENT 6 Package and verify the installed workflow
+
+- [ ] Distribute adapters with the application and document executable discovery,
+  connection setup, protocol compatibility and access revocation.
+- [ ] Test an installed or packaged build in an isolated user profile, not only a
+  development checkout with hardcoded repository paths.
+- [ ] Test simultaneous GUI and agent control, conflicting requests, retries,
+  slow/disconnected clients, application restart and stale instance metadata.
+- [ ] Test IPC authorization, denied mutations, approval binding, secret redaction,
+  malformed messages, oversized responses and path-boundary attacks.
+- [ ] Test bounded subscriptions and paged long-running diagnostics without memory
+  growth caused by an agent that stops reading.
+- [ ] Verify CLI JSON/exit-code contracts and MCP discovery/schema behavior using
+  local deterministic fixtures, without contacting production trackers.
+- [ ] Add an end-to-end acceptance scenario: connect an agent to a running app,
+  read state, perform an authorized operation, observe its confirmed result,
+  disconnect the agent, and verify that downloads continue and the UI agrees.
+
+Done when the installed workflow passes without a second engine, direct SQLite
+editing, GUI click automation, unbounded output, or library publication.
+
+### Agent control delivery order
+
+1. AGENT 1: establish controller ownership, shared state and bounded observation.
+2. AGENT 2 and AGENT 3: add local IPC, structured read-only CLI and MCP access.
+3. AGENT 4 and AGENT 5: establish retry/operation semantics and authorization before
+   enabling mutations; start with explicitly granted pause/resume operations.
+4. Extend the same contracts to adding torrents, verification, recovery, reporting
+   policies and export; keep destructive actions behind bound human approvals.
+5. AGENT 6: verify installation, concurrent use, reconnection and the full workflow.
+
+Keep AGENT identifiers stable and link completed checkboxes to implementation and
+test evidence. Add further requirements without replacing this internal-module
+decision with an implied library-publication requirement.
+
 ## Library publication track
 
-Status: planning. Initial readiness review: 2026-10-23, application commit
-`63556d9`. The first target is an experimental library alpha, not a stable SDK.
+Status: deferred. Current decision, 2026-10-23: retain the core inside this project
+and implement agent control as an isolated internal module first. No core library
+publication is currently planned for execution. The milestones below remain a
+future roadmap and do not gate installed-application agent control.
+
+Initial readiness review: 2026-10-23, application commit
+`63556d9`. If publication is resumed, the first target would be an experimental
+library alpha, not a stable SDK.
 No release date or final crate layout has been committed.
 
 Publish PeerLume as an application-oriented core built on librqbit: torrent

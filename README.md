@@ -312,9 +312,23 @@ single-piece transfer. SQLite in WAL mode persists torrent, file, tracker, queue
 statistics, and transactional verified-piece checkpoints.
 
 The detailed milestones and release gates are in [Release plan](docs/release-plan.md).
+The [Installed application agent control track](docs/release-plan.md#installed-application-agent-control-track)
+covers all six automation capabilities as an isolated internal module: shared
+controller, local IPC and CLI/MCP adapters, machine-readable contracts, reliable
+operations, permissions and approvals, and installed-workflow verification.
+This work does not require publishing the core as a library.
+The first foundation is implemented in `src/control/`: both frontends delegate
+session-event reduction to one controller, with bounded, revisioned in-process
+read observations. Installed-agent IPC, CLI/MCP and external mutations are not yet
+available; the roadmap tracks the remaining command/lifecycle and security work.
+Existing-torrent actions now share a typed controller command gateway with
+optional revision checks. Both UIs distinguish queue acceptance from engine
+confirmation; file selection and verification settings are saved only after
+acknowledgement. Imports/removal, background ownership and external authorization
+remain separate roadmap items.
 The living [Library publication track](docs/release-plan.md#library-publication-track)
-records the headless-core packaging blockers, API and embedding work, open decisions,
-and acceptance gates for an experimental library alpha.
+is deferred and retained for future use; it records headless-core packaging blockers,
+API and embedding work, open decisions and acceptance gates for a possible alpha.
 Defensive tracker-accounting tests and anomaly scenarios are documented in
 `docs/tracker-audit-scenarios.md`.
 

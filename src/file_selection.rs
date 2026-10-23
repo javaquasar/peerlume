@@ -72,6 +72,36 @@ impl FileSelectionModel {
         &self.files
     }
 
+    pub fn rows(&self) -> &[FileTreeRow] {
+        &self.rows
+    }
+
+    /// Build a command only when the UI edited a selection. Never change the
+    /// confirmed model or clone its file tree during an ordinary render frame.
+    pub fn selection_after_edit(
+        &self,
+        all: Option<bool>,
+        edits: &BTreeMap<usize, bool>,
+    ) -> Option<Vec<usize>> {
+        if all.is_none() && edits.is_empty() {
+            return None;
+        }
+        Some(
+            self.files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, file)| {
+                    edits
+                        .get(&index)
+                        .copied()
+                        .or(all)
+                        .unwrap_or(file.selected)
+                        .then_some(index)
+                })
+                .collect(),
+        )
+    }
+
     pub fn rows_and_files_mut(&mut self) -> (&[FileTreeRow], &mut [TorrentFile]) {
         (&self.rows, &mut self.files)
     }
@@ -226,6 +256,33 @@ fn build_tree_rows(files: &[TorrentFile]) -> Vec<FileTreeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_edits_build_commands_without_mutating_or_rebuilding_file_models() {
+        let model = model();
+        let rows = model.rows().as_ptr();
+        let files = model.files().as_ptr();
+        assert_eq!(model.selection_after_edit(None, &BTreeMap::new()), None);
+        assert_eq!(
+            model.selection_after_edit(Some(false), &BTreeMap::new()),
+            Some(vec![])
+        );
+        assert_eq!(
+            model.selection_after_edit(Some(true), &BTreeMap::new()),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            model.selection_after_edit(None, &BTreeMap::from([(1, false)])),
+            Some(vec![0, 2])
+        );
+        assert_eq!(
+            model.selection_after_edit(Some(false), &BTreeMap::from([(2, true)])),
+            Some(vec![2])
+        );
+        assert_eq!(model.selected_count(), 3);
+        assert_eq!(model.rows().as_ptr(), rows);
+        assert_eq!(model.files().as_ptr(), files);
+    }
 
     fn model() -> FileSelectionModel {
         FileSelectionModel::from_files([

@@ -31,9 +31,9 @@ use ratatui::{
 
 use crate::{
     client::{
-        ClientBackend, SessionNotice, add_torrent_command, apply_session_event,
-        torrent_from_record, torrent_to_record,
+        ClientBackend, SessionNotice, add_torrent_command, torrent_from_record, torrent_to_record,
     },
+    control::{COMMAND_ACCEPTED, Controller, TorrentCommand},
     download_mode::DownloadMode,
     file_selection::FileSelectionModel,
     magnet::MagnetLink,
@@ -74,8 +74,7 @@ struct InputPrompt {
 pub struct TuiApp {
     journal_page: usize,
     settings: ClientSettings,
-    backend: ClientBackend,
-    torrents: Vec<TorrentItem>,
+    control: Controller,
     tracker_audits: HashMap<String, StoredTrackerAuditProfile>,
     page: MainPage,
     details_tab: TorrentDetailsTab,
@@ -129,8 +128,7 @@ impl TuiApp {
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
         Self {
             settings,
-            backend,
-            torrents,
+            control: Controller::new(backend, torrents),
             tracker_audits,
             page: MainPage::Torrents,
             details_tab: TorrentDetailsTab::Files,
@@ -154,15 +152,12 @@ impl TuiApp {
     }
 
     fn poll(&mut self) {
-        while let Some(event) = self.backend.try_recv() {
-            match apply_session_event(&mut self.torrents, event) {
+        while let Some(notice) = self.control.poll_next() {
+            match notice {
                 SessionNotice::SettingsApplied { id } => {
-                    if let Some(torrent) =
-                        self.torrents.iter().find(|t| t.info_hashes.join(";") == id)
-                        && let Err(error) = self.backend.save_torrent(&torrent_to_record(
-                            torrent,
-                            self.tracker_audits.get(&id).cloned(),
-                        ))
+                    if let Err(error) = self
+                        .control
+                        .persist_confirmed_settings(&id, self.tracker_audits.get(&id).cloned())
                     {
                         self.status = error;
                     }
@@ -177,6 +172,7 @@ impl TuiApp {
                 SessionNotice::None => {}
             }
         }
+        self.control.publish();
         let audit_message = self
             .audit_result
             .as_ref()
@@ -200,8 +196,9 @@ impl TuiApp {
     fn clamp_selection(&mut self) {
         self.selected_torrent = self
             .selected_torrent
-            .min(self.torrents.len().saturating_sub(1));
+            .min(self.control.torrents.len().saturating_sub(1));
         let file_count = self
+            .control
             .torrents
             .get(self.selected_torrent)
             .map_or(0, |torrent| torrent.files.files().len());
@@ -264,15 +261,12 @@ impl TuiApp {
                 self.open_prompt(PromptKind::ExistingMode, "Mode: 1 normal, 2 no progress, 3 upload x1.5, 4 hide downloaded, 5 freeze [bytes]", "1".into());
             }
             KeyCode::Char('H') if self.page == MainPage::Torrents => {
-                if let Some(torrent) = self.torrents.get(self.selected_torrent) {
+                if let Some(torrent) = self.control.torrents.get(self.selected_torrent) {
                     let mut policy = torrent.overrides.repair_policy;
                     policy.enabled = !policy.enabled;
-                    if let Err(error) = self.backend.send(SessionCommand::SetRepairPolicy {
-                        id: torrent.info_hashes.join(";"),
-                        policy,
-                    }) {
-                        self.status = error;
-                    }
+                    self.status = self
+                        .submit_selected(TorrentCommand::SetRepairPolicy(policy))
+                        .unwrap_or_else(|error| error);
                 }
             }
             KeyCode::Char('L') if self.page == MainPage::Torrents => {
@@ -288,28 +282,17 @@ impl TuiApp {
             KeyCode::Char('R') if self.page == MainPage::Torrents => self.resume_all(),
             KeyCode::Char('d') if self.page == MainPage::Torrents => self.remove_selected(),
             KeyCode::Char('v') if self.page == MainPage::Torrents => {
-                if let Some(torrent) = self.selected() {
-                    self.status = match self.backend.send(SessionCommand::Recheck {
-                        id: torrent.info_hashes.join(";"),
-                    }) {
-                        Ok(()) => {
-                            "Rechecking files (existing payload is not a new download)".into()
-                        }
-                        Err(e) => e,
-                    };
-                }
+                self.status = self
+                    .submit_selected(TorrentCommand::Recheck)
+                    .unwrap_or_else(|error| error);
             }
             KeyCode::Char('V') if self.page == MainPage::Torrents => {
-                if let Some(torrent) = self.selected_mut() {
-                    torrent.overrides.verify_after_download =
-                        torrent.overrides.repair_policy.enabled
-                            || !torrent.overrides.verify_after_download;
-                    let command = SessionCommand::SetVerifyAfterDownload {
-                        id: torrent.info_hashes.join(";"),
-                        enabled: torrent.overrides.verify_after_download,
-                    };
-                    let _ = self.backend.send(command);
-                    self.persist_selected();
+                if let Some(torrent) = self.selected() {
+                    let enabled = torrent.overrides.repair_policy.enabled
+                        || !torrent.overrides.verify_after_download;
+                    self.status = self
+                        .submit_selected(TorrentCommand::SetVerifyAfterDownload(enabled))
+                        .unwrap_or_else(|error| error);
                 }
             }
             KeyCode::Char('e') if self.details_tab == TorrentDetailsTab::Log => {
@@ -458,6 +441,7 @@ impl TuiApp {
             PromptKind::ExistingMode => self.change_existing_mode(&prompt.value),
             PromptKind::RepairLimit => (|| {
                 let torrent = self
+                    .control
                     .torrents
                     .get(self.selected_torrent)
                     .ok_or("No selected torrent")?;
@@ -468,11 +452,7 @@ impl TuiApp {
                     .parse()
                     .map_err(|_| "Enter a number from 1 to 10")?;
                 policy.validate()?;
-                self.backend.send(SessionCommand::SetRepairPolicy {
-                    id: torrent.info_hashes.join(";"),
-                    policy,
-                })?;
-                Ok("Repair policy submitted; awaiting engine confirmation".into())
+                self.submit_selected(TorrentCommand::SetRepairPolicy(policy))
             })(),
             PromptKind::TorrentPath => self.prepare_torrent_add(PathBuf::from(prompt.value)),
             PromptKind::DownloadMode => self.confirm_torrent_mode(prompt.value.trim()),
@@ -527,69 +507,66 @@ impl TuiApp {
                 move_index(self.selected_file, torrent.files.files().len(), direction);
             return;
         }
-        self.selected_torrent = move_index(self.selected_torrent, self.torrents.len(), direction);
+        self.selected_torrent = move_index(
+            self.selected_torrent,
+            self.control.torrents.len(),
+            direction,
+        );
         self.selected_file = 0;
         self.show_tracker_identity = false;
     }
 
     fn selected(&self) -> Option<&TorrentItem> {
-        self.torrents.get(self.selected_torrent)
+        self.control.torrents.get(self.selected_torrent)
     }
 
     fn selected_mut(&mut self) -> Option<&mut TorrentItem> {
-        self.torrents.get_mut(self.selected_torrent)
+        self.control.torrents.get_mut(self.selected_torrent)
+    }
+
+    fn submit_selected(&mut self, command: TorrentCommand) -> Result<String, String> {
+        let id = self
+            .selected()
+            .ok_or("No selected torrent")?
+            .info_hashes
+            .join(";");
+        self.control
+            .submit(&id, command, None)
+            .map_err(|error| error.to_string())?;
+        Ok(COMMAND_ACCEPTED.into())
     }
 
     fn pause_selected(&mut self) {
-        let Some(torrent) = self.selected_mut() else {
-            return;
-        };
-        torrent.state = TorrentState::Paused;
-        torrent.download_rate = 0;
-        torrent.upload_rate = 0;
-        let id = torrent.info_hashes.join(";");
-        let _ = self.backend.send(SessionCommand::Pause { id });
+        self.status = self
+            .submit_selected(TorrentCommand::Pause)
+            .unwrap_or_else(|error| error);
     }
 
     fn resume_selected(&mut self) {
-        let Some(torrent) = self.selected_mut() else {
-            return;
-        };
-        torrent.state = TorrentState::WaitingForEngine;
-        let id = torrent.info_hashes.join(";");
-        let _ = self.backend.send(SessionCommand::Resume { id });
+        self.status = self
+            .submit_selected(TorrentCommand::Resume)
+            .unwrap_or_else(|error| error);
     }
 
     fn pause_all(&mut self) {
-        for torrent in &mut self.torrents {
-            torrent.state = TorrentState::Paused;
-            torrent.download_rate = 0;
-            torrent.upload_rate = 0;
-            let _ = self.backend.send(SessionCommand::Pause {
-                id: torrent.info_hashes.join(";"),
-            });
-        }
-        self.status = "All torrents paused".into();
+        self.status = self.control.submit_batch(false);
     }
 
     fn resume_all(&mut self) {
-        for torrent in &mut self.torrents {
-            torrent.state = TorrentState::WaitingForEngine;
-            let _ = self.backend.send(SessionCommand::Resume {
-                id: torrent.info_hashes.join(";"),
-            });
-        }
-        self.status = "All torrents resumed".into();
+        self.status = self.control.submit_batch(true);
     }
 
     fn remove_selected(&mut self) {
-        if self.torrents.is_empty() {
+        if self.control.torrents.is_empty() {
             return;
         }
-        let torrent = self.torrents.remove(self.selected_torrent);
+        let torrent = self.control.torrents.remove(self.selected_torrent);
         let id = torrent.info_hashes.join(";");
-        let _ = self.backend.send(SessionCommand::Remove { id: id.clone() });
-        let _ = self.backend.remove_torrent(&id);
+        let _ = self
+            .control
+            .backend
+            .send(SessionCommand::Remove { id: id.clone() });
+        let _ = self.control.backend.remove_torrent(&id);
         self.tracker_audits.remove(&id);
         self.status = format!("Removed {}; data kept", torrent.name);
         self.clamp_selection();
@@ -597,16 +574,29 @@ impl TuiApp {
 
     fn toggle_selected_file(&mut self) {
         let index = self.selected_file;
-        let Some(torrent) = self.selected_mut() else {
+        let Some(torrent) = self.selected() else {
             return;
         };
-        let Some(file) = torrent.files.files().get(index) else {
+        let Some(_) = torrent.files.files().get(index) else {
             return;
         };
-        torrent.files.set_selected(index, !file.selected);
-        let command = crate::client::file_selection_command(torrent);
-        let _ = self.backend.send(command);
-        self.persist_selected();
+        let indices = torrent
+            .files
+            .files()
+            .iter()
+            .enumerate()
+            .filter_map(|(file_index, file)| {
+                (if file_index == index {
+                    !file.selected
+                } else {
+                    file.selected
+                })
+                .then_some(file_index)
+            })
+            .collect();
+        self.status = self
+            .submit_selected(TorrentCommand::SetFiles(indices))
+            .unwrap_or_else(|error| error);
     }
 
     fn persist_selected(&mut self) {
@@ -616,7 +606,7 @@ impl TuiApp {
         let id = torrent.info_hashes.join(";");
         let audit = self.tracker_audits.get(&id).cloned();
         let record = torrent_to_record(torrent, audit);
-        if let Err(error) = self.backend.save_torrent(&record) {
+        if let Err(error) = self.control.backend.save_torrent(&record) {
             self.status = format!("Could not save torrent: {error}");
         }
     }
@@ -632,8 +622,9 @@ impl TuiApp {
             .get(index.wrapping_sub(1))
             .ok_or("Enter a mode number from 1 to 5")?;
         let torrent = self
+            .control
             .torrents
-            .get_mut(self.selected_torrent)
+            .get(self.selected_torrent)
             .ok_or("No selected torrent")?;
         let freeze_after_bytes = match parts.next() {
             Some(value) => value
@@ -648,12 +639,7 @@ impl TuiApp {
             mode,
             freeze_after_bytes,
         };
-        let command = crate::client::mode_change_command(torrent, config)?;
-        if let Err(error) = self.backend.send(command) {
-            crate::client::mode_submission_failed(torrent, config, error.clone());
-            return Err(error);
-        }
-        Ok("Mode submitted; awaiting engine confirmation".into())
+        self.submit_selected(TorrentCommand::SetMode(config))
     }
 
     fn prepare_torrent_add(&mut self, path: PathBuf) -> Result<String, String> {
@@ -739,6 +725,7 @@ impl TuiApp {
             )
         };
         let journal = self
+            .control
             .backend
             .journal()
             .ok_or("Transfer session is unavailable")?;
@@ -817,6 +804,7 @@ impl TuiApp {
         };
         let id = torrent.info_hashes.join(";");
         if self
+            .control
             .torrents
             .iter()
             .any(|existing| existing.info_hashes.join(";") == id)
@@ -824,14 +812,16 @@ impl TuiApp {
             return Err("Torrent is already added".into());
         }
         let audit = default_audit(total_size, self.settings.connection.listen_port);
-        self.backend
+        self.control
+            .backend
             .save_torrent(&torrent_to_record(&torrent, Some(audit.clone())))?;
-        self.backend
+        self.control
+            .backend
             .send(add_torrent_command(&torrent, &self.settings))?;
         let name = torrent.name.clone();
         self.tracker_audits.insert(id, audit);
-        self.torrents.push(torrent);
-        self.selected_torrent = self.torrents.len() - 1;
+        self.control.torrents.push(torrent);
+        self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
     }
 
@@ -860,15 +850,16 @@ impl TuiApp {
             overrides: TorrentOverrides::default(),
         };
         let id = torrent.info_hashes.join(";");
-        self.backend
+        self.control
+            .backend
             .save_torrent(&torrent_to_record(&torrent, None))?;
         let mut command = add_torrent_command(&torrent, &self.settings);
         if let SessionCommand::AddTorrent { id: command_id, .. } = &mut command {
             *command_id = id;
         }
-        self.backend.send(command)?;
-        self.torrents.push(torrent);
-        self.selected_torrent = self.torrents.len() - 1;
+        self.control.backend.send(command)?;
+        self.control.torrents.push(torrent);
+        self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
     }
 
@@ -1065,7 +1056,7 @@ impl TuiApp {
         )?;
         let torrent_id = torrent.info_hashes.join(";");
         let record = torrent_to_record(torrent, Some(profile.clone()));
-        self.backend.save_torrent(&record)?;
+        self.control.backend.save_torrent(&record)?;
         self.tracker_audits.insert(torrent_id, profile);
         Ok(format!(
             "Applied tracker profile '{id}'; A runs the saved scenario"
@@ -1224,7 +1215,7 @@ impl TuiApp {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
             .split(area);
-        let rows = self.torrents.iter().map(|torrent| {
+        let rows = self.control.torrents.iter().map(|torrent| {
             let progress_style = if torrent.completed_successfully() {
                 Style::default().fg(Color::Black).bg(Color::Green)
             } else if torrent.state == TorrentState::Checking {
@@ -1257,7 +1248,7 @@ impl TuiApp {
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
         let mut state = ratatui::widgets::TableState::default();
-        if !self.torrents.is_empty() {
+        if !self.control.torrents.is_empty() {
             state.select(Some(self.selected_torrent));
         }
         frame.render_stateful_widget(table, columns[0], &mut state);
@@ -1280,7 +1271,7 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
-        let Some(torrent) = self.torrents.get(self.selected_torrent) else {
+        let Some(torrent) = self.control.torrents.get(self.selected_torrent) else {
             frame.render_widget(
                 Paragraph::new("No torrents. Press a to add a .torrent or m for a magnet.")
                     .block(Block::default().borders(Borders::ALL)),
@@ -1290,7 +1281,7 @@ impl TuiApp {
         };
         match self.details_tab {
             TorrentDetailsTab::Status => {
-                let last = self.backend.journal().and_then(|j| {
+                let last = self.control.backend.journal().and_then(|j| {
                     torrent
                         .info_hashes
                         .iter()
@@ -1548,7 +1539,7 @@ impl TuiApp {
             }
             TorrentDetailsTab::Log => {
                 let mut lines = Vec::new();
-                if let Some(journal) = self.backend.journal() {
+                if let Some(journal) = self.control.backend.journal() {
                     if let Some(path) = journal.path() {
                         lines.push(Line::from(format!("JSONL: {}", path.display())));
                     }
@@ -1799,6 +1790,79 @@ mod tests {
 
     use super::*;
 
+    fn wait_for_tui(app: &mut TuiApp, predicate: impl Fn(&TuiApp) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll();
+            if predicate(app) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TUI did not confirm the command: {}",
+                app.status
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn live_tui_pause_resume_and_files_use_engine_confirmations() {
+        let crate::control::test_support::LiveFixture {
+            controller,
+            root: _root,
+            ..
+        } = crate::control::test_support::LiveFixture::new();
+        let mut app = TuiApp::from_parts(
+            ClientSettings::default(),
+            ClientBackend::offline(),
+            vec![],
+            HashMap::new(),
+        );
+        app.control = controller;
+        app.resume_selected();
+        assert_eq!(app.status, COMMAND_ACCEPTED);
+        assert_eq!(app.control.torrents[0].state, TorrentState::Paused);
+        wait_for_tui(&mut app, |app| {
+            app.control.torrents[0].state == TorrentState::Seeding
+        });
+        app.pause_selected();
+        assert_eq!(app.control.torrents[0].state, TorrentState::Seeding);
+        wait_for_tui(&mut app, |app| {
+            app.control.torrents[0].state == TorrentState::Paused
+        });
+        app.toggle_selected_file();
+        assert!(app.control.torrents[0].files.files()[0].selected);
+        wait_for_tui(&mut app, |app| {
+            !app.control.torrents[0].files.files()[0].selected
+        });
+        assert!(!app.control.backend.load_torrents().unwrap()[0].files[0].selected);
+    }
+
+    #[test]
+    fn live_tui_verification_toggle_persists_the_engine_acknowledgement() {
+        let crate::control::test_support::LiveFixture {
+            controller,
+            root: _root,
+            ..
+        } = crate::control::test_support::LiveFixture::new();
+        let mut app = TuiApp::from_parts(
+            ClientSettings::default(),
+            ClientBackend::offline(),
+            vec![],
+            HashMap::new(),
+        );
+        app.control = controller;
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
+        assert_eq!(app.status, COMMAND_ACCEPTED);
+        assert!(!app.control.torrents[0].overrides.verify_after_download);
+        assert!(!app.control.backend.load_torrents().unwrap()[0].verify_after_download);
+        wait_for_tui(&mut app, |app| {
+            app.control.torrents[0].overrides.verify_after_download
+        });
+        assert!(app.control.backend.load_torrents().unwrap()[0].verify_after_download);
+    }
+
     #[test]
     fn journal_formats_only_the_viewport_of_a_large_peer_reply() {
         let journal = crate::announce_journal::AnnounceJournal::memory();
@@ -1830,11 +1894,11 @@ mod tests {
         let mut app = app();
         assert!(app.change_existing_mode("2").is_err());
         assert_eq!(
-            app.torrents[0].overrides.download_mode,
+            app.control.torrents[0].overrides.download_mode,
             DownloadMode::Normal
         );
         assert!(matches!(
-            app.torrents[0].runtime.mode,
+            app.control.torrents[0].runtime.mode,
             crate::runtime_status::ModeApplication::Failed { active: None, .. }
         ));
         assert!(app.change_existing_mode("5 0").is_err());
@@ -1846,7 +1910,7 @@ mod tests {
     fn tui_status_renders_the_shared_model_and_scrolls_without_changing_torrent() {
         let mut app = app();
         app.details_tab = TorrentDetailsTab::Status;
-        let expected = crate::runtime_status::status_card(&app.torrents[0], None);
+        let expected = crate::runtime_status::status_card(&app.control.torrents[0], None);
         let mut terminal = Terminal::new(TestBackend::new(240, 70)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
@@ -1891,9 +1955,9 @@ mod tests {
                 "Verification failed",
             ),
         ] {
-            app.torrents[0].state = state;
-            app.torrents[0].completion = completion;
-            app.torrents[0].downloaded_bytes = app.torrents[0].selected_size();
+            app.control.torrents[0].state = state;
+            app.control.torrents[0].completion = completion;
+            app.control.torrents[0].downloaded_bytes = app.control.torrents[0].selected_size();
             terminal.draw(|frame| app.render(frame)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -1913,13 +1977,14 @@ mod tests {
     }
 
     #[test]
-    fn verification_toggle_updates_the_shared_torrent_setting() {
+    fn offline_verification_toggle_does_not_change_confirmed_settings() {
         let mut app = app();
-        assert!(!app.torrents[0].overrides.verify_after_download);
+        assert!(!app.control.torrents[0].overrides.verify_after_download);
         app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::NONE));
-        assert!(app.torrents[0].overrides.verify_after_download);
-        let record = torrent_to_record(&app.torrents[0], None);
-        assert!(record.verify_after_download);
+        assert!(!app.control.torrents[0].overrides.verify_after_download);
+        assert!(app.status.contains("unavailable"));
+        let record = torrent_to_record(&app.control.torrents[0], None);
+        assert!(!record.verify_after_download);
     }
 
     #[test]
@@ -1970,7 +2035,7 @@ mod tests {
     fn tracker_account_is_visible_in_info_and_trackers_but_the_key_requires_f2() {
         let mut app = app();
         app.settings.privacy.redact_tracker_credentials = true;
-        app.torrents[0].trackers = vec!["https://tracker.test/ann?uk=fixture-key".into()];
+        app.control.torrents[0].trackers = vec!["https://tracker.test/ann?uk=fixture-key".into()];
         let mut terminal = Terminal::new(TestBackend::new(180, 50)).unwrap();
         for tab in [TorrentDetailsTab::Info, TorrentDetailsTab::Trackers] {
             app.details_tab = tab;
@@ -2050,12 +2115,12 @@ mod tests {
         let mut app = app();
         app.behavior_catalog =
             BehaviorCatalog::from_toml(include_str!("../config/tracker-behaviors.example.toml"));
-        let original_trackers = app.torrents[0].trackers.clone();
+        let original_trackers = app.control.torrents[0].trackers.clone();
         app.apply_behavior_profile("periodic-test").unwrap();
-        let id = app.torrents[0].info_hashes.join(";");
+        let id = app.control.torrents[0].info_hashes.join(";");
         assert_eq!(app.tracker_audits[&id].steps.len(), 4);
         assert_eq!(app.tracker_audits[&id].steps[0].left, 1024);
-        assert_eq!(app.torrents[0].trackers, original_trackers);
+        assert_eq!(app.control.torrents[0].trackers, original_trackers);
         let previous = app.tracker_audits[&id].clone();
         assert!(app.apply_behavior_profile("typo").is_err());
         assert_eq!(app.tracker_audits[&id], previous);
@@ -2111,7 +2176,7 @@ mod tests {
         });
 
         let mut app = app();
-        app.torrents[0].trackers = vec![format!("http://{address}/announce")];
+        app.control.torrents[0].trackers = vec![format!("http://{address}/announce")];
         app.behavior_catalog = BehaviorCatalog::from_toml(
             &include_str!("../config/tracker-behaviors.example.toml")
                 .replace("delay_seconds = 1800", "delay_seconds = 0"),
@@ -2137,7 +2202,7 @@ mod tests {
     #[test]
     fn scenario_cancellation_interrupts_delay_without_sending_request() {
         let mut app = app();
-        let id = app.torrents[0].info_hashes.join(";");
+        let id = app.control.torrents[0].info_hashes.join(";");
         let mut profile = default_audit(1024, 1234);
         profile.steps[0].delay_seconds = 3600;
         app.tracker_audits.insert(id, profile);
@@ -2207,13 +2272,13 @@ mod tests {
                 info_hash_v2_hex: None,
             },
         ));
-        let count = app.torrents.len();
+        let count = app.control.torrents.len();
         app.confirm_torrent_mode("5").unwrap();
         assert_eq!(
             app.input.as_ref().unwrap().kind,
             PromptKind::FreezeAfterBytes
         );
-        assert_eq!(app.torrents.len(), count);
+        assert_eq!(app.control.torrents.len(), count);
         assert!(app.confirm_freeze_threshold("0").is_err());
         assert!(app.confirm_freeze_threshold("NaN").is_err());
         assert!(app.pending_add.is_some());
@@ -2240,11 +2305,12 @@ mod tests {
     }
 
     #[test]
-    fn file_toggle_updates_shared_torrent_model() {
+    fn offline_file_toggle_does_not_change_confirmed_selection() {
         let mut app = app();
-        assert!(app.torrents[0].files.files()[0].selected);
+        assert!(app.control.torrents[0].files.files()[0].selected);
         app.toggle_selected_file();
-        assert!(!app.torrents[0].files.files()[0].selected);
+        assert!(app.control.torrents[0].files.files()[0].selected);
+        assert!(app.status.contains("unavailable"));
     }
 
     #[test]
@@ -2293,18 +2359,23 @@ mod tests {
     }
 
     #[test]
-    fn pause_resume_and_remove_actions_update_model_offline() {
+    fn offline_pause_resume_and_batches_do_not_claim_success() {
         let mut app = app();
+        let before = app.control.torrents[0].state;
         app.pause_selected();
-        assert_eq!(app.torrents[0].state, TorrentState::Paused);
+        assert_eq!(app.control.torrents[0].state, before);
+        assert!(app.status.contains("unavailable"));
         app.resume_selected();
-        assert_eq!(app.torrents[0].state, TorrentState::WaitingForEngine);
+        assert_eq!(app.control.torrents[0].state, before);
+        assert!(app.status.contains("unavailable"));
         app.pause_all();
-        assert_eq!(app.torrents[0].state, TorrentState::Paused);
+        assert_eq!(app.control.torrents[0].state, before);
+        assert!(app.status.contains("queued: 0"));
         app.resume_all();
-        assert_eq!(app.torrents[0].state, TorrentState::WaitingForEngine);
+        assert_eq!(app.control.torrents[0].state, before);
+        assert!(app.status.contains("queued: 0"));
         app.remove_selected();
-        assert!(app.torrents.is_empty());
+        assert!(app.control.torrents.is_empty());
     }
 
     #[test]
@@ -2313,7 +2384,10 @@ mod tests {
         assert!(app.set_download_directory(String::new()).is_err());
         assert!(app.set_download_directory("downloads/other".into()).is_ok());
         assert_eq!(
-            app.torrents[0].overrides.download_directory.as_deref(),
+            app.control.torrents[0]
+                .overrides
+                .download_directory
+                .as_deref(),
             Some("downloads/other")
         );
         assert!(app.set_tracker_url("ftp://invalid".into()).is_err());
@@ -2321,7 +2395,10 @@ mod tests {
             app.set_tracker_url("http://127.0.0.1:9000/announce".into())
                 .is_ok()
         );
-        assert_eq!(app.torrents[0].trackers, ["http://127.0.0.1:9000/announce"]);
+        assert_eq!(
+            app.control.torrents[0].trackers,
+            ["http://127.0.0.1:9000/announce"]
+        );
     }
 
     #[test]

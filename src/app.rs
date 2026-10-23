@@ -17,9 +17,9 @@ use eframe::egui;
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
     client::{
-        ClientBackend, SessionNotice, add_torrent_command, apply_session_event,
-        torrent_from_record, torrent_to_record,
+        ClientBackend, SessionNotice, add_torrent_command, torrent_from_record, torrent_to_record,
     },
+    control::{COMMAND_ACCEPTED, Controller, TorrentCommand},
     download_mode::DownloadMode,
     engine::EngineRuntime,
     file_selection::{FileSelectionModel, FileTreeRow},
@@ -358,7 +358,6 @@ pub struct PeerLumeApp {
     page: MainPage,
     details_tab: DetailsTab,
     preferences_tab: PreferencesTab,
-    torrents: Vec<TorrentItem>,
     selected_torrent: usize,
     settings: ClientSettings,
     saved_settings: ClientSettings,
@@ -376,7 +375,7 @@ pub struct PeerLumeApp {
     pending_torrent_paths: VecDeque<PathBuf>,
     add_status: String,
     magnet_input: String,
-    backend: ClientBackend,
+    control: Controller,
     tracker_audits: HashMap<String, TorrentTrackerAudit>,
     behavior_catalog: Result<BehaviorCatalog, String>,
     trash_confirmation: Option<TrashRequest>,
@@ -436,7 +435,6 @@ impl Default for PeerLumeApp {
             log_offset: 0,
             log_torrent: String::new(),
             preferences_tab,
-            torrents,
             selected_torrent: 0,
             settings,
             saved_settings,
@@ -454,7 +452,7 @@ impl Default for PeerLumeApp {
             pending_torrent_paths: VecDeque::new(),
             add_status: String::new(),
             magnet_input: String::new(),
-            backend,
+            control: Controller::new(backend, torrents),
             tracker_audits,
             behavior_catalog: BehaviorCatalog::load(),
             trash_confirmation: None,
@@ -463,8 +461,9 @@ impl Default for PeerLumeApp {
         if auto_update {
             app.start_blocklist_update(update_url);
         }
-        for torrent in &app.torrents {
+        for torrent in &app.control.torrents {
             let _ = app
+                .control
                 .backend
                 .send(add_torrent_command(torrent, &app.settings));
         }
@@ -475,16 +474,16 @@ impl Default for PeerLumeApp {
 impl PeerLumeApp {
     fn poll_session_events(&mut self) {
         loop {
-            let event = self.backend.try_recv();
-            let Some(event) = event else { break };
-            match apply_session_event(&mut self.torrents, event) {
+            let Some(notice) = self.control.poll_next() else {
+                break;
+            };
+            match notice {
                 SessionNotice::SettingsApplied { id } => {
-                    if let Some(torrent) =
-                        self.torrents.iter().find(|t| t.info_hashes.join(";") == id)
-                        && let Err(error) = self
-                            .backend
-                            .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
-                    {
+                    let audit = self
+                        .tracker_audits
+                        .get(&id)
+                        .map(TorrentTrackerAudit::to_stored);
+                    if let Err(error) = self.control.persist_confirmed_settings(&id, audit) {
                         self.add_status = error;
                     }
                 }
@@ -516,6 +515,7 @@ impl PeerLumeApp {
                 SessionNotice::None => {}
             }
         }
+        self.control.publish();
     }
 
     fn complete_trash_request(&mut self) {
@@ -529,24 +529,26 @@ impl PeerLumeApp {
 
         if request.scope.removes_torrent() {
             if let Some(index) = self
+                .control
                 .torrents
                 .iter()
                 .position(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
             {
-                self.torrents.remove(index);
+                self.control.torrents.remove(index);
                 self.tracker_audits.remove(&request.torrent_id);
                 self.selected_torrent = self
                     .selected_torrent
-                    .min(self.torrents.len().saturating_sub(1));
+                    .min(self.control.torrents.len().saturating_sub(1));
             }
-            let _ = self.backend.remove_torrent(&request.torrent_id);
+            let _ = self.control.backend.remove_torrent(&request.torrent_id);
         } else if let Some(index) = self
+            .control
             .torrents
             .iter()
             .position(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
         {
             let command = {
-                let torrent = &mut self.torrents[index];
+                let torrent = &mut self.control.torrents[index];
                 for file_index in 0..torrent.files.files().len() {
                     torrent.files.set_file_downloaded(file_index, 0);
                 }
@@ -559,10 +561,13 @@ impl PeerLumeApp {
                 torrent.state = TorrentState::Paused;
                 add_torrent_command(torrent, &self.settings)
             };
-            let _ = self.backend.send(command);
-            if let Some(torrent) = self.torrents.get(index) {
+            let _ = self.control.backend.send(command);
+            if let Some(torrent) = self.control.torrents.get(index) {
                 let audit = self.tracker_audits.get(&request.torrent_id);
-                let _ = self.backend.save_torrent(&torrent_record(torrent, audit));
+                let _ = self
+                    .control
+                    .backend
+                    .save_torrent(&torrent_record(torrent, audit));
             }
         }
         self.add_status = format!(
@@ -578,6 +583,7 @@ impl PeerLumeApp {
             return;
         }
         let Some(torrent) = self
+            .control
             .torrents
             .iter()
             .find(|torrent| torrent.info_hashes.join(";") == id)
@@ -643,11 +649,11 @@ impl PeerLumeApp {
             .trash_confirmation
             .take()
             .expect("trash confirmation exists");
-        if !self.backend.session_available() {
+        if !self.control.backend.session_available() {
             self.add_status = "Transfer engine is unavailable; nothing was deleted".into();
             return;
         }
-        match self.backend.send(SessionCommand::Remove {
+        match self.control.backend.send(SessionCommand::Remove {
             id: request.torrent_id.clone(),
         }) {
             Ok(()) => {
@@ -719,11 +725,15 @@ impl PeerLumeApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let active = self
+                        .control
                         .torrents
                         .iter()
                         .filter(|torrent| torrent.state == TorrentState::Downloading)
                         .count();
-                    ui.label(format!("{active} active / {} total", self.torrents.len()));
+                    ui.label(format!(
+                        "{active} active / {} total",
+                        self.control.torrents.len()
+                    ));
                 });
             });
         });
@@ -744,39 +754,20 @@ impl PeerLumeApp {
                     self.add_magnet();
                 }
                 if ui.button("Pause all").clicked() {
-                    for torrent in &mut self.torrents {
-                        if matches!(
-                            torrent.state,
-                            TorrentState::Downloading | TorrentState::WaitingForEngine
-                        ) {
-                            torrent.state = TorrentState::Paused;
-                            let _ = self.backend.send(SessionCommand::Pause {
-                                id: torrent.info_hashes.join(";"),
-                            });
-                        }
-                    }
+                    self.add_status = self.control.submit_batch(false);
                 }
                 if ui.button("Resume all").clicked() {
-                    for torrent in &mut self.torrents {
-                        if torrent.state == TorrentState::Paused {
-                            torrent.state = TorrentState::WaitingForEngine;
-                            torrent.download_rate = 0;
-                            torrent.upload_rate = 0;
-                            let _ = self.backend.send(SessionCommand::Resume {
-                                id: torrent.info_hashes.join(";"),
-                            });
-                        }
-                    }
+                    self.add_status = self.control.submit_batch(true);
                 }
-                if ui.button("Remove selected (keep data)").clicked() && !self.torrents.is_empty() {
-                    let index = self.selected_torrent.min(self.torrents.len() - 1);
-                    let removed = self.torrents.remove(index);
+                if ui.button("Remove selected (keep data)").clicked() && !self.control.torrents.is_empty() {
+                    let index = self.selected_torrent.min(self.control.torrents.len() - 1);
+                    let removed = self.control.torrents.remove(index);
                     let id = removed.info_hashes.join(";");
                     self.tracker_audits.remove(&id);
-                    let _ = self.backend.remove_torrent(&id);
+                    let _ = self.control.backend.remove_torrent(&id);
                     self.selected_torrent = self
                         .selected_torrent
-                        .min(self.torrents.len().saturating_sub(1));
+                        .min(self.control.torrents.len().saturating_sub(1));
                     self.add_status = format!("Removed {}; downloaded data was kept", removed.name);
                 }
                 if !self.add_status.is_empty() {
@@ -802,7 +793,7 @@ impl PeerLumeApp {
                                     ui.strong(title);
                                 }
                                 ui.end_row();
-                                for (index, torrent) in self.torrents.iter().enumerate() {
+                                for (index, torrent) in self.control.torrents.iter().enumerate() {
                                     let name = if torrent.is_private {
                                         format!("[Private] {}", torrent.name)
                                     } else {
@@ -991,7 +982,7 @@ impl PeerLumeApp {
                     .display_name
                     .unwrap_or_else(|| "Magnet metadata".into());
                 let id = magnet.exact_topics.join(";");
-                self.torrents.push(TorrentItem {
+                self.control.torrents.push(TorrentItem {
                     runtime: Default::default(),
                     completion: crate::completion::CompletionStatus::Pending,
                     name: name.clone(),
@@ -1010,8 +1001,8 @@ impl PeerLumeApp {
                     is_private: false,
                     overrides: Default::default(),
                 });
-                self.selected_torrent = self.torrents.len() - 1;
-                if let Some(torrent) = self.torrents.last() {
+                self.selected_torrent = self.control.torrents.len() - 1;
+                if let Some(torrent) = self.control.torrents.last() {
                     self.tracker_audits.insert(
                         id.clone(),
                         TorrentTrackerAudit::new(
@@ -1022,12 +1013,12 @@ impl PeerLumeApp {
                     );
                 }
                 self.add_status = format!("Added {name}; waiting for metadata exchange");
-                if let Some(torrent) = self.torrents.last() {
+                if let Some(torrent) = self.control.torrents.last() {
                     let mut command = add_torrent_command(torrent, &self.settings);
                     if let SessionCommand::AddTorrent { id: command_id, .. } = &mut command {
                         *command_id = id;
                     }
-                    let _ = self.backend.send(command);
+                    let _ = self.control.backend.send(command);
                 }
                 self.magnet_input.clear();
             }
@@ -1286,7 +1277,7 @@ impl PeerLumeApp {
         } else {
             TorrentState::Paused
         };
-        self.torrents.push(TorrentItem {
+        self.control.torrents.push(TorrentItem {
             runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
@@ -1318,23 +1309,29 @@ impl PeerLumeApp {
                 ..Default::default()
             },
         });
-        self.selected_torrent = self.torrents.len() - 1;
-        if let Some(torrent) = self.torrents.last() {
+        self.selected_torrent = self.control.torrents.len() - 1;
+        if let Some(torrent) = self.control.torrents.last() {
             let id = torrent.info_hashes.join(";");
             self.tracker_audits.insert(id, tracker_audit);
             let id = torrent.info_hashes.join(";");
             if let Err(error) = self
+                .control
                 .backend
                 .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
             {
                 self.add_status = format!("Added {name}; state save failed: {error}");
             }
             let _ = self
+                .control
                 .backend
                 .send(add_torrent_command(torrent, &self.settings));
         }
         if start_observation {
-            let torrent = self.torrents.last().expect("just added torrent exists");
+            let torrent = self
+                .control
+                .torrents
+                .last()
+                .expect("just added torrent exists");
             let id = torrent.info_hashes.join(";");
             if let Some(audit) = self.tracker_audits.get_mut(&id) {
                 let full_size = torrent
@@ -1373,31 +1370,23 @@ impl PeerLumeApp {
     }
 
     fn show_selected_torrent(&mut self, ui: &mut egui::Ui) {
-        if self.torrents.is_empty() {
+        if self.control.torrents.is_empty() {
             ui.label("No torrents");
             return;
         }
-        self.selected_torrent = self.selected_torrent.min(self.torrents.len() - 1);
-        let torrent = &mut self.torrents[self.selected_torrent];
+        self.selected_torrent = self.selected_torrent.min(self.control.torrents.len() - 1);
+        let mut commands = Vec::new();
+        let torrent = &mut self.control.torrents[self.selected_torrent];
+        let torrent_id = torrent.info_hashes.join(";");
         ui.horizontal(|ui| {
             ui.heading(&torrent.name);
             ui.separator();
             if torrent.state == TorrentState::Paused {
                 if ui.button("Resume").clicked() {
-                    torrent.state = TorrentState::WaitingForEngine;
-                    torrent.download_rate = 0;
-                    torrent.upload_rate = 0;
-                    let _ = self.backend.send(SessionCommand::Resume {
-                        id: torrent.info_hashes.join(";"),
-                    });
+                    commands.push(TorrentCommand::Resume);
                 }
             } else if ui.button("Pause").clicked() {
-                torrent.state = TorrentState::Paused;
-                torrent.download_rate = 0;
-                torrent.upload_rate = 0;
-                let _ = self.backend.send(SessionCommand::Pause {
-                    id: torrent.info_hashes.join(";"),
-                });
+                commands.push(TorrentCommand::Pause);
             }
             ui.selectable_value(
                 &mut self.details_tab,
@@ -1442,7 +1431,7 @@ impl PeerLumeApp {
         });
         match self.details_tab {
             DetailsTab::Status => {
-                let last = self.backend.journal().and_then(|j| {
+                let last = self.control.backend.journal().and_then(|j| {
                     torrent
                         .info_hashes
                         .iter()
@@ -1451,14 +1440,8 @@ impl PeerLumeApp {
                 show_runtime_status(ui, torrent, last.as_deref());
             }
             DetailsTab::Files => {
-                if Self::show_file_tree(ui, torrent) {
-                    let _ = self
-                        .backend
-                        .send(crate::client::file_selection_command(torrent));
-                    let audit = self.tracker_audits.get(&torrent.info_hashes.join(";"));
-                    if let Err(e) = self.backend.save_torrent(&torrent_record(torrent, audit)) {
-                        self.add_status = e;
-                    }
+                if let Some(indices) = Self::show_file_tree(ui, torrent) {
+                    commands.push(TorrentCommand::SetFiles(indices));
                 }
             }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
@@ -1493,14 +1476,7 @@ impl PeerLumeApp {
                     )
                     .clicked()
                 {
-                    match crate::client::mode_change_command(torrent, draft) {
-                        Ok(command) => {
-                            if let Err(error) = self.backend.send(command) {
-                                crate::client::mode_submission_failed(torrent, draft, error);
-                            }
-                        }
-                        Err(error) => self.add_status = error,
-                    }
+                    commands.push(TorrentCommand::SetMode(draft));
                 }
                 ui.small("Applying briefly pauses and resumes active transfers. Already transmitted announces cannot be recalled.");
                 let mut repair = torrent.overrides.repair_policy;
@@ -1517,28 +1493,16 @@ impl PeerLumeApp {
                             .prefix("Maximum repair attempts: "),
                     )
                     .changed();
-                if repair_changed
-                    && let Err(error) = self.backend.send(SessionCommand::SetRepairPolicy {
-                        id: torrent.info_hashes.join(";"),
-                        policy: repair,
-                    })
-                {
-                    self.add_status = error;
+                if repair_changed {
+                    commands.push(TorrentCommand::SetRepairPolicy(repair));
                 }
                 let before = torrent.overrides.verify_after_download;
                 Self::show_torrent_settings(ui, torrent, &self.settings);
                 if before != torrent.overrides.verify_after_download {
-                    let id = torrent.info_hashes.join(";");
-                    let _ = self.backend.send(SessionCommand::SetVerifyAfterDownload {
-                        id: id.clone(),
-                        enabled: torrent.overrides.verify_after_download,
-                    });
-                    if let Err(error) = self
-                        .backend
-                        .save_torrent(&torrent_record(torrent, self.tracker_audits.get(&id)))
-                    {
-                        self.add_status = error.to_string();
-                    }
+                    commands.push(TorrentCommand::SetVerifyAfterDownload(
+                        torrent.overrides.verify_after_download,
+                    ));
+                    torrent.overrides.verify_after_download = before;
                 }
             }
             DetailsTab::Peers => {
@@ -1560,6 +1524,7 @@ impl PeerLumeApp {
                     show_torrent_tracker_audit(ui, torrent, audit, &mut self.behavior_catalog);
                 if changed
                     && let Err(error) = self
+                        .control
                         .backend
                         .save_torrent(&torrent_record(torrent, Some(audit)))
                 {
@@ -1577,17 +1542,10 @@ impl PeerLumeApp {
                 ui.horizontal(|ui| {
                     ui.label("Real download announces (not the standalone audit)");
                     if ui.button("Recheck files").clicked() {
-                        self.add_status = match self.backend.send(SessionCommand::Recheck {
-                            id: torrent.info_hashes.join(";"),
-                        }) {
-                            Ok(()) => {
-                                "Rechecking existing files; transfer counters are retained".into()
-                            }
-                            Err(e) => e,
-                        };
+                        commands.push(TorrentCommand::Recheck);
                     }
                 });
-                if let Some(journal) = self.backend.journal() {
+                if let Some(journal) = self.control.backend.journal() {
                     if let Some(path) = journal.path() {
                         ui.label(format!("JSONL: {}", path.display()));
                     }
@@ -1701,17 +1659,49 @@ impl PeerLumeApp {
                 }
             }
         }
+        if let Some(status) =
+            Self::submit_torrent_commands(&mut self.control, &torrent_id, commands)
+        {
+            self.add_status = status;
+        }
     }
 
-    fn show_file_tree(ui: &mut egui::Ui, torrent: &mut TorrentItem) -> bool {
-        let previous_size = torrent.selected_size();
-        let previous_count = torrent.files.selected_count();
+    fn submit_torrent_commands(
+        control: &mut Controller,
+        id: &str,
+        commands: Vec<TorrentCommand>,
+    ) -> Option<String> {
+        let mut first_error = None;
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for command in commands {
+            match control.submit(id, command, None) {
+                Ok(_) => accepted += 1,
+                Err(error) => {
+                    rejected += 1;
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        match first_error {
+            Some(error) if accepted > 0 => Some(format!(
+                "Commands queued: {accepted}; rejected: {rejected}. {error}"
+            )),
+            Some(error) => Some(error),
+            None if accepted > 0 => Some(COMMAND_ACCEPTED.into()),
+            None => None,
+        }
+    }
+
+    fn show_file_tree(ui: &mut egui::Ui, torrent: &TorrentItem) -> Option<Vec<usize>> {
+        let mut select_all = None;
+        let mut changes = std::collections::BTreeMap::new();
         ui.horizontal(|ui| {
             if ui.small_button("Select all").clicked() {
-                torrent.files.select_all(true);
+                select_all = Some(true);
             }
             if ui.small_button("Select none").clicked() {
-                torrent.files.select_all(false);
+                select_all = Some(false);
             }
             ui.label(format!(
                 "{} of {} files selected ({}), {} downloaded",
@@ -1721,12 +1711,12 @@ impl PeerLumeApp {
                 format_size(torrent.files.selected_downloaded())
             ));
         });
-        let mut selection_changed = false;
         egui::ScrollArea::vertical()
             .id_salt("selected_torrent_files_scroll")
             .max_height(270.0)
             .show_rows(ui, 22.0, torrent.files.row_count(), |ui, rows_range| {
-                let (rows, files) = torrent.files.rows_and_files_mut();
+                let rows = torrent.files.rows();
+                let files = torrent.files.files();
                 for row in &rows[rows_range] {
                     match row {
                         FileTreeRow::Group { name, file_count } => {
@@ -1736,14 +1726,17 @@ impl PeerLumeApp {
                             index,
                             display_start,
                         } => {
-                            let file = &mut files[*index];
+                            let file = &files[*index];
                             let progress = if file.size_bytes == 0 {
                                 0.0
                             } else {
                                 file.downloaded_bytes as f32 / file.size_bytes as f32
                             };
                             ui.horizontal(|ui| {
-                                selection_changed |= ui.checkbox(&mut file.selected, "").changed();
+                                let mut selected = select_all.unwrap_or(file.selected);
+                                if ui.checkbox(&mut selected, "").changed() {
+                                    changes.insert(*index, selected);
+                                }
                                 ui.add_sized(
                                     [(ui.available_width() - 220.0).max(80.0), 20.0],
                                     egui::Label::new(&file.path[*display_start..]).truncate(),
@@ -1759,14 +1752,7 @@ impl PeerLumeApp {
                     }
                 }
             });
-        if selection_changed {
-            torrent.files.refresh_selection_totals();
-        }
-        let selected_size = torrent.selected_size();
-        if selected_size != previous_size {
-            torrent.downloaded_bytes = torrent.files.selected_downloaded();
-        }
-        selection_changed || previous_count != torrent.files.selected_count()
+        torrent.files.selection_after_edit(select_all, &changes)
     }
 
     fn show_torrent_info(ui: &mut egui::Ui, torrent: &TorrentItem, global: &ClientSettings) {
@@ -3257,6 +3243,52 @@ fn show_runtime_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_dispatch_distinguishes_acceptance_from_application_and_reports_rejection() {
+        let mut control = Controller::new(
+            ClientBackend::offline(),
+            vec![crate::client::tests::torrent()],
+        );
+        assert_eq!(
+            PeerLumeApp::submit_torrent_commands(&mut control, "v1: abc", vec![]),
+            None
+        );
+        let before = control.torrents[0].state;
+        let rejected = PeerLumeApp::submit_torrent_commands(
+            &mut control,
+            "v1: abc",
+            vec![TorrentCommand::Pause],
+        )
+        .unwrap();
+        assert!(rejected.contains("unavailable"));
+        assert_eq!(control.torrents[0].state, before);
+        let mut fixture = crate::control::test_support::LiveFixture::new();
+        let accepted = PeerLumeApp::submit_torrent_commands(
+            &mut fixture.controller,
+            &fixture.id,
+            vec![TorrentCommand::Resume],
+        )
+        .unwrap();
+        assert_eq!(accepted, COMMAND_ACCEPTED);
+        assert_eq!(fixture.controller.torrents[0].state, TorrentState::Paused);
+        fixture.wait_for(|fixture| fixture.controller.torrents[0].state == TorrentState::Seeding);
+        let partial = PeerLumeApp::submit_torrent_commands(
+            &mut fixture.controller,
+            &fixture.id,
+            vec![
+                TorrentCommand::SetRepairPolicy(crate::runtime_status::RepairPolicy {
+                    enabled: true,
+                    max_attempts: 0,
+                }),
+                TorrentCommand::Pause,
+            ],
+        )
+        .unwrap();
+        assert!(partial.contains("queued: 1; rejected: 1"));
+        assert!(partial.contains("Repair attempts"));
+        fixture.wait_for(|fixture| fixture.controller.torrents[0].state == TorrentState::Paused);
+    }
 
     #[test]
     fn egui_status_renders_the_shared_unconfirmed_and_active_policy_model() {

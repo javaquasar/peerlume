@@ -65,6 +65,14 @@ pub enum SessionCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    VerifyAfterDownload {
+        id: String,
+        enabled: bool,
+    },
+    FilesApplied {
+        id: String,
+        only_files: Vec<usize>,
+    },
     Mode {
         id: String,
         application: ModeApplication,
@@ -114,6 +122,23 @@ pub enum SessionEvent {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionSendError {
+    Unavailable,
+    Full,
+    Closed,
+}
+
+fn send_command(
+    sender: &tokio_mpsc::Sender<SessionCommand>,
+    command: SessionCommand,
+) -> Result<(), SessionSendError> {
+    sender.try_send(command).map_err(|error| match error {
+        tokio_mpsc::error::TrySendError::Full(_) => SessionSendError::Full,
+        tokio_mpsc::error::TrySendError::Closed(_) => SessionSendError::Closed,
+    })
+}
+
 pub struct SessionRuntime {
     pub journal: AnnounceJournal,
     commands: tokio_mpsc::Sender<SessionCommand>,
@@ -139,7 +164,7 @@ impl SessionRuntime {
     }
 
     #[cfg(test)]
-    fn start_with_options(
+    pub(crate) fn start_with_options(
         capacity: usize,
         default_output_folder: PathBuf,
         options: SessionOptions,
@@ -544,6 +569,9 @@ impl SessionRuntime {
                                         if let Some(SessionCommand::AddTorrent { verify_after_download, repair_policy, .. }) = added_commands.get_mut(&id) {
                                             *verify_after_download = enabled || repair_policy.enabled;
                                             if enabled { checked_after_download.remove(&id); }
+                                            let _ = event_tx.send(SessionEvent::VerifyAfterDownload { id, enabled: *verify_after_download });
+                                        } else {
+                                            let _ = event_tx.send(SessionEvent::Error { id, message: "Torrent is not registered in the transfer engine".into() });
                                         }
                                     }
                                     SessionCommand::SetFiles { id, only_files } => {
@@ -552,10 +580,13 @@ impl SessionRuntime {
                                             match session.update_only_files(handle, &selected).await {
                                                 Ok(()) => {
                                                     checked_after_download.remove(&id);
-                                                    if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files); }
+                                                    if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files.clone()); }
+                                                    let _ = event_tx.send(SessionEvent::FilesApplied { id, only_files });
                                                 },
                                                 Err(error) => { let _ = event_tx.send(SessionEvent::Error { id, message: format!("File selection update failed: {error:#}") }); }
                                             }
+                                        } else {
+                                            let _ = event_tx.send(SessionEvent::Error { id, message: "Torrent is not registered in the transfer engine".into() });
                                         }
                                     }
                                 }
@@ -577,6 +608,10 @@ impl SessionRuntime {
         self.commands
             .try_send(command)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn send_checked(&self, command: SessionCommand) -> Result<(), SessionSendError> {
+        send_command(&self.commands, command)
     }
 
     pub fn try_recv(&self) -> Option<SessionEvent> {
@@ -739,6 +774,22 @@ mod verification_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_command_transport_reports_full_and_closed_without_dropping_queued_commands() {
+        let (sender, mut receiver) = tokio_mpsc::channel(1);
+        assert_eq!(send_command(&sender, SessionCommand::Shutdown), Ok(()));
+        assert_eq!(
+            send_command(&sender, SessionCommand::Pause { id: "a".into() }),
+            Err(SessionSendError::Full)
+        );
+        assert_eq!(receiver.try_recv().unwrap(), SessionCommand::Shutdown);
+        drop(receiver);
+        assert_eq!(
+            send_command(&sender, SessionCommand::Shutdown),
+            Err(SessionSendError::Closed)
+        );
+    }
 
     #[test]
     fn reporting_registration_is_scoped_to_torrent_and_session() {

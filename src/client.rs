@@ -31,6 +31,26 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::VerifyAfterDownload { id, enabled } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.overrides.verify_after_download = enabled;
+            }
+            SessionNotice::SettingsApplied { id }
+        }
+        SessionEvent::FilesApplied { id, only_files } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                let selected: std::collections::HashSet<_> = only_files.into_iter().collect();
+                let mut changed = false;
+                for index in 0..torrent.files.files().len() {
+                    changed |= torrent.files.set_selected(index, selected.contains(&index));
+                }
+                torrent.downloaded_bytes = torrent.files.selected_downloaded();
+                if changed && torrent.completion == crate::completion::CompletionStatus::Verified {
+                    torrent.completion = crate::completion::CompletionStatus::Pending;
+                }
+            }
+            SessionNotice::SettingsApplied { id }
+        }
         SessionEvent::Mode { id, application } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 torrent.runtime.mode = application.clone();
@@ -369,6 +389,29 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
 }
 
 impl ClientBackend {
+    #[cfg(test)]
+    pub(crate) fn with_session_and_store(runtime: SessionRuntime, store: StateStore) -> Self {
+        let mut backend = Self::with_session(runtime);
+        backend.state_store = Some(store);
+        backend
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_state_store(state_store: StateStore) -> Self {
+        Self {
+            state_store: Some(state_store),
+            session_runtime: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_session(session_runtime: SessionRuntime) -> Self {
+        Self {
+            state_store: None,
+            session_runtime: Some(session_runtime),
+        }
+    }
+
     pub fn journal(&self) -> Option<&crate::announce_journal::AnnounceJournal> {
         self.session_runtime.as_ref().map(|s| &s.journal)
     }
@@ -428,7 +471,17 @@ impl ClientBackend {
             .try_send(command)
     }
 
-    pub fn try_recv(&self) -> Option<SessionEvent> {
+    pub(crate) fn send_checked(
+        &self,
+        command: SessionCommand,
+    ) -> Result<(), crate::session::SessionSendError> {
+        self.session_runtime
+            .as_ref()
+            .ok_or(crate::session::SessionSendError::Unavailable)?
+            .send_checked(command)
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<SessionEvent> {
         self.session_runtime
             .as_ref()
             .and_then(SessionRuntime::try_recv)
@@ -436,6 +489,11 @@ impl ClientBackend {
 
     pub fn session_available(&self) -> bool {
         self.session_runtime.is_some()
+    }
+
+    #[cfg(any(test, feature = "gui", feature = "tui"))]
+    pub(crate) fn persistence_available(&self) -> bool {
+        self.state_store.is_some()
     }
 }
 
