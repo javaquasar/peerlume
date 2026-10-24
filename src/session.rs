@@ -1666,8 +1666,15 @@ mod tests {
                 assert_eq!(entries.len(), 2, "{expected}");
                 let stopped = &entries[1].announce;
                 assert_eq!(stopped.event.as_deref(), Some("stopped"));
-                assert_eq!(stopped.outcome, "transport_error");
+                // Linux commonly reports refusal immediately; Windows may
+                // still be connecting when the two-second stop deadline cancels
+                // the attempt. Neither path may claim tracker acceptance.
+                assert!(matches!(
+                    stopped.outcome.as_str(),
+                    "transport_error" | "cancelled"
+                ));
                 assert_eq!(stopped.reply.http_status, None);
+                assert_eq!(stopped.request_transmitted, None);
             } else {
                 // The initial request still holds the transport lock. The
                 // bounded shutdown cancels it rather than inventing a reply.
