@@ -209,6 +209,20 @@ class Desktop:
         subprocess.run(["xdotool", "windowactivate", "--sync", self.window], check=True)
         subprocess.run(["xdotool", "key", "--clearmodifiers", "alt+F4"], check=True)
 
+    def done(self):
+        # Read the actual first-row progress badge, not controller state. White
+        # text on the green badge needs a red-channel threshold; full-screen
+        # grayscale OCR can merge the rounded badge into the letters.
+        header = self.locate("Progress")
+        if header is None:
+            return False
+        crop = self.report / "done-ocr.png"
+        geometry = f"150x24+{header[0] - 28}+{header[1] + 9}"
+        subprocess.run(["convert", str(self.report / "current.png"), "-crop", geometry, "+repage", "-channel", "R", "-separate", "-threshold", "45%", "-negate", "-resize", "400%", "-bordercolor", "white", "-border", "12", str(crop)], check=True, timeout=10)
+        result = subprocess.run(["tesseract", str(crop), "stdout", "--psm", "7"], capture_output=True, check=True, timeout=15)
+        (self.report / "done-ocr.txt").write_bytes(result.stdout)
+        return self.normalize(result.stdout.decode()) == "done"
+
 
 def run(args):
     report = Path(args.report).resolve()
@@ -303,7 +317,7 @@ def run(args):
                 after = fixture.requests.get(0, 0)
             assert after > before, "Damaged piece was not fetched again from the real peer"
             assert row()["active_mode"] == "normal"
-            wait_for(lambda: desktop.locate("Done"), timeout=30)
+            wait_for(desktop.done, timeout=30)
             desktop.screenshot("04-repaired-done")
             desktop.click("Pause all")
             wait_for(lambda: row()["state"] == "paused")
