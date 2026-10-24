@@ -46,6 +46,9 @@ fn wait(runtime: &SessionRuntime, mut predicate: impl FnMut(SessionEvent) -> boo
     let end = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(event) = runtime.try_recv() {
+            if let SessionEvent::Error { message, .. } = &event {
+                panic!("sandbox backend error: {message}");
+            }
             if predicate(event) {
                 return;
             }
@@ -75,8 +78,9 @@ fn prepared_add_uses_the_validated_bytes_without_reopening_a_missing_source() {
     wait(&runtime, |event| {
         matches!(
             event,
-            SessionEvent::Verification {
-                status: CompletionStatus::Verified,
+            SessionEvent::Stats {
+                finished: true,
+                paused: true,
                 ..
             }
         )
@@ -111,8 +115,9 @@ fn prepared_root_identity_survives_path_replacement_and_a_real_recheck() {
     wait(&runtime, |event| {
         matches!(
             event,
-            SessionEvent::Verification {
-                status: CompletionStatus::Verified,
+            SessionEvent::Stats {
+                finished: true,
+                paused: true,
                 ..
             }
         )

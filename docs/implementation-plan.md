@@ -88,9 +88,12 @@ publishes current JSON, LCOV and HTML reports and rejects a lower result.
 - REL 2: implemented the measured Linux resource workload and push/manual/weekly
   jobs. It holds one owner alive, reconnects IPC clients and repeatedly runs local
   parallel-download and corrupt-piece-repair fixtures in separate sessions.
-  Sampling is at idle cycle boundaries with RSS/thread/handle growth budgets;
-  peak profiling, sustained churn within one swarm and a completed 24-hour run
-  remain release gates. Hosted manual runs support up to four hours.
+  Sampling now runs once per second during activity as well as at idle cycle
+  boundaries, with post-warmup RSS/thread/handle budgets for both idle values and
+  sampled peaks. The separate Long soak workflow supports four hosted hours or
+  one continuous 24-hour process on an existing trusted Linux self-hosted runner.
+  Reports require a final success record. Allocation profiling, sustained churn
+  within one swarm and a completed 24-hour run remain release gates.
 - REL 3: added completion/ETA/ratio, blocklist corruption and legacy-header,
   settings, operation quota, missing-credential and startup-recovery regressions.
   Fixed legacy cache allocation before validation and rejected non-finite enabled
@@ -98,14 +101,21 @@ publishes current JSON, LCOV and HTML reports and rejects a lower result.
 - REL 4: implemented rendered egui and ratatui workflows against a copied external
   CLI, real engine acknowledgements and SQLite. They exercise frontend pause/resume,
   external policy/recheck operations, confirmed status rendering and restart.
-  Fresh network addition, fault repair and native-window input in one combined
-  frontend scenario remain open; local network/repair tests run separately.
+  Added a Linux X11 native-window scenario using copied ordinary GUI/CLI binaries,
+  mouse/OCR input, fresh local-peer download, GUI pause/resume, external recheck,
+  corrupt-piece refetch and restart. Screenshots and a final result are retained
+  in GitHub artifacts. Windows native input and broader visual parity remain open.
 - REL 5: implemented pinned no-follow preview reads/export creation, bounded
   metainfo reads, injectable credential stores, Windows DPAPI and Linux Secret
   Service with a disposable real-service CI test. Missing secrets fail explicitly
   and both frontends display restore errors without clearing saved records.
-  Backend payload I/O and the engine's initial metainfo path reopen still need
-  pinned-handle integration; do not advertise complete filesystem race immunity.
+  The real transfer backend now consumes a per-torrent pinned directory storage
+  factory, uses owned file handles for positioned I/O and retains the capability
+  across rechecks. Agent adds pass the validated metainfo snapshot directly to
+  the engine without reopening the import pathname. Tests cover missing source,
+  Unix path replacement through a real backend/recheck and Windows junctions.
+  Human-controlled root resolution, restart, hard links and arbitrary same-user
+  file modification remain outside a claim of complete filesystem race immunity.
 - REL 6: implemented a measured coverage baseline with negative gate self-tests,
   five bounded fuzz targets, seed/failure corpus artifacts and weekly/manual
   fuzz/resource jobs. All five fuzz targets run successfully in Reliability CI.

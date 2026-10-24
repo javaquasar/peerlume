@@ -478,12 +478,14 @@ are documented in [Installed agent control](agent-control.md).
   approvals, path checks, structurally redacted responses/exports and bounded
   authenticated action/state audit. No agent-grant or approval bypass method,
   remote listener, arbitrary shell or payload-deletion endpoint. Atomic
-  handle-relative path hardening and payload-deletion approval design stay open.
+  import/export and backend payload access now use pinned directory handles in
+  the REL 5 slice. Payload-deletion approval design stays open.
 - AGENT 6: copied CLI/MCP/profile integration tests, local real tracker/peer
   download after IPC disconnect without UI polling, authorization/retry/restart/
   export/property tests, and Windows development ZIP packaging in existing CI.
-  Full graphical frontend + agent E2E, signed installer integration and broader
-  hostile concurrent-filesystem testing remain open.
+  REL 4 adds a Linux native-window + external CLI download/repair/restart scenario
+  alongside rendered frontend tests. Windows native automation, signed installer
+  integration and broader hostile concurrent-filesystem testing remain open.
 
 Implementation: [controller](../src/control/mod.rs),
 [agent coordinator](../src/control/agent.rs), [local host](../src/control/host.rs),

@@ -221,6 +221,16 @@ Run the desktop UI:
 cargo run
 ```
 
+Open a local torrent directly in the ordinary review dialog, without adding or
+starting it automatically:
+
+```powershell
+cargo run -- --open C:\path\to\example.torrent
+```
+
+`--open` requires an absolute `.torrent` path and accepts up to 16 repeated
+arguments. Each torrent still requires confirmation in the normal add dialog.
+
 Update and validate the configured blocklist without opening the UI:
 
 ```powershell
@@ -266,8 +276,7 @@ gh run list --repo javaquasar/peerlume --workflow ci.yml
 CI checks formatting, strict Clippy lints, and repository language. The test matrix
 covers both GUI and TUI features on Windows and separate core-only and TUI builds
 on Linux, including the vendored tracker library's tests and documentation tests.
-Linux GUI builds are not included because the GUI dependency does not currently
-enable Linux window-system features. A separate Ubuntu job runs the four ignored
+The Reliability workflow also builds the Linux X11 GUI. A separate Ubuntu job runs the four ignored
 Docker tracker/peer integration tests against local synthetic fixtures; it does
 not use production trackers or private torrent credentials.
 
@@ -288,13 +297,37 @@ supported suites separately. The manual upstream UDP test remains ignored.
 The [Reliability workflow](https://github.com/javaquasar/peerlume/actions/workflows/reliability.yml)
 adds rendered egui/ratatui workflows with a copied external adapter, a disposable
 Linux Secret Service, bounded parser fuzzing, and a resource soak with JSONL
-artifacts. Push/PR runs use a 90-second resource workload; weekly scheduled runs
-use one hour. Manual inputs allow up to four hours on hosted runners. For a
-24-hour local run, set `PEERLUME_SOAK_SECONDS=86400` and a new output filename in
-`PEERLUME_SOAK_REPORT`, then run `cargo test --no-default-features --lib
-reliability_resource_soak -- --ignored --test-threads=1 --nocapture` on Linux.
-Samples cover idle boundaries after each parallel-transfer/repair cycle, not
-peak allocation profiling. Native desktop window automation is not included.
+artifacts. A separate Xvfb/Openbox job operates the actual Linux X11 window using
+mouse input and OCR. It adds a fresh torrent, downloads from a local peer,
+pauses/resumes through the GUI, grants an external CLI access, corrupts a piece,
+requests a real recheck/repair, and restarts the installed application. Its
+`native-window-evidence` artifact contains screenshots and a success result only
+after all assertions pass. Windows native-window automation is not covered.
+
+Push/PR runs use a 90-second resource workload; weekly scheduled runs use one
+hour. The sampler records RSS, threads, open handles, journal/database sizes and
+the last IPC latency once per second during transfer/repair, plus idle cycle
+boundaries. Growth budgets cover idle values and sampled peaks after warmup;
+one-second sampling is not an allocation profiler. One control owner stays alive
+while IPC clients reconnect and transfer/repair fixtures run in separate sessions;
+this does not yet exercise sustained churn inside one swarm. JSONL ends with
+`kind=result, completed=true` only after successful completion; missing that
+record means the report is incomplete or failed.
+
+The manual [Long soak workflow](https://github.com/javaquasar/peerlume/actions/workflows/long-soak.yml)
+does not cancel a running experiment when another commit is pushed. Start a
+four-hour GitHub-hosted run with:
+
+```powershell
+gh workflow run long-soak.yml --repo javaquasar/peerlume --ref main -f runner=hosted -f seconds=14400
+```
+
+For a continuous 24-hour release gate, select `runner=continuous-24h` and provide
+the label of an existing trusted Linux self-hosted runner in `runner_label`
+(default `peerlume-soak`). The workflow uses one 86,400-second process, not shorter
+runs combined into a nominal day. GitHub-hosted jobs have a six-hour execution
+limit, so they cannot complete this gate. Both variants publish JSONL artifacts;
+a successful short run does not close the 24-hour gate.
 
 Linux persists private tracker credentials in the current user's Secret Service;
 the service must be available and unlocked. Windows retains current-user DPAPI.

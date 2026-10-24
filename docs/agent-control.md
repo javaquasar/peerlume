@@ -154,10 +154,23 @@ and destination descendants must already exist. Absolute paths, traversal, ADS,
 reserved names and symlink/reparse-point descendants are rejected; outputs are
 never overwritten. Filesystem roots are human-controlled, not agent-configurable.
 Preview reads and export creation use pinned directory handles and no-follow
-descendant opens, rather than reopening validated paths. Imports are byte-bounded
-through the opened handle. Backend payload writes and the engine's initial source
-reopen still use paths; racing replacement at these boundaries remains a hardening
-gate. These changes do not claim race immunity for arbitrary same-user processes.
+descendant opens, rather than reopening validated paths. An agent add validates a
+bounded metainfo snapshot and passes those same bytes to the transfer engine;
+the engine does not reopen the imported source for that add. The download grant
+pins its trusted root on first use and opens existing destination descendants
+without following links. The real backend opens payloads relative to that pinned
+directory and performs positioned reads/writes through owned file handles. A
+recheck retains the directory capability rather than reopening its pathname.
+Payload resume may update existing regular files, while agent export never
+overwrites an existing output.
+
+Only the human-selected root is opened with ambient filesystem authority. That
+root is resolved again on application restart; pins are not durable filesystem
+identities. Directory capabilities do not prevent another same-user process from
+modifying file contents, creating hard links, or changing trusted roots before
+they are opened. Do not treat this as an OS sandbox against arbitrary same-user
+code. Unix directory-replacement/symlink tests and a Windows junction regression
+exercise the supported no-follow boundaries.
 
 At most two exports run concurrently outside the controller lock. An export
 snapshots the disk journal length, streams at most 512 MiB, bounds individual
@@ -181,14 +194,15 @@ performs a real download after the control client disconnects, without frontend
 polling; observed and owner completion agree.
 
 All six AGENT tracks have implementation slices, not unconditional release-gate
-closure. Remaining work includes full GUI/TUI visual E2E coverage with an external
-agent, backend payload handle integration, typed IPC push subscriptions
+closure. Remaining work includes broader GUI/TUI visual E2E coverage with an external
+agent, Windows native-window automation, typed IPC push subscriptions
 (latest-value polling is implemented), paged archived diagnostics,
 cancellation of already-running engine work, final removal
 of legacy preference/audit model access, signed installer/discovery integration,
 and a separately designed payload-deletion approval workflow. Operation archiving,
-rendered frontend/external-agent workflows and pinned import/export opens now have
+rendered frontend/external-agent workflows, a Linux native-window download/repair
+scenario and pinned import/export/payload opens now have
 REL implementation slices in [the primary plan](implementation-plan.md).
-Native-window automation and backend payload handle integration remain separate
-gates. These capabilities
-are not advertised as implemented. Core library publication stays deferred.
+The native scenario's screenshots and `result.json` are published by Reliability
+CI; only a completed successful run establishes that scenario. Core library
+publication stays deferred.

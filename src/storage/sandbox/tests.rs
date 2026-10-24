@@ -34,7 +34,7 @@ fn aliases_absolute_paths_and_traversal_never_create_files() {
         "NUL",
         "CON.txt",
         "a:b",
-        "a\\b",
+        "a\\..\\escape",
         "",
     ] {
         assert!(root.open_payload(Path::new(path), true).is_err(), "{path}");
@@ -115,7 +115,7 @@ fn parallel_positioned_writes_preserve_each_disjoint_block() {
     }
     let mut bytes = vec![0; 8192];
     p.pread_exact(0, 0, &mut bytes).unwrap();
-    for (index, block) in bytes.chunks_exact(1024).enumerate() {
+    for (index, block) in bytes.as_chunks::<1024>().0.iter().enumerate() {
         assert!(block.iter().all(|b| *b == index as u8));
     }
 }

@@ -163,8 +163,9 @@ class Desktop:
         subprocess.run(["xdotool", "mousemove", "--sync", str(position[0]), str(position[1]), "click", "1"], check=True)
         time.sleep(0.5)
 
-    def attach(self):
+    def attach(self, app):
         def window():
+            assert app.poll() is None, "GUI exited before creating its native window; see application.log"
             result = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "^PeerLume$"], capture_output=True)
             return result.stdout.decode().splitlines() if result.returncode == 0 else None
         self.window = wait_for(window, timeout=45)[-1]
@@ -229,7 +230,7 @@ def run(args):
                 return subprocess.Popen(command, cwd=installed, stdout=log, stderr=subprocess.STDOUT)
 
             app = launch(True)
-            desktop.attach()
+            desktop.attach(app)
             desktop.add()
             target = downloads / "payload.bin"
             expected = hashlib.sha256(fixture.payload).digest()
@@ -303,7 +304,7 @@ def run(args):
             desktop.close()
             app.wait(timeout=20)
             app = launch(False)
-            desktop.attach()
+            desktop.attach(app)
             desktop.grant(new=False)
             assert request("list", {"offset": 0, "limit": 1, "revision": None, "after_revision": None}, explicit_instance=old_instance, allow_error=True)["error"] == "conflict"
             instance = None
