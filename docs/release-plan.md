@@ -470,7 +470,8 @@ are documented in [Installed agent control](agent-control.md).
 - AGENT 4: durable bounded operation records, distinct queued/running/terminal
   outcomes, per-client argument-bound idempotency, revision conflicts, deadlines,
   safe cancellation before dispatch and reconciliation after restart/ambiguity.
-  Running-work cancellation and automatic safe retention remain open; capacity
+  Running-work cancellation remains open. The REL 1 implementation now archives
+  terminal results automatically while preserving keys; active/archive capacity
   exhaustion rejects new work rather than silently forgetting idempotency keys.
 - AGENT 5: hashed tokens, independent grants, controller-side authorization,
   trusted GUI/TUI enable/grant/revoke/approval controls, bound remove/export
@@ -608,9 +609,11 @@ without modifying process-global application settings or relying on UI polling.
 - [ ] Publish a platform support matrix; do not infer macOS or other platform
   support from successful Windows and Linux application builds.
 
-Current behavior uses current-user DPAPI on Windows. The non-Windows persistence
-path does not preserve the full secret URL. This is a portability limitation to
-resolve or explicitly constrain, not a completed cross-platform secret store.
+The original non-Windows assessment did not preserve full secret URLs. REL 5 now
+adds an injectable credential provider, current-user DPAPI on Windows and Linux
+Secret Service for file-backed profiles. Missing/locked providers fail explicitly;
+legacy Linux records without their secrets require re-entering the original URL.
+Other platforms and an embedding-host support contract remain library gates.
 
 Done when supported platforms have tested, documented restart behavior and no
 plaintext-secret fallback is introduced implicitly.

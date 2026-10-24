@@ -47,11 +47,12 @@ jobs:
       - name: Run instrumented core and TUI tests
         run: |
           mkdir -p coverage
+          cargo +stable llvm-cov clean --workspace
           cargo +stable llvm-cov --locked --no-default-features --features tui --all-targets -p peerlume -p librqbit-tracker-comms --no-report
       - name: Include the rendered TUI and copied external adapter workflow
         run: |
           export PEERLUME_CONTROL_BIN="$PWD/target/coverage-build/llvm-cov-target/debug/peerlume-control"
-          cargo +stable llvm-cov test --locked --no-clean --no-report --no-default-features --features tui --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
+          cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
       - name: Generate LCOV and HTML reports without rerunning tests
         run: |
           cargo +stable llvm-cov report --json --summary-only --output-path coverage/summary.json

@@ -74,5 +74,42 @@ results. A green smoke job is not evidence of a completed hours-long experiment.
 
 ## Delivery evidence
 
-Implementation is in progress. Record actual run URLs and measured results after
-GitHub jobs complete. Leave acceptance criteria open where evidence is incomplete.
+The initial implementation is delivered in `4e8ccd7` and `271068c`.
+The [application test matrix](https://github.com/javaquasar/peerlume/actions/runs/40077949609)
+and [Reliability jobs](https://github.com/javaquasar/peerlume/actions/runs/40077949726)
+pass for `271068c`. The coverage baseline is the measured `f0bc306` result;
+the [Coverage workflow](https://github.com/javaquasar/peerlume/actions/workflows/coverage.yml)
+publishes current JSON, LCOV and HTML reports and rejects a lower result.
+
+- REL 1: implemented hot/archive retention with a 512-record hot set and a
+  100,000-record archive. Tests run 1,536 sequential operations and check archived
+  lookup, client isolation, restart, rollback, saturation and preservation of keys.
+  Archive quota exhaustion remains an explicit Busy result, not key eviction.
+- REL 2: implemented the measured Linux resource workload and push/manual/weekly
+  jobs. It holds one owner alive, reconnects IPC clients and repeatedly runs local
+  parallel-download and corrupt-piece-repair fixtures in separate sessions.
+  Sampling is at idle cycle boundaries with RSS/thread/handle growth budgets;
+  peak profiling, sustained churn within one swarm and a completed 24-hour run
+  remain release gates. Hosted manual runs support up to four hours.
+- REL 3: added completion/ETA/ratio, blocklist corruption and legacy-header,
+  settings, operation quota, missing-credential and startup-recovery regressions.
+  Fixed legacy cache allocation before validation and rejected non-finite enabled
+  ratio limits. Coverage gates retain the previous measured baseline.
+- REL 4: implemented rendered egui and ratatui workflows against a copied external
+  CLI, real engine acknowledgements and SQLite. They exercise frontend pause/resume,
+  external policy/recheck operations, confirmed status rendering and restart.
+  Fresh network addition, fault repair and native-window input in one combined
+  frontend scenario remain open; local network/repair tests run separately.
+- REL 5: implemented pinned no-follow preview reads/export creation, bounded
+  metainfo reads, injectable credential stores, Windows DPAPI and Linux Secret
+  Service with a disposable real-service CI test. Missing secrets fail explicitly
+  and both frontends display restore errors without clearing saved records.
+  Backend payload I/O and the engine's initial metainfo path reopen still need
+  pinned-handle integration; do not advertise complete filesystem race immunity.
+- REL 6: implemented a measured coverage baseline with negative gate self-tests,
+  five bounded fuzz targets, seed/failure corpus artifacts and weekly/manual
+  fuzz/resource jobs. All five fuzz targets run successfully in Reliability CI.
+  A smoke fuzz run is not exhaustive parser verification.
+
+Continue with the open gates above. Do not mark the full release acceptance
+criteria complete on the strength of smoke or rendered-only tests.
