@@ -1654,14 +1654,32 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             server.join().unwrap();
             let entries = journal.entries(Some(&hash));
-            assert_eq!(entries.len(), 1, "{expected}");
-            let record = &entries[0].announce;
+            let starts: Vec<_> = entries
+                .iter()
+                .filter(|e| e.announce.event.as_deref() == Some("started"))
+                .collect();
+            assert_eq!(starts.len(), 1, "{expected}");
+            // This fixture accepts exactly one connection. Orderly shutdown now
+            // makes a real stopped attempt after completed initial requests;
+            // the closed fixture must not turn that attempt into a fake success.
+            if status.is_some() {
+                assert_eq!(entries.len(), 2, "{expected}");
+                let stopped = &entries[1].announce;
+                assert_eq!(stopped.event.as_deref(), Some("stopped"));
+                assert_eq!(stopped.outcome, "transport_error");
+                assert_eq!(stopped.reply.http_status, None);
+            } else {
+                // The initial request still holds the transport lock. The
+                // bounded shutdown cancels it rather than inventing a reply.
+                assert_eq!(entries.len(), 1);
+            }
+            let record = &starts[0].announce;
             assert_eq!(record.outcome, expected);
             assert_eq!(record.reply.http_status, status);
             assert_eq!(record.request_transmitted, status.map(|_| true));
             assert_eq!(record.sent.downloaded, 0);
             assert_eq!(record.sent.left, 1);
-            let json = serde_json::to_string(&entries[0]).unwrap();
+            let json = serde_json::to_string(&entries).unwrap();
             assert!(!json.contains("secret"));
             assert!(!json.contains("private-path"));
             if expected == "tracker_failure" {
