@@ -218,7 +218,7 @@ class Desktop:
             return False
         crop = self.report / "done-ocr.png"
         geometry = f"150x24+{header[0] - 28}+{header[1] + 9}"
-        subprocess.run(["convert", str(self.report / "current.png"), "-crop", geometry, "+repage", "-channel", "R", "-separate", "-threshold", "45%", "-negate", "-resize", "400%", "-bordercolor", "white", "-border", "12", str(crop)], check=True, timeout=10)
+        subprocess.run(["convert", str(self.report / "current.png"), "-crop", geometry, "+repage", "-channel", "R", "-separate", "+channel", "-threshold", "45%", "-negate", "-resize", "400%", "-bordercolor", "white", "-border", "12", str(crop)], check=True, timeout=10)
         result = subprocess.run(["tesseract", str(crop), "stdout", "--psm", "7"], capture_output=True, check=True, timeout=15)
         (self.report / "done-ocr.txt").write_bytes(result.stdout)
         return self.normalize(result.stdout.decode()) == "done"
