@@ -126,6 +126,97 @@ impl Drop for CheckedFixture {
 }
 
 #[test]
+fn preexisting_seed_reports_stopped_on_pause_and_remove_without_completed() {
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    struct TrackerGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+    impl Drop for TrackerGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let tracker_url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let _tracker = TrackerGuard(
+        stop,
+        Some(thread::spawn(move || {
+            super::multi_peer_tests::serve_tracker(listener, vec![], worker_stop).unwrap();
+        })),
+    );
+    let fixture = CheckedFixture::with_tracker(Some(tracker_url));
+    let journal = fixture.runtime().journal.clone();
+    assert!(
+        journal.entries(None).is_empty(),
+        "an initially paused torrent must not announce"
+    );
+    for expected in 1..=2 {
+        fixture
+            .runtime()
+            .try_send(SessionCommand::Resume {
+                id: fixture.id.clone(),
+            })
+            .unwrap();
+        fixture.wait_for(|_| {
+            journal
+                .entries(None)
+                .iter()
+                .filter(|e| {
+                    e.announce.event.as_deref() == Some("started") && e.announce.outcome == "ok"
+                })
+                .count()
+                >= expected
+        });
+        let command = if expected == 1 {
+            SessionCommand::Pause {
+                id: fixture.id.clone(),
+            }
+        } else {
+            SessionCommand::Remove {
+                id: fixture.id.clone(),
+            }
+        };
+        fixture.runtime().try_send(command).unwrap();
+        fixture.wait_for(|e| {
+            if expected == 1 {
+                matches!(
+                    e,
+                    SessionEvent::StateChanged {
+                        state: "paused",
+                        ..
+                    }
+                )
+            } else {
+                matches!(e, SessionEvent::Removed { .. })
+            }
+        });
+        let entries = journal.entries(None);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.announce.event.as_deref() == Some("stopped")
+                    && e.announce.outcome == "ok")
+                .count(),
+            expected
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.announce.event.as_deref() != Some("completed"))
+        );
+        assert_eq!(
+            entries.last().unwrap().announce.event.as_deref(),
+            Some("stopped")
+        );
+    }
+}
+
+#[test]
 fn every_mode_transition_preserves_paused_payload_and_rejects_invalid_threshold() {
     let fixture = CheckedFixture::new();
     for from in DownloadMode::ALL {

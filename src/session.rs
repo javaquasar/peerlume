@@ -388,7 +388,7 @@ impl SessionRuntime {
                                         if let Some(budget) = repairs.get(&id) { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Checking { attempt: budget.used, limit: controls::repair_policy(added_commands.get(&id)).max_attempts } }); }
                                         let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                         let resume = !matches!(stats.state, TorrentStatsState::Paused);
-                                        match restart_for_check(&session, &handle, &added_commands[&id], &counters, storage_roots.get(&id)).await {
+                                        match restart_for_check(&session, &handle, &added_commands[&id], session_peer_id.0, &counters, storage_roots.get(&id)).await {
                                             Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id, CheckRun { resume, require_complete: true }); }
                                             Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
                                         }
@@ -438,7 +438,7 @@ impl SessionRuntime {
                                     transfers(handle.info_hash().0);
                                     let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                     let Some(saved) = added_commands.get(id) else { continue; };
-                                    match restart_for_check(&session, &handle, saved, &counters, storage_roots.get(id)).await {
+                                    match restart_for_check(&session, &handle, saved, session_peer_id.0, &counters, storage_roots.get(id)).await {
                                         Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.send(SessionEvent::Added { id: id.clone() }); }
                                         Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
                                     }
@@ -551,6 +551,7 @@ impl SessionRuntime {
                                         let result = if let Some(handle) = torrents.get(&id) {
                                             transfers(handle.info_hash().0);
                                             let final_sample = final_transfer_sampler(handle, &counters);
+                                            librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, session_peer_id.0).await;
                                             let result = session.pause(handle).await.map_err(|error| format!("{error:#}"));
                                             final_sample();
                                             result
@@ -582,12 +583,16 @@ impl SessionRuntime {
                                     SessionCommand::Remove { id } => {
                                         let result = if let Some(handle) = torrents.get(&id).cloned() {
                                             let final_sample = final_transfer_sampler(&handle, &counters);
+                                            librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, session_peer_id.0).await;
                                             let result = session
                                                 .delete(handle.id().into(), false)
                                                 .await
                                                 .map_err(|error| format!("{error:#}"));
                                             final_sample();
-                                            if result.is_ok() { counters.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle.info_hash().0); }
+                                            if result.is_ok() {
+                                                counters.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle.info_hash().0);
+                                                librqbit_tracker_comms::forget_torrent_lifecycle(handle.info_hash().0, session_peer_id.0);
+                                            }
                                             result
                                         } else {
                                             Err("Torrent is not registered in the transfer engine".into())
@@ -617,6 +622,7 @@ impl SessionRuntime {
                                     }
                                     SessionCommand::Shutdown => {
                                         let final_samples: Vec<_> = torrents.values().map(|h| final_transfer_sampler(h, &counters)).collect();
+                                        librqbit_tracker_comms::stop_session_announces(session_peer_id.0).await;
                                         session.stop().await;
                                         for sample in final_samples { sample(); }
                                         reporting_policies.clear();
@@ -1215,6 +1221,33 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         runtime.shutdown().unwrap();
+        let entries = journal.entries(Some(&info_hash));
+        let completed = entries
+            .iter()
+            .filter(|entry| {
+                entry.announce.event.as_deref() == Some("completed")
+                    && entry.announce.outcome == "ok"
+            })
+            .count();
+        if mode == DownloadMode::Normal {
+            assert_eq!(
+                completed, 1,
+                "a fresh download must report completed exactly once"
+            );
+        }
+        if mode == DownloadMode::NoProgress {
+            assert_eq!(
+                completed, 0,
+                "no-progress must continue suppressing completed"
+            );
+        }
+        let last = &entries.last().unwrap().announce;
+        assert_eq!(last.event.as_deref(), Some("stopped"));
+        assert_eq!(
+            last.outcome, "ok",
+            "shutdown must wait for the real tracker reply"
+        );
+        assert_eq!(last.mode, mode.id());
         stop.store(true, Ordering::Relaxed);
         tracker_thread.join().unwrap();
         peer_thread.join().unwrap();

@@ -12,8 +12,9 @@ use crate::{
 };
 use sha1::{Digest, Sha1};
 use std::{
+    collections::HashMap,
     fs,
-    io::{Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -568,6 +569,34 @@ fn reliability_continuous_session_soak() {
         .export(&destination.parent().unwrap().join("announces.jsonl"), None)
         .unwrap();
     assert!(exported_announces > 0);
+    // Validate the complete disk export, not the bounded live journal tail:
+    // the initial completion may be hours older than the retained UI entries.
+    let mut lifecycle = HashMap::<String, (usize, usize, Option<String>)>::new();
+    for line in BufReader::new(
+        fs::File::open(destination.parent().unwrap().join("announces.jsonl")).unwrap(),
+    )
+    .lines()
+    {
+        let entry: crate::announce_journal::JournalEntry =
+            serde_json::from_str(&line.unwrap()).unwrap();
+        let announce = entry.announce;
+        assert_eq!(announce.outcome, "ok");
+        let summary = lifecycle.entry(announce.info_hash).or_default();
+        summary.0 += usize::from(announce.event.as_deref() == Some("completed"));
+        summary.1 += usize::from(announce.event.as_deref() == Some("stopped"));
+        summary.2 = announce.event;
+    }
+    let main_lifecycle = &lifecycle[id.strip_prefix("v1: ").unwrap()];
+    let anchor_lifecycle = &lifecycle[anchor_id.strip_prefix("v1: ").unwrap()];
+    assert_eq!(main_lifecycle.0, usize::from(mode == DownloadMode::Normal));
+    assert_eq!(
+        anchor_lifecycle.0, 0,
+        "pre-existing seed must not announce completed"
+    );
+    for summary in [main_lifecycle, anchor_lifecycle] {
+        assert!(summary.1 > 0);
+        assert_eq!(summary.2.as_deref(), Some("stopped"));
+    }
     record(
         &report,
         serde_json::json!({"kind":"result","completed":true,"workload":"continuous_session",
@@ -575,7 +604,9 @@ fn reliability_continuous_session_soak() {
         "session_starts":1,"session_identity_unchanged":true,"fixed_torrents":2,"permanent_seeding_connections":1,
         "mode":mode.id(),"checked_announces":checked_announces,"exported_announces":exported_announces,
         "sampled_peaks":peaks,"network_downloaded_bytes":totals.0,"network_uploaded_bytes":totals.1,
-        "activity":proof.snapshot(),"clean_shutdown":true}),
+        "activity":proof.snapshot(),"clean_shutdown":true,
+        "main_completed_announces":main_lifecycle.0,"main_stopped_announces":main_lifecycle.1,
+        "anchor_completed_announces":anchor_lifecycle.0,"anchor_stopped_announces":anchor_lifecycle.1}),
     );
 }
 

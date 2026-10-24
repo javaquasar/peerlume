@@ -24,6 +24,7 @@ pub(super) async fn apply_mode(
     let resume = matches!(handle.stats().state, TorrentStatsState::Live);
     if resume {
         let sample = final_transfer_sampler(handle, counters);
+        librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, peer_id).await;
         let result = session.pause(handle).await;
         sample();
         result.map_err(|_| "Could not pause the torrent to apply the mode".to_owned())?;

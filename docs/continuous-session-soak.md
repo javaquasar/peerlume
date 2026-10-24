@@ -37,6 +37,23 @@ modes in addition to ordinary regressions. The no-progress variant must preserve
 zero sent upload/download counters, full-size `left`, and no `completed` announce
 while actual download, upload and repair still take place.
 
+Both HTTP and UDP tracker workers use the same lifecycle rules. A new full
+download reports `completed` once per tracker; pre-existing complete files,
+partial selections and subsequent repair/recheck generations do not create a
+new completion. Pause, removal, mode replacement, recheck and orderly application
+shutdown flush real `stopped` requests before the engine cancels its peer stream.
+An earned completion is flushed first if it has not yet been acknowledged.
+Reporting modes still transform these requests; `no_progress` and a frozen
+nonzero `left` suppress `completed`.
+
+Lifecycle requests do not wait for the tracker's regular announce interval or
+for peer-stream backpressure. Stop flushing is best-effort: concurrent trackers
+share a five-second deadline, with at most two seconds per final request.
+Unreachable trackers can therefore leave failed/cancelled attempts rather than
+successful `stopped` records; abrupt process termination cannot guarantee delivery.
+Journal records always describe actual attempts and responses, not synthetic
+UI-generated completion or stop entries.
+
 Start one four-hour run of the manual Continuous session soak workflow:
 
 ```powershell
@@ -58,7 +75,12 @@ The `continuous-session-soak` artifact contains `resources.jsonl` and a complete
 - initial-download evidence and per-cycle damaged-piece indices, fetched bytes,
   repair transitions, retained identities, reporting mode and controller snapshots;
 - a final result only after successful workload completion, fixture shutdown,
-  engine shutdown and journal export.
+  engine shutdown and journal export, including completion/stop counts.
+
+The complete exported journal must contain exactly one successful main-torrent
+`completed` in normal mode (zero in no-progress mode), no completion for the
+pre-existing control seed, and a final successful `stopped` for each torrent.
+The check reads the full export rather than the bounded live UI journal.
 
 After three warmup cycles, idle and sampled-peak growth budgets are 192 MiB RSS,
 32 threads and 64 handles. SQLite files are bounded to 32 MiB; journal and resource

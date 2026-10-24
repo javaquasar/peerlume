@@ -63,7 +63,13 @@ pub type TransferMetricsProvider = Arc<dyn Fn([u8; 20]) -> TransferSnapshot + Se
 pub(crate) struct Hooks {
     pub observer: Observer,
     pub transfers: TransferMetricsProvider,
+    pub completions: CompletionHistory,
 }
+pub(crate) struct CompletionState {
+    pub baseline: Option<u64>,
+    pub settled: bool,
+}
+type CompletionHistory = Arc<Mutex<HashMap<([u8; 20], String), Arc<Mutex<CompletionState>>>>>;
 static HOOKS: LazyLock<Mutex<HashMap<[u8; 20], Hooks>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 pub struct ObservationRegistration([u8; 20]);
@@ -89,6 +95,7 @@ pub fn register_observer(
         Hooks {
             observer,
             transfers,
+            completions: Default::default(),
         },
     );
     Ok(ObservationRegistration(peer_id))

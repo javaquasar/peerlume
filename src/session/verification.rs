@@ -9,6 +9,7 @@ pub(super) async fn restart_for_check(
     session: &Arc<Session>,
     handle: &Arc<ManagedTorrent>,
     saved: &SessionCommand,
+    peer_id: [u8; 20],
     counters: &Arc<std::sync::Mutex<HashMap<[u8; 20], TransferCounter>>>,
     root: Option<&crate::storage::sandbox::Directory>,
 ) -> Result<Arc<ManagedTorrent>, String> {
@@ -31,6 +32,7 @@ pub(super) async fn restart_for_check(
         .with_metadata(|metadata| metadata.torrent_bytes.clone())
         .map_err(|_| "Torrent metadata is unavailable for verification".to_owned())?;
     let final_sample = final_transfer_sampler(handle, counters);
+    librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, peer_id).await;
     let deleted = session.delete(handle.id().into(), false).await;
     final_sample();
     deleted.map_err(|_| "Could not stop the torrent for verification".to_owned())?;
