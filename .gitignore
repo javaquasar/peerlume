@@ -9,4 +9,5 @@
 /fuzz/artifacts
 /native-results
 /long-soak-results
+/continuous-results
 __pycache__/

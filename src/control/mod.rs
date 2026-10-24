@@ -355,7 +355,9 @@ impl Drop for Controller {
 #[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
-mod soak_tests;
+mod continuous_soak;
+#[cfg(test)]
+pub(crate) mod soak_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

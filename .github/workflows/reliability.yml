@@ -22,6 +22,41 @@ concurrency:
   group: reliability-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  continuous-session:
+    name: Continuous session smoke (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, no_progress]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-continuous-session-${{ hashFiles('Cargo.lock','**/Cargo.toml') }}
+      - name: Download, seed and repair without replacing the engine
+        env:
+          PEERLUME_SOAK_SECONDS: '90'
+          PEERLUME_SOAK_MODE: ${{ matrix.mode }}
+        run: |
+          mkdir -p continuous-results
+          export PEERLUME_SOAK_REPORT="$PWD/continuous-results/resources.jsonl"
+          cargo +stable test --locked --no-default-features --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: continuous-session-smoke-${{ matrix.mode }}
+          path: continuous-results/
+          if-no-files-found: warn
+          retention-days: 14
   native-window:
     name: Native X11 window and real peer repair
     runs-on: ubuntu-latest

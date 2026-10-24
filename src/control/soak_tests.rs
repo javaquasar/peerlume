@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Report = Arc<Mutex<std::fs::File>>;
-fn record(report: &Report, value: serde_json::Value) {
+pub(crate) type Report = Arc<Mutex<std::fs::File>>;
+pub(crate) fn record(report: &Report, value: serde_json::Value) {
     let mut file = report.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         file.metadata().unwrap().len() < 128 * 1024 * 1024,
@@ -17,15 +17,23 @@ fn record(report: &Report, value: serde_json::Value) {
     writeln!(file, "{value}").unwrap();
     file.flush().unwrap();
 }
-struct Sampler {
+pub(crate) struct Sampler {
     stop: std::sync::mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
     peaks: Arc<[AtomicU64; 3]>,
-    cycle: Arc<AtomicU64>,
-    latency: Arc<AtomicU64>,
+    pub(crate) cycle: Arc<AtomicU64>,
+    pub(crate) latency: Arc<AtomicU64>,
 }
 impl Sampler {
-    fn start(report: Report, profile: std::path::PathBuf, start: Instant) -> Self {
+    pub(crate) fn start(report: Report, profile: std::path::PathBuf, start: Instant) -> Self {
+        Self::with_activity(report, profile, start, || serde_json::Value::Null)
+    }
+    pub(crate) fn with_activity(
+        report: Report,
+        profile: std::path::PathBuf,
+        start: Instant,
+        activity: impl Fn() -> serde_json::Value + Send + 'static,
+    ) -> Self {
         let (stop, rx) = std::sync::mpsc::channel();
         let peaks = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let cycle = Arc::new(AtomicU64::new(0));
@@ -37,8 +45,8 @@ impl Sampler {
             loop {
                 let sample=resources();
                 for (index,value) in [sample.0,sample.1,sample.2].into_iter().enumerate(){observed[index].fetch_max(value,Ordering::Relaxed);}
-                let disk=std::fs::read_dir(&profile).unwrap().filter_map(Result::ok).filter_map(|e|e.metadata().ok()).filter(|m|m.is_file()).map(|m|m.len()).sum::<u64>();
-                record(&report,serde_json::json!({"kind":"periodic","elapsed_ms":start.elapsed().as_millis(),"cycle":observed_cycle.load(Ordering::Relaxed),"rss_bytes":sample.0,"threads":sample.1,"open_handles":sample.2,"profile_bytes":disk,"ipc_latency_us":observed_latency.load(Ordering::Relaxed)}));
+                let (disk,database,journal)=disk_sizes(&profile);
+                record(&report,serde_json::json!({"kind":"periodic","elapsed_ms":start.elapsed().as_millis(),"cycle":observed_cycle.load(Ordering::Relaxed),"rss_bytes":sample.0,"threads":sample.1,"open_handles":sample.2,"profile_bytes":disk,"database_bytes":database,"journal_bytes":journal,"ipc_latency_us":observed_latency.load(Ordering::Relaxed),"activity":activity()}));
                 match rx.recv_timeout(Duration::from_secs(1)){Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{},_=>break}
             }
         }).unwrap();
@@ -50,7 +58,7 @@ impl Sampler {
             latency,
         }
     }
-    fn peaks(&self) -> [u64; 3] {
+    pub(crate) fn peaks(&self) -> [u64; 3] {
         std::array::from_fn(|index| self.peaks[index].load(Ordering::Relaxed))
     }
 }
@@ -188,7 +196,7 @@ fn reliability_resource_soak() {
 }
 
 #[cfg(target_os = "linux")]
-fn resources() -> (u64, u64, u64) {
+pub(crate) fn resources() -> (u64, u64, u64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let value = |name: &str| -> u64 {
         status
@@ -208,6 +216,42 @@ fn resources() -> (u64, u64, u64) {
     )
 }
 #[cfg(not(target_os = "linux"))]
-fn resources() -> (u64, u64, u64) {
+pub(crate) fn resources() -> (u64, u64, u64) {
     panic!("Resource soak measurement is supported on Linux only")
+}
+
+pub(crate) fn disk_sizes(profile: &std::path::Path) -> (u64, u64, u64) {
+    let mut total = 0;
+    let mut database = 0;
+    for entry in std::fs::read_dir(profile).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let length = entry.metadata().unwrap().len();
+            total += length;
+            if entry.file_name().to_string_lossy().contains(".sqlite3") {
+                database += length;
+            }
+        }
+    }
+    let journal = std::fs::read_dir(profile.join("announce-logs"))
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_type().unwrap().is_file())
+                .map(|e| e.metadata().unwrap().len())
+                .sum()
+        })
+        .unwrap_or(0);
+    (total, database, journal)
+}
+
+#[test]
+fn disk_samples_separate_database_journal_and_other_profile_files() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("state.sqlite3"), [0; 7]).unwrap();
+    std::fs::write(root.path().join("state.sqlite3-wal"), [0; 3]).unwrap();
+    std::fs::write(root.path().join("settings.toml"), [0; 2]).unwrap();
+    std::fs::create_dir(root.path().join("announce-logs")).unwrap();
+    std::fs::write(root.path().join("announce-logs/one.jsonl"), [0; 11]).unwrap();
+    assert_eq!(disk_sizes(root.path()), (12, 10, 11));
 }

@@ -329,6 +329,12 @@ runs combined into a nominal day. GitHub-hosted jobs have a six-hour execution
 limit, so they cannot complete this gate. Both variants publish JSONL artifacts;
 a successful short run does not close the 24-hour gate.
 
+The separate [Continuous session soak](docs/continuous-session-soak.md) holds one
+real engine and two fixed torrents alive, proves sustained upload over a single
+permanent TCP connection, and repeatedly corrupts/refetches pieces of the primary
+torrent. Reliability CI runs short normal/no-progress variants; its manual
+workflow supports one four-hour experiment and exports resource and announce JSONL.
+
 Linux persists private tracker credentials in the current user's Secret Service;
 the service must be available and unlocked. Windows retains current-user DPAPI.
 An unavailable provider fails explicitly without a plaintext fallback. Existing

@@ -392,6 +392,11 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
 
 impl ClientBackend {
     #[cfg(test)]
+    pub(crate) fn test_engine(&self) -> Option<std::sync::Arc<librqbit::Session>> {
+        self.session_runtime.as_ref()?.test_engine()
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_session_and_store(runtime: SessionRuntime, store: StateStore) -> Self {
         let mut backend = Self::with_session(runtime);
         backend.state_store = Some(store);

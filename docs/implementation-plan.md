@@ -90,8 +90,11 @@ pass for `f104d04`: Linux core/TUI coverage is 88.438% of lines and 80% of
 functions. Native-window success additionally requires both GUI processes to
 exit cleanly; destroying the X11 surface is not a successful shutdown.
 A [four-hour hosted workload](https://github.com/javaquasar/peerlume/actions/runs/40082042583)
-was dispatched for the same source revision. Its final JSONL success record,
-not dispatch or a green smoke run, establishes completion of that experiment.
+completed for the same source revision: 14,406.389 seconds, 1,710 cycles and
+14,401 periodic samples, with a final JSONL success record. That workload used
+separate transfer/repair sessions and does not establish sustained activity in
+one engine. The [continuous session experiment](continuous-session-soak.md)
+adds that distinct gate; its own completed-run evidence is required.
 
 - REL 1: implemented hot/archive retention with a 512-record hot set and a
   100,000-record archive. Tests run 1,536 sequential operations and check archived
@@ -105,7 +108,12 @@ not dispatch or a green smoke run, establishes completion of that experiment.
   sampled peaks. The separate Long soak workflow supports four hosted hours or
   one continuous 24-hour process on an existing trusted Linux self-hosted runner.
   Reports require a final success record. Allocation profiling, sustained churn
-  within one swarm and a completed 24-hour run remain release gates.
+  within one swarm and a completed 24-hour run remain release gates. A separate
+  continuous-session workload now keeps two fixed torrents and one permanent
+  seeding connection inside one engine, rotates corrupt pieces, checks actual
+  upload/refetch and retains normal/no-progress reporting through repair. Short
+  variants run in Reliability and Coverage CI; the manual workflow supports four
+  hours and requires its own final success record.
 - REL 3: added completion/ETA/ratio, blocklist corruption and legacy-header,
   settings, operation quota, missing-credential and startup-recovery regressions.
   Fixed legacy cache allocation before validation and rejected non-finite enabled

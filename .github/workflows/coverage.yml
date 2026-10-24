@@ -53,6 +53,15 @@ jobs:
         run: |
           export PEERLUME_CONTROL_BIN="$PWD/target/coverage-build/llvm-cov-target/debug/peerlume-control"
           cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
+      - name: Include continuous-session download, seeding and repair
+        run: |
+          for mode in normal no_progress; do
+            mkdir -p "coverage/continuous-$mode"
+            export PEERLUME_SOAK_SECONDS=60
+            export PEERLUME_SOAK_MODE="$mode"
+            export PEERLUME_SOAK_REPORT="$PWD/coverage/continuous-$mode/resources.jsonl"
+            cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
+          done
       - name: Generate LCOV and HTML reports without rerunning tests
         run: |
           cargo +stable llvm-cov report --json --summary-only --output-path coverage/summary.json
