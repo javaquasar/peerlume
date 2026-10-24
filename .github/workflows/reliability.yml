@@ -132,9 +132,12 @@ jobs:
           seconds="${REQUESTED_SECONDS:-10}"
           if [ "$EVENT_NAME" = schedule ]; then seconds=600; fi
           [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 10 && seconds <= 1800 )) || exit 2
+          cargo +nightly-2026-10-01 fetch --locked --manifest-path fuzz/Cargo.toml
+          export CARGO_NET_OFFLINE=true
           for target in metainfo blocklist wire peer tracker; do
-            cargo +nightly-2026-10-01 fuzz run "$target" --locked -- -max_total_time="$seconds" -max_len=65536 -rss_limit_mb=1024 -timeout=5
+            cargo +nightly-2026-10-01 fuzz run "$target" -- -max_total_time="$seconds" -max_len=65536 -rss_limit_mb=1024 -timeout=5
           done
+          git diff --exit-code -- fuzz/Cargo.lock
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:

@@ -328,3 +328,20 @@ fn unresolved_operations_are_never_archived_to_make_room() {
     );
     assert_eq!(store.list().unwrap().len(), MAX_OPERATIONS);
 }
+
+#[test]
+fn archive_quota_failure_preserves_every_hot_result_and_key() {
+    let store = store();
+    for index in 0..MAX_OPERATIONS {
+        let mut op = create(&store, &format!("quota-{index}"));
+        op.state = OperationState::Failed;
+        store.save(&op).unwrap();
+    }
+    assert_eq!(
+        store.archive_completed(MAX_OPERATIONS - 1),
+        Err(ErrorCode::Busy)
+    );
+    assert_eq!(store.list().unwrap().len(), MAX_OPERATIONS);
+    assert_eq!(store.page("client", 0, 1).unwrap().1, MAX_OPERATIONS);
+    assert!(store.lookup("client", "quota-0").unwrap().is_some());
+}

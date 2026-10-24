@@ -523,7 +523,9 @@ impl ClientSettings {
                 "peer ID prefix must contain 1 to 8 printable ASCII bytes",
             );
         }
-        if self.seeding.ratio_limit_enabled && self.seeding.ratio_limit <= 0.0 {
+        if self.seeding.ratio_limit_enabled
+            && (!self.seeding.ratio_limit.is_finite() || self.seeding.ratio_limit <= 0.0)
+        {
             push("seeding.ratio_limit", "must be greater than zero");
         }
         if self.seeding.upload_slots_per_torrent == 0 {
@@ -659,6 +661,78 @@ fn settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ratio_validation_rejects_non_finite_and_non_positive_limits() {
+        let mut s = ClientSettings::default();
+        s.seeding.ratio_limit_enabled = true;
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            s.seeding.ratio_limit = ratio;
+            assert!(
+                s.validate()
+                    .iter()
+                    .any(|issue| issue.field == "seeding.ratio_limit")
+            );
+        }
+        s.seeding.ratio_limit = 0.1;
+        assert!(s.validate().is_empty());
+    }
+
+    #[test]
+    fn optional_paths_are_required_only_when_their_features_are_enabled() {
+        let mut s = ClientSettings::default();
+        s.download.incomplete_directory.clear();
+        s.storage.completed_directory.clear();
+        s.automation.watch_directory.clear();
+        s.automation.backup_directory.clear();
+        assert!(s.validate().is_empty());
+        s.download.incomplete_directory_enabled = true;
+        s.storage.move_completed = true;
+        s.automation.watch_directory_enabled = true;
+        s.automation.backup_torrents_enabled = true;
+        let fields: Vec<_> = s.validate().into_iter().map(|i| i.field).collect();
+        for field in [
+            "download.incomplete_directory",
+            "storage.completed_directory",
+            "automation.watch_directory",
+            "automation.backup_directory",
+        ] {
+            assert!(fields.contains(&field));
+        }
+    }
+
+    #[test]
+    fn request_schedule_connection_and_upload_boundaries_are_validated() {
+        let mut s = ClientSettings::default();
+        s.queue.max_active_downloads = 0;
+        s.queue.max_active_checks = 0;
+        s.speed.schedule_begin_minutes = 1440;
+        s.speed.schedule_enabled = true;
+        s.speed.schedule_days = 0;
+        s.connection.connection_timeout_seconds = 0;
+        s.connection.proxy_url = "file:///not-a-proxy".into();
+        s.bittorrent.max_outstanding_requests = 0;
+        s.seeding.upload_slots_per_torrent = 0;
+        let fields: Vec<_> = s.validate().into_iter().map(|i| i.field).collect();
+        for field in [
+            "queue.max_active_downloads",
+            "queue.max_active_checks",
+            "speed.schedule",
+            "speed.schedule_days",
+            "connection.connection_timeout_seconds",
+            "connection.proxy_url",
+            "bittorrent.max_outstanding_requests",
+            "seeding.upload_slots_per_torrent",
+        ] {
+            assert!(fields.contains(&field), "{field}");
+        }
+        s.queue.enabled = false;
+        assert!(
+            !s.validate()
+                .iter()
+                .any(|i| i.field == "queue.max_active_downloads")
+        );
+    }
 
     #[test]
     fn current_settings_round_trip_through_toml() {

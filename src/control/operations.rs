@@ -153,7 +153,7 @@ impl ControlStore {
         if self.lookup(client, key)?.is_some() {
             return Err(ErrorCode::IdempotencyConflict);
         }
-        self.archive_completed()?;
+        self.archive_completed(MAX_ARCHIVED_OPERATIONS)?;
         if self.list()?.len() >= MAX_OPERATIONS {
             return Err(ErrorCode::Busy);
         }
@@ -174,7 +174,7 @@ impl ControlStore {
         Ok(op)
     }
 
-    fn archive_completed(&self) -> Result<(), ErrorCode> {
+    fn archive_completed(&self, capacity: usize) -> Result<(), ErrorCode> {
         let current = self.list()?;
         // Keep recent results hot until the working set reaches its bound.
         if current.len() < MAX_OPERATIONS {
@@ -201,7 +201,7 @@ impl ControlStore {
                 r.get(0)
             })
             .map_err(|_| ErrorCode::PersistenceUnavailable)?;
-        if count.saturating_add(terminal.len() as i64) > MAX_ARCHIVED_OPERATIONS as i64 {
+        if count.saturating_add(terminal.len() as i64) > capacity as i64 {
             return Err(ErrorCode::Busy);
         }
         for op in terminal {

@@ -448,7 +448,7 @@ impl Default for PeerLumeApp {
             settings.privacy.blocklist_enabled && settings.privacy.blocklist_auto_update;
         let update_url = settings.privacy.blocklist_url.clone();
         let backend = ClientBackend::start(&settings);
-        let restored_records = backend.load_torrents().unwrap_or_default();
+        let (restored_records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = restored_records
             .iter()
             .map(|record| {
@@ -495,7 +495,7 @@ impl Default for PeerLumeApp {
             add_dialog: None,
             last_download_directory: None,
             pending_torrent_paths: VecDeque::new(),
-            add_status: String::new(),
+            add_status: restore_status.unwrap_or_default().into(),
             magnet_input: String::new(),
             control: Controller::new(backend, torrents),
             tracker_audits,

@@ -443,6 +443,19 @@ impl ClientBackend {
         )
     }
 
+    /// Shared startup presentation: a restore failure must not look like an empty profile.
+    pub fn restore_for_frontend(&self) -> (Vec<TorrentRecord>, Option<&'static str>) {
+        match self.load_torrents() {
+            Ok(records) => (records, None),
+            Err(_) => (
+                Vec::new(),
+                Some(
+                    "Could not restore downloads. Unlock the OS credential store and restart; legacy missing tracker credentials require the original URL. The saved database has not been cleared.",
+                ),
+            ),
+        }
+    }
+
     pub fn save_torrent(&mut self, torrent: &TorrentRecord) -> Result<(), String> {
         self.state_store.as_mut().map_or_else(
             || Ok(()),
@@ -501,6 +514,48 @@ impl ClientBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn restore_failure_has_one_redacted_frontend_message_without_erasing_records() {
+        struct Switch {
+            memory: crate::secrets::MemorySecrets,
+            locked: std::sync::atomic::AtomicBool,
+        }
+        impl crate::secrets::TrackerSecrets for Switch {
+            fn protect(&self, v: &str) -> Result<Vec<u8>, crate::secrets::SecretUnavailable> {
+                self.memory.protect(v)
+            }
+            fn restore(&self, v: &[u8]) -> Result<String, crate::secrets::SecretUnavailable> {
+                if self.locked.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(crate::secrets::SecretUnavailable)
+                } else {
+                    self.memory.restore(v)
+                }
+            }
+        }
+        let provider = std::sync::Arc::new(Switch {
+            memory: Default::default(),
+            locked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut store = StateStore::in_memory_with_secrets(provider.clone()).unwrap();
+        let mut record = torrent_to_record(&torrent(), None);
+        record.trackers = vec!["https://tracker.test/announce?token=SYNTHETIC_SECRET".into()];
+        store.save_torrent(&record).unwrap();
+        let backend = ClientBackend::with_state_store(store);
+        assert!(backend.restore_for_frontend().1.is_none());
+        provider
+            .locked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (rows, status) = backend.restore_for_frontend();
+        assert!(rows.is_empty());
+        let status = status.unwrap();
+        assert!(status.contains("has not been cleared"));
+        assert!(!status.contains("SYNTHETIC_SECRET"));
+        provider
+            .locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(backend.restore_for_frontend().0.len(), 1);
+    }
 
     fn completion_stats(finished: bool, paused: bool) -> SessionEvent {
         SessionEvent::Stats {

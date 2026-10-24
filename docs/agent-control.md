@@ -182,9 +182,9 @@ polling; observed and owner completion agree.
 
 All six AGENT tracks have implementation slices, not unconditional release-gate
 closure. Remaining work includes full GUI/TUI visual E2E coverage with an external
-agent, atomic handle-relative filesystem hardening, typed IPC push subscriptions
-(latest-value polling is implemented), paged archived diagnostics, automatic safe
-operation retention, cancellation of already-running engine work, final removal
+agent, backend payload handle integration, typed IPC push subscriptions
+(latest-value polling is implemented), paged archived diagnostics,
+cancellation of already-running engine work, final removal
 of legacy preference/audit model access, signed installer/discovery integration,
 and a separately designed payload-deletion approval workflow. Operation archiving,
 rendered frontend/external-agent workflows and pinned import/export opens now have

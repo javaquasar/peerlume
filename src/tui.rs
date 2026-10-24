@@ -99,7 +99,7 @@ impl TuiApp {
     pub fn load() -> Self {
         let settings = ClientSettings::load();
         let backend = ClientBackend::start(&settings);
-        let records = backend.load_torrents().unwrap_or_default();
+        let (records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = records
             .iter()
             .filter_map(|record| {
@@ -116,7 +116,11 @@ impl TuiApp {
         for torrent in &torrents {
             let _ = backend.send(add_torrent_command(torrent, &settings));
         }
-        Self::from_parts(settings, backend, torrents, tracker_audits)
+        let mut app = Self::from_parts(settings, backend, torrents, tracker_audits);
+        if let Some(status) = restore_status {
+            app.status = status.into();
+        }
+        app
     }
 
     fn from_parts(

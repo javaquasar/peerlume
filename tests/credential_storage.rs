@@ -75,6 +75,19 @@ fn real_linux_secret_service_round_trip() {
         PlatformSecrets.restore(&reference).unwrap(),
         "https://tracker.test/announce?passkey=CI_SYNTHETIC_ONLY"
     );
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state.sqlite3");
+    let mut value = record();
+    value.trackers = vec!["https://tracker.test/announce?passkey=CI_SYNTHETIC_ONLY".into()];
+    let mut store = StateStore::open(&path).unwrap();
+    store.save_torrent(&value).unwrap();
+    drop(store);
+    let store = StateStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_torrent(&value.id).unwrap().unwrap().trackers,
+        value.trackers
+    );
+    drop(store);
     let key = std::str::from_utf8(&reference).unwrap();
     keyring::Entry::new("PeerLume tracker credentials", key)
         .unwrap()
