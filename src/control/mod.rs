@@ -11,6 +11,7 @@ pub mod adapters;
 pub mod agent;
 mod commands;
 mod export;
+mod filesystem;
 #[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) mod frontends;
 pub mod host;
@@ -329,6 +330,8 @@ impl Drop for Controller {
 
 #[cfg(test)]
 mod agent_tests;
+#[cfg(test)]
+mod soak_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

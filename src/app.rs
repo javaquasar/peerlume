@@ -3283,6 +3283,39 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "installed frontend workflow; Reliability CI supplies the copied adapter"]
+    fn reliability_installed_frontend_workflow_egui() {
+        crate::control::test_support::installed_frontend_workflow(
+            |control, command| {
+                let id = control.torrents[0].info_hashes.join(";");
+                assert_eq!(
+                    PeerLumeApp::submit_torrent_commands(control, &id, vec![command]).unwrap(),
+                    COMMAND_ACCEPTED
+                );
+            },
+            |control| {
+                let torrent = &control.torrents[0];
+                let context = egui::Context::default();
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1600.0, 1000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show_runtime_status(ui, torrent, None);
+                        });
+                    },
+                );
+                assert!(!output.shapes.is_empty());
+            },
+        );
+    }
+
+    #[test]
     fn egui_dispatch_distinguishes_acceptance_from_application_and_reports_rejection() {
         let mut control = Controller::new(
             ClientBackend::offline(),

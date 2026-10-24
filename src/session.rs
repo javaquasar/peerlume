@@ -773,6 +773,12 @@ mod multi_peer_tests;
 mod verification_tests;
 
 #[cfg(test)]
+pub(crate) fn reliability_transfer_cycle() {
+    multi_peer_tests::different_torrents_are_verified_after_parallel_download_before_done();
+    verification_tests::automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_reporting_mode();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

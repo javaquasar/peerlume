@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Read, path::Path};
 
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -27,14 +27,18 @@ impl TorrentMetainfo {
     }
 
     pub fn load_with_limits(path: &Path, limits: &ResourceLimits) -> Result<Self, String> {
-        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+        let file = fs::File::open(path).map_err(|error| error.to_string())?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
         if metadata.len() > limits.max_torrent_bytes {
             return Err(format!(
                 "torrent file is larger than {} MiB",
                 limits.max_torrent_bytes / 1024 / 1024
             ));
         }
-        let bytes = fs::read(path).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(limits.max_torrent_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
         Self::parse_with_limits(&bytes, limits)
     }
 

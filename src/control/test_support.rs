@@ -165,3 +165,155 @@ impl LiveFixture {
         }
     }
 }
+
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub(crate) fn installed_frontend_workflow(
+    mut dispatch: impl FnMut(&mut Controller, TorrentCommand),
+    mut render: impl FnMut(&mut Controller),
+) {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        sync::{Arc, Mutex},
+    };
+    let binary = std::env::var_os("PEERLUME_CONTROL_BIN")
+        .expect("Set PEERLUME_CONTROL_BIN to the built adapter");
+    let mut fixture = LiveFixture::new();
+    let id = fixture.id.clone();
+    let profile = fixture.root.path().to_path_buf();
+    let copied = profile.join(if cfg!(windows) {
+        "installed-control.exe"
+    } else {
+        "installed-control"
+    });
+    std::fs::copy(binary, &copied).unwrap();
+    fixture
+        .controller
+        .configure_agents(&profile, profile.clone())
+        .unwrap();
+    let agent = fixture.controller.agent_access().unwrap();
+    agent.enabled = true;
+    let token = agent
+        .grant(access::Grants {
+            manage: true,
+            reporting: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let instance = agent.instance_id.clone();
+    let owner = Arc::new(Mutex::new(fixture));
+    let lock = host::InstanceLock::acquire(&profile).unwrap();
+    let host = host::Host::start(owner.clone(), |f| &mut f.controller, profile.clone()).unwrap();
+    let cli = |method: wire::Method| -> wire::Response {
+        let mut child = Command::new(&copied)
+            .arg("request")
+            .arg("--profile")
+            .arg(&profile)
+            .env("PEERLUME_CONTROL_TOKEN", &token)
+            .current_dir(&profile)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            serde_json::to_string(&adapters::Input {
+                instance_id: Some(instance.clone()),
+                method
+            })
+            .unwrap()
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let ready = Instant::now();
+    while cli(wire::Method::Discover).error.is_some() {
+        assert!(ready.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for (command, state, persisted) in [
+        (TorrentCommand::Resume, TorrentState::Seeding, "downloading"),
+        (TorrentCommand::Pause, TorrentState::Paused, "paused"),
+    ] {
+        dispatch(&mut owner.lock().unwrap().controller, command);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut f = owner.lock().unwrap();
+            render(&mut f.controller);
+            if f.controller.torrents[0].state == state {
+                assert_eq!(
+                    f.controller.backend.load_torrents().unwrap()[0].state,
+                    persisted
+                );
+                break;
+            }
+            drop(f);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for (index, command) in [
+        TorrentCommand::SetMode(crate::runtime_status::ModeConfig {
+            mode: crate::download_mode::DownloadMode::HideDownloaded,
+            ..Default::default()
+        }),
+        TorrentCommand::Recheck,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = owner
+            .lock()
+            .unwrap()
+            .controller
+            .command_revision(&id)
+            .unwrap();
+        let response = cli(wire::Method::Mutate {
+            torrent_id: id.clone(),
+            expected_revision: revision,
+            command,
+            idempotency_key: format!("frontend-{index}"),
+            deadline_unix_ms: operations::now_ms() + 15000,
+        });
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let operation = response.result.unwrap()["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            render(&mut owner.lock().unwrap().controller);
+            let reply = cli(wire::Method::Operation {
+                operation_id: operation.clone(),
+            });
+            assert!(reply.error.is_none());
+            let value = reply.result.unwrap();
+            if value["state"] == "succeeded" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "operation did not succeed: {value}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    assert!(host.error.lock().unwrap().is_none());
+    drop(host);
+    drop(lock);
+    let fixture = Arc::try_unwrap(owner)
+        .ok()
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .restart();
+    assert_eq!(
+        fixture.controller.torrents[0].overrides.download_mode,
+        crate::download_mode::DownloadMode::HideDownloaded
+    );
+    assert!(fixture.controller.torrents[0].completed_successfully());
+}

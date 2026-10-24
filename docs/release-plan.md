@@ -1,5 +1,9 @@
 # PeerLume release plan
 
+The [reliability implementation plan](implementation-plan.md) is the primary
+implementation order from 2026-10-24. This document retains the broader roadmap
+and historical delivery evidence; it does not supersede the six REL priorities.
+
 This plan takes PeerLume from the current desktop prototype to a production-oriented
 BitTorrent client. Each milestone keeps formatting, strict Clippy, unit, property,
 integration, and container tests green. Network features remain disabled in the UI

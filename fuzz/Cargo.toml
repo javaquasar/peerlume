@@ -9,7 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-peerlume = { path = ".." }
+peerlume = { path = "..", default-features = false }
+
+[patch.crates-io]
+librqbit-tracker-comms = { path = "../vendor/librqbit-tracker-comms" }
 
 [[bin]]
 name = "metainfo"
@@ -20,5 +23,23 @@ doc = false
 [[bin]]
 name = "blocklist"
 path = "fuzz_targets/blocklist.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "peer"
+path = "fuzz_targets/peer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tracker"
+path = "fuzz_targets/tracker.rs"
 test = false
 doc = false

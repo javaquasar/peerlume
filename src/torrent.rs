@@ -3,6 +3,9 @@ use crate::{
     settings::{ClientSettings, PieceStrategy, TrackerReportingMode},
 };
 
+#[cfg(test)]
+mod reliability_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TorrentState {
     Downloading,

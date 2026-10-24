@@ -260,7 +260,7 @@ fn automatic_repair_does_not_override_a_user_paused_integrity_check() {
 }
 
 #[test]
-fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_reporting_mode() {
+pub(super) fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_reporting_mode() {
     use crate::protocol::{HANDSHAKE_LENGTH, Handshake, PeerMessage};
     use std::{
         io::{Read, Write},

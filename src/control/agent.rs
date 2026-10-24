@@ -204,7 +204,8 @@ impl AgentService {
             Method::Discover => Ok(json!({"protocol_version": super::PROTOCOL_VERSION,
                 "capabilities": ["list", "details", "journal", "tracker_peers", "operations", "mutate", "preview", "add", "export"],
                 "grants": client.grants, "limits": {"page_size": MAX_PAGE_SIZE, "request_bytes": super::wire::MAX_REQUEST_BYTES,
-                    "response_bytes": super::wire::MAX_RESPONSE_BYTES, "operation_records": super::wire::MAX_OPERATIONS},
+                    "response_bytes": super::wire::MAX_RESPONSE_BYTES, "operation_records": super::wire::MAX_OPERATIONS,
+                    "archived_operation_records": super::operations::MAX_ARCHIVED_OPERATIONS},
                 "units": {"bytes": "bytes", "timestamps": "unix_ms"},
                 "payload_deletion": false, "connected_peer_addresses": false,
                 "subscriptions": "poll_latest_snapshot_with_revision_and_gap_detection"})),
@@ -286,23 +287,17 @@ impl AgentService {
                 )
             }
             Method::Operations { offset, limit } => {
-                let operations: Vec<_> = self
-                    .store
-                    .list()?
-                    .into_iter()
-                    .filter(|op| op.client_id == client.id)
-                    .collect();
-                let (end, next) = page(*offset, *limit, operations.len())?;
+                let (operations, total) = self.store.page(&client.id, *offset, *limit)?;
+                let next =
+                    (*offset + operations.len() < total).then_some(*offset + operations.len());
                 Ok(
-                    json!({"operations": operations[*offset..end].iter().map(operation_json).collect::<Vec<_>>(), "next_offset": next}),
+                    json!({"operations": operations.iter().map(operation_json).collect::<Vec<_>>(), "total":total, "next_offset": next}),
                 )
             }
             Method::Operation { operation_id } => {
                 let op = self
                     .store
-                    .list()?
-                    .into_iter()
-                    .find(|op| op.id == *operation_id && op.client_id == client.id)
+                    .operation(&client.id, operation_id)?
                     .ok_or(ErrorCode::UnknownOperation)?;
                 let mut value = operation_json(&op);
                 value["exported_entries"] = json!(
@@ -334,9 +329,8 @@ impl AgentService {
                 if !client.grants.manage {
                     return Err(ErrorCode::PermissionDenied);
                 }
-                let path = access::confined_existing(&self.import_root, source)?;
-                let meta = crate::metainfo::TorrentMetainfo::load(&path)
-                    .map_err(|_| ErrorCode::InvalidRequest)?;
+                let meta =
+                    super::filesystem::Root::open(&self.import_root)?.read_metainfo(source)?;
                 Ok(
                     json!({"total_bytes": meta.total_size(), "file_count": meta.files.len(), "private": meta.is_private,
                     "info_hash_v1": meta.info_hash_v1_hex, "info_hash_v2": meta.info_hash_v2_hex,
@@ -590,8 +584,8 @@ impl AgentService {
                 if !output.is_dir() {
                     return Err(ErrorCode::PathDenied);
                 }
-                let meta = crate::metainfo::TorrentMetainfo::load(&path)
-                    .map_err(|_| ErrorCode::InvalidRequest)?;
+                let meta =
+                    super::filesystem::Root::open(&self.import_root)?.read_metainfo(source)?;
                 let settings = self.client_settings.clone();
                 let mut item = crate::torrent::TorrentItem {
                     runtime: Default::default(),
@@ -644,7 +638,6 @@ impl AgentService {
                 let item = find(control, torrent_id)?;
                 let hash = crate::announce_journal::torrent_hash(&item.info_hashes)
                     .ok_or(ErrorCode::Unsupported)?;
-                let output = access::confined_new(&self.export_root, destination)?;
                 let journal = control.backend.journal().ok_or(ErrorCode::Unsupported)?;
                 if self.export_jobs.len() >= 2 {
                     return Err(ErrorCode::Busy);
@@ -652,11 +645,8 @@ impl AgentService {
                 if journal.path().is_none() {
                     return Err(ErrorCode::Unsupported);
                 }
-                let file = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(output)
-                    .map_err(|_| ErrorCode::PathDenied)?;
+                let file =
+                    super::filesystem::Root::open(&self.export_root)?.create_export(destination)?;
                 let job = super::export::start(
                     journal,
                     hash.into(),

@@ -45,18 +45,8 @@ pub(crate) fn matches_token(hash: &str, token: &str) -> bool {
 /// Existing files only, no links/reparse points. Never accept absolute, ADS or traversal paths.
 /// The configured root is trusted; descendants must remain under its canonical path.
 pub fn confined_existing(root: &Path, relative: &str) -> Result<PathBuf, ErrorCode> {
-    if relative.is_empty() || relative.len() > 1024 || relative.contains(['\\', ':']) {
-        return Err(ErrorCode::PathDenied);
-    }
+    validate_relative(relative)?;
     let path = Path::new(relative);
-    if path
-        .components()
-        .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(ErrorCode::PathDenied);
-    }
-    crate::limits::validate_relative_paths([relative], &crate::limits::ResourceLimits::default())
-        .map_err(|_| ErrorCode::PathDenied)?;
     let root = root.canonicalize().map_err(|_| ErrorCode::PathDenied)?;
     let mut target = root.clone();
     for part in path.components() {
@@ -71,6 +61,22 @@ pub fn confined_existing(root: &Path, relative: &str) -> Result<PathBuf, ErrorCo
         return Err(ErrorCode::PathDenied);
     }
     Ok(resolved)
+}
+
+pub(crate) fn validate_relative(relative: &str) -> Result<(), ErrorCode> {
+    if relative.is_empty() || relative.len() > 1024 || relative.contains(['\\', ':']) {
+        return Err(ErrorCode::PathDenied);
+    }
+    let path = Path::new(relative);
+    if path
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(ErrorCode::PathDenied);
+    }
+    crate::limits::validate_relative_paths([relative], &crate::limits::ResourceLimits::default())
+        .map_err(|_| ErrorCode::PathDenied)?;
+    Ok(())
 }
 
 pub fn confined_new(root: &Path, relative: &str) -> Result<PathBuf, ErrorCode> {

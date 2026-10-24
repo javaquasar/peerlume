@@ -128,10 +128,14 @@ Keys/results are retained across restart; queued/running records become
 Read current state and explicitly decide what to do; do not blindly repeat a
 destructive or externally visible operation with a new key.
 
-Operation storage is capped at 512 records per profile. There is deliberately no
-silent key eviction: a full store returns `busy` for new operations, while reads
-and existing-key lookups continue. Automatic retention/maintenance is a follow-up
-gate; do not delete the store to work around an unknown result. The action audit
+The hot operation set is capped at 512 records per profile. At capacity,
+succeeded, failed and cancelled records move transactionally into a paged archive.
+Queued, running and reconciliation-required results are never evicted. Archived
+results and client-scoped keys remain queryable across restart; retries do not
+replay commands. The archive holds at most 100,000 records; saturation returns
+`busy` without forgetting keys. Do not delete the store to work around an unknown
+result. Retention preserves results instead of silently resetting deduplication.
+The action audit
 retains at most 4096 records, including authenticated accepted/denied requests and
 operation state transitions, without raw arguments or secrets.
 
@@ -149,9 +153,11 @@ under `PROFILE/exports`. The download root is shown in the access panel. Import
 and destination descendants must already exist. Absolute paths, traversal, ADS,
 reserved names and symlink/reparse-point descendants are rejected; outputs are
 never overwritten. Filesystem roots are human-controlled, not agent-configurable.
-Concurrent hostile filesystem replacement by other same-user processes is not
-claimed to be prevented by these path checks; handle-relative no-follow I/O is a
-remaining hardening gate.
+Preview reads and export creation use pinned directory handles and no-follow
+descendant opens, rather than reopening validated paths. Imports are byte-bounded
+through the opened handle. Backend payload writes and the engine's initial source
+reopen still use paths; racing replacement at these boundaries remains a hardening
+gate. These changes do not claim race immunity for arbitrary same-user processes.
 
 At most two exports run concurrently outside the controller lock. An export
 snapshots the disk journal length, streams at most 512 MiB, bounds individual
@@ -180,5 +186,9 @@ agent, atomic handle-relative filesystem hardening, typed IPC push subscriptions
 (latest-value polling is implemented), paged archived diagnostics, automatic safe
 operation retention, cancellation of already-running engine work, final removal
 of legacy preference/audit model access, signed installer/discovery integration,
-and a separately designed payload-deletion approval workflow. These capabilities
+and a separately designed payload-deletion approval workflow. Operation archiving,
+rendered frontend/external-agent workflows and pinned import/export opens now have
+REL implementation slices in [the primary plan](implementation-plan.md).
+Native-window automation and backend payload handle integration remain separate
+gates. These capabilities
 are not advertised as implemented. Core library publication stays deferred.

@@ -278,11 +278,32 @@ pull request are canceled. A failed matrix entry does not cancel other entries.
 The independent [Coverage workflow](https://github.com/javaquasar/peerlume/actions/workflows/coverage.yml)
 has the same push/PR/manual triggers. It runs instrumented Linux core/TUI tests
 using pinned `cargo-llvm-cov` 0.9.1 and publishes JSON, LCOV and HTML artifacts.
-The job summary reports measured line/function coverage. No percentage is claimed
-until measured and no unmeasured threshold is used to manufacture a passing gate.
+The job summary reports measured line/function coverage. A checked-in measured
+baseline in `config/coverage-baseline.json` rejects regression; baseline changes
+must cite a real run and must not hide failing coverage by excluding application code.
 This report does not measure the Windows-only GUI code, Docker-only ignored
 tests, or documentation tests; the main Tests workflow continues to run those
 supported suites separately. The manual upstream UDP test remains ignored.
+
+The [Reliability workflow](https://github.com/javaquasar/peerlume/actions/workflows/reliability.yml)
+adds rendered egui/ratatui workflows with a copied external adapter, a disposable
+Linux Secret Service, bounded parser fuzzing, and a resource soak with JSONL
+artifacts. Push/PR runs use a 90-second resource workload; weekly scheduled runs
+use one hour. Manual inputs allow up to four hours on hosted runners. For a
+24-hour local run, set `PEERLUME_SOAK_SECONDS=86400` and a new output filename in
+`PEERLUME_SOAK_REPORT`, then run `cargo test --no-default-features --lib
+reliability_resource_soak -- --ignored --test-threads=1 --nocapture` on Linux.
+Samples cover idle boundaries after each parallel-transfer/repair cycle, not
+peak allocation profiling. Native desktop window automation is not included.
+
+Linux persists private tracker credentials in the current user's Secret Service;
+the service must be available and unlocked. Windows retains current-user DPAPI.
+An unavailable provider fails explicitly without a plaintext fallback. Existing
+Linux databases that lost their secrets require re-entering the original URL.
+In-memory databases use an ephemeral credential provider on non-Windows platforms.
+
+See the [primary reliability implementation plan](docs/implementation-plan.md)
+for acceptance criteria and remaining release gates.
 
 ## Integration tests
 

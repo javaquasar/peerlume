@@ -61,7 +61,7 @@ fn duplicate_client_key_is_rejected_without_inserting_an_audit_row() {
                 false
             )
             .err(),
-        Some(ErrorCode::PersistenceUnavailable)
+        Some(ErrorCode::IdempotencyConflict)
     );
     assert_eq!(store.list().unwrap().len(), 1);
     let after: i64 = store
@@ -220,4 +220,111 @@ fn dropped_table_reports_failure_instead_of_an_unknown_operation() {
         store.lookup("client", "key").err(),
         Some(ErrorCode::PersistenceUnavailable)
     );
+}
+
+#[test]
+fn sequential_work_exceeds_hot_capacity_without_losing_retry_results() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("operations.sqlite3");
+    let store = ControlStore::open(&path).unwrap();
+    let mut first = String::new();
+    for index in 0..MAX_OPERATIONS * 3 {
+        let mut op = create(&store, &format!("sequential-{index}"));
+        if index == 0 {
+            first.clone_from(&op.id);
+        }
+        op.state = OperationState::Succeeded;
+        store.save(&op).unwrap();
+    }
+    assert!(store.list().unwrap().len() <= MAX_OPERATIONS);
+    assert_eq!(store.page("client", 0, 128).unwrap().1, MAX_OPERATIONS * 3);
+    assert_eq!(
+        store.operation("client", &first).unwrap().unwrap().state,
+        OperationState::Succeeded
+    );
+    assert!(store.operation("another", &first).unwrap().is_none());
+    assert!(store.lookup("another", "sequential-0").unwrap().is_none());
+    let old = store.lookup("client", "sequential-0").unwrap().unwrap();
+    assert_eq!(store.save(&old).err(), Some(ErrorCode::Conflict));
+    assert_eq!(
+        store
+            .create(
+                ("client", "torrent", "pause"),
+                "sequential-0",
+                "new",
+                now_ms() + 1000,
+                false
+            )
+            .err(),
+        Some(ErrorCode::IdempotencyConflict)
+    );
+    drop(store);
+    let store = ControlStore::open(&path).unwrap();
+    assert_eq!(
+        store.lookup("client", "sequential-0").unwrap().unwrap().id,
+        first
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    for offset in (0..MAX_OPERATIONS * 3).step_by(128) {
+        for op in store.page("client", offset, 128).unwrap().0 {
+            assert!(ids.insert(op.id));
+        }
+    }
+    assert_eq!(ids.len(), MAX_OPERATIONS * 3);
+}
+
+#[test]
+fn archive_transaction_rolls_back_if_source_deletion_fails() {
+    let store = store();
+    for index in 0..MAX_OPERATIONS {
+        let mut op = create(&store, &format!("terminal-{index}"));
+        op.state = OperationState::Succeeded;
+        store.save(&op).unwrap();
+    }
+    store.connection.execute_batch("CREATE TEMP TRIGGER reject_archive BEFORE DELETE ON agent_operations BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
+    assert_eq!(
+        store
+            .create(
+                ("client", "torrent", "pause"),
+                "next",
+                "hash",
+                now_ms() + 1000,
+                false
+            )
+            .err(),
+        Some(ErrorCode::PersistenceUnavailable)
+    );
+    assert_eq!(store.list().unwrap().len(), MAX_OPERATIONS);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM agent_operation_archive", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn unresolved_operations_are_never_archived_to_make_room() {
+    let store = store();
+    for index in 0..MAX_OPERATIONS {
+        let mut op = create(&store, &format!("uncertain-{index}"));
+        op.state = OperationState::ReconciliationRequired;
+        store.save(&op).unwrap();
+    }
+    assert_eq!(
+        store
+            .create(
+                ("client", "torrent", "pause"),
+                "next",
+                "hash",
+                now_ms() + 1000,
+                false
+            )
+            .err(),
+        Some(ErrorCode::Busy)
+    );
+    assert_eq!(store.list().unwrap().len(), MAX_OPERATIONS);
 }

@@ -1812,6 +1812,40 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    #[ignore = "installed frontend workflow; Reliability CI supplies the copied adapter"]
+    fn reliability_installed_frontend_workflow_ratatui() {
+        crate::control::test_support::installed_frontend_workflow(
+            |control, command| {
+                let mut app = app();
+                std::mem::swap(&mut app.control, control);
+                match command {
+                    TorrentCommand::Resume => app.resume_selected(),
+                    TorrentCommand::Pause => app.pause_selected(),
+                    _ => panic!("unexpected command"),
+                }
+                assert_eq!(app.status, COMMAND_ACCEPTED);
+                std::mem::swap(&mut app.control, control);
+            },
+            |control| {
+                let mut app = app();
+                std::mem::swap(&mut app.control, control);
+                app.details_tab = TorrentDetailsTab::Status;
+                let mut terminal = Terminal::new(TestBackend::new(240, 70)).unwrap();
+                terminal.draw(|f| app.render(f)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains("Status"));
+                std::mem::swap(&mut app.control, control);
+            },
+        );
+    }
+
     fn wait_for_tui(app: &mut TuiApp, predicate: impl Fn(&TuiApp) -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {

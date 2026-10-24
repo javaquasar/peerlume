@@ -13,6 +13,8 @@ use crate::limits::ResourceLimits;
 use crate::settings::data_directory;
 
 const CACHE_MAGIC: &[u8; 8] = b"PLBL\x02\0\0\0";
+#[cfg(test)]
+mod reliability_tests;
 const V1_CACHE_MAGIC: &[u8; 8] = b"PLBL\x01\0\0\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,12 +288,35 @@ impl Blocklist {
         let count: usize = read_u64(&mut reader)?.try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "legacy range count too large")
         })?;
+        let expected = count
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(V1_CACHE_MAGIC.len() + 16))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "legacy range data is too large")
+            })?;
+        if count > ResourceLimits::default().max_blocklist_rules
+            || reader.get_ref().metadata()?.len() != expected as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy cache length or range count is invalid",
+            ));
+        }
         let mut ranges = Vec::with_capacity(count);
         for _ in 0..count {
-            ranges.push(Ipv4Range {
-                start: read_u32(&mut reader)?,
-                end: read_u32(&mut reader)?,
-            });
+            let start = read_u32(&mut reader)?;
+            let end = read_u32(&mut reader)?;
+            if start > end
+                || ranges
+                    .last()
+                    .is_some_and(|last: &Ipv4Range| last.end >= start)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid legacy cache ranges",
+                ));
+            }
+            ranges.push(Ipv4Range { start, end });
         }
         Ok(Self {
             ranges,

@@ -55,6 +55,7 @@ pub struct TorrentRecord {
 
 pub struct StateStore {
     connection: Connection,
+    secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets>,
 }
 
 impl StateStore {
@@ -65,16 +66,44 @@ impl StateStore {
         }
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        Self::from_connection(connection)
+        let mut store = Self::from_connection(connection)?;
+        store.secrets = std::sync::Arc::new(crate::secrets::PlatformSecrets);
+        Ok(store)
     }
 
     pub fn in_memory() -> rusqlite::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
+    pub fn open_with_secrets(
+        path: &Path,
+        secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets>,
+    ) -> rusqlite::Result<Self> {
+        let mut store = Self::open(path)?;
+        store.secrets = secrets;
+        Ok(store)
+    }
+
+    pub fn in_memory_with_secrets(
+        secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets>,
+    ) -> rusqlite::Result<Self> {
+        let mut store = Self::in_memory()?;
+        store.secrets = secrets;
+        Ok(store)
+    }
+
     fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
         connection.pragma_update(None, "foreign_keys", true)?;
-        let mut store = Self { connection };
+        #[cfg(windows)]
+        let secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets> =
+            std::sync::Arc::new(crate::secrets::PlatformSecrets);
+        #[cfg(not(windows))]
+        let secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets> =
+            std::sync::Arc::new(crate::secrets::MemorySecrets::default());
+        let mut store = Self {
+            connection,
+            secrets,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -289,7 +318,14 @@ impl StateStore {
         )?;
         for (position, tracker) in torrent.trackers.iter().enumerate() {
             let persisted_url = crate::identity::redact_tracker_url(tracker);
-            let protected_url = protect_tracker_url(tracker)?;
+            let protected_url =
+                if persisted_url == *tracker {
+                    None
+                } else {
+                    Some(self.secrets.protect(tracker).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?)
+                };
             transaction.execute(
                 "INSERT INTO trackers(torrent_id, position, url, secret_ref)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -431,7 +467,25 @@ impl StateStore {
             .collect::<rusqlite::Result<_>>()?;
         torrent.trackers = stored_trackers
             .into_iter()
-            .map(|(redacted_url, protected_url)| restore_tracker_url(redacted_url, protected_url))
+            .map(|(redacted_url, protected_url)| {
+                if let Some(reference) = protected_url {
+                    self.secrets.restore(&reference).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })
+                } else if redacted_url.contains("REDACTED") {
+                    Err(rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Null,
+                        Box::new(crate::secrets::SecretUnavailable),
+                    ))
+                } else {
+                    Ok(redacted_url)
+                }
+            })
             .collect::<rusqlite::Result<_>>()?;
         let mut file_statement = self.connection.prepare(
             "SELECT file_index, path, size_bytes, downloaded_bytes, selected, priority
@@ -579,53 +633,8 @@ fn insert_tracker_audit(
     Ok(())
 }
 
-fn protect_tracker_url(value: &str) -> rusqlite::Result<Option<Vec<u8>>> {
-    #[cfg(windows)]
-    {
-        dpapi_protect(value.as_bytes()).map(Some).map_err(|error| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = value;
-        Ok(None)
-    }
-}
-
-fn restore_tracker_url(
-    redacted_url: String,
-    protected_url: Option<Vec<u8>>,
-) -> rusqlite::Result<String> {
-    #[cfg(windows)]
-    {
-        let Some(protected_url) = protected_url else {
-            return Ok(redacted_url);
-        };
-        let plaintext = dpapi_unprotect(&protected_url).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Blob,
-                Box::new(std::io::Error::other(error)),
-            )
-        })?;
-        String::from_utf8(plaintext).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Blob,
-                Box::new(error),
-            )
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = protected_url;
-        Ok(redacted_url)
-    }
-}
-
 #[cfg(windows)]
-fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -665,7 +674,7 @@ fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(windows)]
-fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn dpapi_unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -968,15 +977,9 @@ mod tests {
             .unwrap();
         assert!(!redacted_url.contains("0123456789abcdef01234567"));
         assert!(!redacted_url.contains("token=secret"));
-        #[cfg(windows)]
         assert!(protected_url.is_some());
-        #[cfg(not(windows))]
-        assert!(protected_url.is_none());
         let stored = store.load_torrent(&record.id).unwrap().unwrap();
-        #[cfg(windows)]
         assert_eq!(stored.trackers, record.trackers);
-        #[cfg(not(windows))]
-        assert_eq!(stored.trackers, [redacted_url]);
     }
 
     #[test]

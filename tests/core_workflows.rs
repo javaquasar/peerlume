@@ -58,7 +58,9 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
         .as_nanos();
     let root = std::env::temp_dir().join(format!("peerlume-state-integration-{nonce}"));
     let database = root.join("state.sqlite3");
-    let mut store = StateStore::open(&database).expect("open SQLite state");
+    let secrets = std::sync::Arc::new(peerlume::secrets::MemorySecrets::default());
+    let mut store =
+        StateStore::open_with_secrets(&database, secrets.clone()).expect("open SQLite state");
     let record = TorrentRecord {
         repair_policy: Default::default(),
         verify_after_download: false,
@@ -104,7 +106,7 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
     store.save_torrent(&record).expect("save torrent state");
     drop(store);
 
-    let store = StateStore::open(&database).expect("reopen SQLite state");
+    let store = StateStore::open_with_secrets(&database, secrets).expect("reopen SQLite state");
     let restored = store
         .load_torrent(&record.id)
         .expect("load torrent state")
@@ -114,13 +116,7 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
     assert_eq!(restored.downloaded_bytes, 50);
     assert_eq!(restored.uploaded_bytes, 5);
     assert_eq!(restored.tracker_audit, record.tracker_audit);
-    #[cfg(windows)]
     assert_eq!(restored.trackers, record.trackers);
-    #[cfg(not(windows))]
-    {
-        assert!(!restored.trackers[0].contains("token=secret"));
-        assert!(!restored.trackers[0].contains("0123456789abcdef01234567"));
-    }
 
     drop(store);
     fs::remove_dir_all(root).expect("remove temporary SQLite directory");

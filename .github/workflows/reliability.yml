@@ -1,0 +1,145 @@
+name: Reliability
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: 'Resource workload seconds (10 to 14400 on hosted runners)'
+        default: '120'
+        required: true
+      fuzz_seconds:
+        description: 'Seconds per parser target (10 to 1800)'
+        default: '30'
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: reliability-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontends:
+    name: Rendered frontends and installed external agent
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-frontends-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+      - run: cargo +stable build --locked --all-features --bin peerlume-control
+      - shell: pwsh
+        run: |
+          $env:PEERLUME_CONTROL_BIN=(Resolve-Path target/debug/peerlume-control.exe).Path
+          cargo +stable test --locked --all-features --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
+  linux-secrets:
+    name: Isolated Linux Secret Service
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-secrets-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+      - run: sudo apt-get update && sudo apt-get install -y gnome-keyring dbus-x11
+      - name: Verify the real provider in a disposable DBus session
+        run: |
+          dbus-run-session -- bash -euc '
+            export XDG_DATA_HOME="$(mktemp -d)"
+            printf "%s" "ci-disposable-keyring-password" | gnome-keyring-daemon --unlock --components=secrets
+            cargo +stable test --locked --no-default-features --test credential_storage real_linux_secret_service_round_trip -- --ignored --test-threads=1
+          '
+  resources:
+    name: Local transfer and IPC resource soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-reliability-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+      - name: Run the measured workload
+        shell: bash
+        env:
+          REQUESTED_SECONDS: ${{ inputs.soak_seconds }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          seconds="${REQUESTED_SECONDS:-90}"
+          if [ "$EVENT_NAME" = schedule ]; then seconds=3600; fi
+          [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 10 && seconds <= 14400 )) || exit 2
+          mkdir -p reliability-results
+          export PEERLUME_SOAK_SECONDS="$seconds"
+          export PEERLUME_SOAK_REPORT="$PWD/reliability-results/resources.jsonl"
+          cargo +stable test --locked --no-default-features --lib reliability_resource_soak -- --ignored --test-threads=1 --nocapture
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-resources
+          path: reliability-results/
+          if-no-files-found: warn
+          retention-days: 14
+  fuzz:
+    name: Bounded parser fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install nightly-2026-10-01 --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            .tools/fuzz
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-0.13.2-nightly-2026-10-01-${{ hashFiles('Cargo.lock','fuzz/Cargo.lock','**/Cargo.toml') }}
+      - name: Install pinned fuzz driver
+        run: |
+          if [ ! -x .tools/fuzz/bin/cargo-fuzz ]; then cargo +nightly-2026-10-01 install cargo-fuzz --locked --version 0.13.2 --root .tools/fuzz; fi
+          echo "$GITHUB_WORKSPACE/.tools/fuzz/bin" >> "$GITHUB_PATH"
+      - name: Exercise parsers with bounded input and memory
+        env:
+          REQUESTED_SECONDS: ${{ inputs.fuzz_seconds }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          seconds="${REQUESTED_SECONDS:-10}"
+          if [ "$EVENT_NAME" = schedule ]; then seconds=600; fi
+          [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 10 && seconds <= 1800 )) || exit 2
+          for target in metainfo blocklist wire peer tracker; do
+            cargo +nightly-2026-10-01 fuzz run "$target" --locked -- -max_total_time="$seconds" -max_len=65536 -rss_limit_mb=1024 -timeout=5
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: parser-fuzz-corpus
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+          retention-days: 14

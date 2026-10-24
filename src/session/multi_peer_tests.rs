@@ -638,7 +638,7 @@ fn different_torrents_download_concurrently_in_one_session() {
 }
 
 #[test]
-fn different_torrents_are_verified_after_parallel_download_before_done() {
+pub(super) fn different_torrents_are_verified_after_parallel_download_before_done() {
     download_torrents_with_verification(
         &[(2, DownloadMode::Normal), (2, DownloadMode::NoProgress)],
         true,

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "scope": "linux-core-tui",
+  "lines": 86.879,
+  "functions": 78.8107,
+  "source_commit": "f0bc306a9a6fe1644c371907bec06aba2a800023",
+  "source_run": "https://github.com/javaquasar/peerlume/actions/runs/40037209080"
+}
