@@ -136,8 +136,9 @@ class Desktop:
     def words(self):
         image = self.screenshot("current")
         scaled = self.report / "ocr.png"
-        subprocess.run(["convert", str(image), "-resize", "200%", str(scaled)], check=True, timeout=10)
+        subprocess.run(["convert", str(image), "-colorspace", "Gray", "-negate", "-resize", "200%", str(scaled)], check=True, timeout=10)
         result = subprocess.run(["tesseract", str(scaled), "stdout", "--psm", "11", "tsv"], capture_output=True, check=True, timeout=15)
+        (self.report / "ocr.tsv").write_bytes(result.stdout)
         return [row for row in csv.DictReader(io.StringIO(result.stdout.decode()), delimiter="\t") if row.get("text", "").strip()]
 
     @staticmethod
@@ -146,16 +147,21 @@ class Desktop:
 
     def locate(self, phrase, last=False, minimum_y=0):
         words = self.words()
-        needle = [self.normalize(word) for word in phrase.split()]
+        needle = self.normalize(phrase)
         matches = []
-        for index in range(len(words) - len(needle) + 1):
-            block = words[index:index + len(needle)]
-            if [self.normalize(row["text"]) for row in block] != needle:
-                continue
-            x = (int(block[0]["left"]) + int(block[-1]["left"]) + int(block[-1]["width"])) // 4
-            y = (int(block[0]["top"]) + int(block[0]["height"]) // 2) // 2
-            if y >= minimum_y:
-                matches.append((x, y))
+        for index in range(len(words)):
+            text = ""
+            for end in range(index, min(len(words), index + len(phrase.split()) + 4)):
+                text += self.normalize(words[end]["text"])
+                if text == needle:
+                    block = words[index:end + 1]
+                    x = (int(block[0]["left"]) + int(block[-1]["left"]) + int(block[-1]["width"])) // 4
+                    y = (int(block[0]["top"]) + int(block[0]["height"]) // 2) // 2
+                    if y >= minimum_y:
+                        matches.append((x, y))
+                    break
+                if not needle.startswith(text):
+                    break
         return matches[-1 if last else 0] if matches else None
 
     def click(self, phrase, last=False, minimum_y=0):

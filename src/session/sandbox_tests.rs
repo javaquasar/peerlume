@@ -42,15 +42,15 @@ fn add(id: &str, source: &Path, output: &Path) -> SessionCommand {
         peer_limit: None,
     }
 }
-fn wait(runtime: &SessionRuntime, mut predicate: impl FnMut(SessionEvent) -> bool) {
+fn wait(runtime: &SessionRuntime, mut predicate: impl FnMut(&SessionEvent) -> bool) {
     let end = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(event) = runtime.try_recv() {
+            if predicate(&event) {
+                return;
+            }
             if let SessionEvent::Error { message, .. } = &event {
                 panic!("sandbox backend error: {message}");
-            }
-            if predicate(event) {
-                return;
             }
         } else {
             std::thread::sleep(Duration::from_millis(10));
