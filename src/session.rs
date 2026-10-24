@@ -12,12 +12,45 @@ mod verification;
 use crate::runtime_status::{
     ModeApplication, ModeConfig, RepairBudget, RepairPolicy, RepairStatus,
 };
+use librqbit::storage::StorageFactoryExt;
 use verification::{CheckRun, restart_for_check};
 mod controls;
 mod events;
 
+/// One validated metainfo snapshot and the authorized output directory identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedTorrent {
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) directory: crate::storage::sandbox::Directory,
+}
+impl std::fmt::Debug for PreparedTorrent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTorrent")
+            .field("bytes", &self.bytes.len())
+            .field("directory", &self.directory)
+            .finish()
+    }
+}
+
+fn read_metainfo_snapshot(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let limit = crate::limits::ResourceLimits::default().max_torrent_bytes;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    crate::metainfo::TorrentMetainfo::parse(&bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid metainfo snapshot")
+    })?;
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
+    PreparedAdd {
+        command: Box<SessionCommand>,
+        prepared: PreparedTorrent,
+    },
     AddTorrent {
         repair_policy: RepairPolicy,
         verify_after_download: bool,
@@ -253,6 +286,7 @@ impl SessionRuntime {
                         Err(message) => { let _ = event_tx.send(SessionEvent::Error { id: String::new(), message: message.into() }); return; }
                     };
                     let mut torrents: HashMap<String, Arc<ManagedTorrent>> = HashMap::new();
+                    let mut storage_roots: HashMap<String,crate::storage::sandbox::Directory> = HashMap::new();
                     let mut reporting_policies = HashMap::new();
                     let mut added_commands: HashMap<String, SessionCommand> = HashMap::new();
                     let mut checks = HashMap::<String, CheckRun>::new();
@@ -346,7 +380,7 @@ impl SessionRuntime {
                                         if let Some(budget) = repairs.get(&id) { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Checking { attempt: budget.used, limit: controls::repair_policy(added_commands.get(&id)).max_attempts } }); }
                                         let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                         let resume = !matches!(stats.state, TorrentStatsState::Paused);
-                                        match restart_for_check(&session, &handle, &added_commands[&id], &counters).await {
+                                        match restart_for_check(&session, &handle, &added_commands[&id], &counters, storage_roots.get(&id)).await {
                                             Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id, CheckRun { resume, require_complete: true }); }
                                             Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
                                         }
@@ -383,6 +417,10 @@ impl SessionRuntime {
                             }
                             command = command_rx.recv() => {
                                 let Some(command) = command else { break };
+                                let (command,prepared)=match command {
+                                    SessionCommand::PreparedAdd{command,prepared} if matches!(*command,SessionCommand::AddTorrent{..})=>(*command,Some(prepared)),
+                                    other=>(other,None),
+                                };
                                 if let SessionCommand::Recheck { id } = &command {
                                     if checks.contains_key(id) { continue; }
                                     let Some(handle) = torrents.get(id).cloned() else { continue; };
@@ -392,7 +430,7 @@ impl SessionRuntime {
                                     transfers(handle.info_hash().0);
                                     let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                     let Some(saved) = added_commands.get(id) else { continue; };
-                                    match restart_for_check(&session, &handle, saved, &counters).await {
+                                    match restart_for_check(&session, &handle, saved, &counters, storage_roots.get(id)).await {
                                         Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.send(SessionEvent::Added { id: id.clone() }); }
                                         Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
                                     }
@@ -438,6 +476,10 @@ impl SessionRuntime {
                                             continue;
                                         }
                                         if let Err(message) = repair_policy.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
+                                        let root=match prepared.as_ref().map(|p|Ok(p.directory.clone())).unwrap_or_else(||crate::storage::sandbox::Directory::create_root(std::path::Path::new(&output_folder))) {
+                                            Ok(root)=>root,
+                                            Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
+                                        };
                                         let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes) {
                                             Ok(registration) => registration,
                                             Err(message) => {
@@ -445,18 +487,21 @@ impl SessionRuntime {
                                                 continue;
                                             }
                                         };
-                                        let add = if source.starts_with("magnet:") {
+                                        let add = if let Some(prepared)=prepared {
+                                            Ok(AddTorrent::from_bytes(prepared.bytes.to_vec()))
+                                        } else if source.starts_with("magnet:") {
                                             Ok(AddTorrent::from_url(source))
                                         } else {
-                                            std::fs::read(&source)
+                                            read_metainfo_snapshot(std::path::Path::new(&source))
                                                 .map(AddTorrent::from_bytes)
-                                                .map_err(|error| format!("Could not read torrent file: {error}"))
+                                                .map_err(|_| "Could not read bounded torrent metadata".to_owned())
                                         };
                                         let result = match add {
                                             Ok(add) => session
                                                 .add_torrent(
                                                     add,
                                                     Some(AddTorrentOptions {
+                                                        storage_factory:Some(crate::storage::sandbox::Factory{root:root.clone()}.boxed()),
                                                         paused,
                                                         only_files,
                                                         overwrite: true,
@@ -476,6 +521,7 @@ impl SessionRuntime {
                                             })
                                         }) {
                                             Ok(handle) => {
+                                                storage_roots.insert(id.clone(),root);
                                                 added_commands.insert(id.clone(), saved_command);
                                                 if let Some(registration) = registration {
                                                     reporting_policies.insert(id.clone(), registration);
@@ -541,6 +587,7 @@ impl SessionRuntime {
                                         let event = match result {
                                             Ok(()) => {
                                                 torrents.remove(&id);
+                                                storage_roots.remove(&id);
                                                 checks.remove(&id);
                                                 checked_after_download.remove(&id);
                                                 check_failed.remove(&id);
@@ -556,6 +603,9 @@ impl SessionRuntime {
                                             Err(message) => SessionEvent::Error { id, message },
                                         };
                                         let _ = event_tx.send(event);
+                                    }
+                                    SessionCommand::PreparedAdd { .. } => {
+                                        let _=event_tx.send(SessionEvent::Error{id:String::new(),message:"Invalid prepared add command".into()});
                                     }
                                     SessionCommand::Shutdown => {
                                         let final_samples: Vec<_> = torrents.values().map(|h| final_transfer_sampler(h, &counters)).collect();
@@ -769,6 +819,8 @@ impl Drop for SessionRuntime {
 #[cfg(test)]
 mod multi_peer_tests;
 
+#[cfg(test)]
+mod sandbox_tests;
 #[cfg(test)]
 mod verification_tests;
 

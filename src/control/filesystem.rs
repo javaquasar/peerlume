@@ -36,6 +36,13 @@ impl Root {
         &self,
         relative: &str,
     ) -> Result<crate::metainfo::TorrentMetainfo, ErrorCode> {
+        self.read_metainfo_bytes(relative).map(|(_, meta)| meta)
+    }
+
+    pub fn read_metainfo_bytes(
+        &self,
+        relative: &str,
+    ) -> Result<(Vec<u8>, crate::metainfo::TorrentMetainfo), ErrorCode> {
         let (dir, name) = self.parent(relative)?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
@@ -58,7 +65,9 @@ impl Root {
         if bytes.len() as u64 > limit {
             return Err(ErrorCode::TooLarge);
         }
-        crate::metainfo::TorrentMetainfo::parse(&bytes).map_err(|_| ErrorCode::InvalidRequest)
+        let metadata = crate::metainfo::TorrentMetainfo::parse(&bytes)
+            .map_err(|_| ErrorCode::InvalidRequest)?;
+        Ok((bytes, metadata))
     }
 
     pub fn create_export(&self, relative: &str) -> Result<File, ErrorCode> {

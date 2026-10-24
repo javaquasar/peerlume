@@ -396,6 +396,11 @@ impl HostedGui {
         let directory = crate::settings::data_directory();
         let instance = crate::control::host::InstanceLock::acquire(&directory)?;
         let mut app = PeerLumeApp::default();
+        app.pending_torrent_paths
+            .extend(crate::settings::open_torrent_arguments(
+                &std::env::args().skip(1).collect::<Vec<_>>(),
+            )?);
+        app.open_next_queued_torrent();
         let download_root = PathBuf::from(&app.settings.download.download_directory);
         app.control
             .configure_agents(&directory, download_root)

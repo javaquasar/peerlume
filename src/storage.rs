@@ -6,6 +6,8 @@ use std::{
 
 use crate::limits::{ResourceLimits, validate_relative_paths};
 
+pub mod sandbox;
+
 pub struct PositionedFile {
     file: File,
     pub path: PathBuf,

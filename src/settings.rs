@@ -630,6 +630,38 @@ pub fn data_directory() -> PathBuf {
 
 static PROFILE_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Desktop launch integration. Files still require the ordinary add dialog approval.
+pub fn open_torrent_arguments(args: &[String]) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--open" {
+            let value = args.get(index + 1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--open requires an absolute torrent path",
+                )
+            })?;
+            let path = PathBuf::from(value);
+            if !path.is_absolute()
+                || path
+                    .extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("torrent"))
+                || files.len() >= 16
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--open accepts at most 16 absolute .torrent paths",
+                ));
+            }
+            files.push(path);
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(files)
+}
+
 /// Explicit installed-profile override, set once before starting application workers.
 pub fn configure_profile_from_args() -> io::Result<()> {
     let args: Vec<_> = std::env::args().collect();
@@ -661,6 +693,31 @@ fn settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_open_arguments_are_bounded_absolute_and_preview_only() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("fixture.torrent");
+        assert_eq!(
+            open_torrent_arguments(&["--open".into(), file.display().to_string()]).unwrap(),
+            vec![file.clone()]
+        );
+        for args in [
+            vec!["--open".into()],
+            vec!["--open".into(), "relative.torrent".into()],
+            vec![
+                "--open".into(),
+                root.path().join("file.txt").display().to_string(),
+            ],
+        ] {
+            assert!(open_torrent_arguments(&args).is_err());
+        }
+        let many: Vec<_> = (0..17)
+            .flat_map(|_| ["--open".into(), file.display().to_string()])
+            .collect();
+        assert!(open_torrent_arguments(&many).is_err());
+        assert!(!file.exists());
+    }
 
     #[test]
     fn ratio_validation_rejects_non_finite_and_non_positive_limits() {

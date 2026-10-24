@@ -10,7 +10,11 @@ pub(super) async fn restart_for_check(
     handle: &Arc<ManagedTorrent>,
     saved: &SessionCommand,
     counters: &Arc<std::sync::Mutex<HashMap<[u8; 20], TransferCounter>>>,
+    root: Option<&crate::storage::sandbox::Directory>,
 ) -> Result<Arc<ManagedTorrent>, String> {
+    let root = root
+        .ok_or_else(|| "Pinned payload directory is unavailable".to_owned())?
+        .clone();
     let SessionCommand::AddTorrent {
         output_folder,
         only_files,
@@ -34,6 +38,7 @@ pub(super) async fn restart_for_check(
         .add_torrent(
             AddTorrent::from_bytes(bytes),
             Some(AddTorrentOptions {
+                storage_factory: Some(crate::storage::sandbox::Factory { root }.boxed()),
                 paused: true,
                 only_files: only_files.clone(),
                 overwrite: true,

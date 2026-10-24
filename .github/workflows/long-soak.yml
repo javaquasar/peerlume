@@ -1,0 +1,94 @@
+name: Long soak
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'hosted supports up to 4 hours; continuous-24h requires an existing Linux self-hosted runner'
+        type: choice
+        options: [hosted, continuous-24h]
+        default: hosted
+      seconds:
+        description: 'Hosted duration in seconds (10 to 14400); continuous-24h always uses 86400'
+        default: '14400'
+        required: true
+      runner_label:
+        description: 'Existing self-hosted runner label; unused for hosted runs'
+        default: peerlume-soak
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: long-soak-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    name: Validate explicit run selection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          SELECTED_RUNNER: ${{ inputs.runner }}
+          SELECTED_SECONDS: ${{ inputs.seconds }}
+          SELECTED_LABEL: ${{ inputs.runner_label }}
+        run: |
+          [[ "$SELECTED_RUNNER" = hosted || "$SELECTED_RUNNER" = continuous-24h ]] || exit 2
+          [[ "$SELECTED_SECONDS" =~ ^[0-9]+$ ]] && (( SELECTED_SECONDS >= 10 && SELECTED_SECONDS <= 14400 )) || exit 2
+          [[ "$SELECTED_LABEL" =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+  hosted:
+    needs: validate
+    if: inputs.runner == 'hosted'
+    name: Hosted sustained resource workload
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-long-soak-${{ hashFiles('Cargo.lock','**/Cargo.toml') }}
+      - name: Run one continuous hosted workload
+        env:
+          REQUESTED_SECONDS: ${{ inputs.seconds }}
+        run: |
+          [[ "$REQUESTED_SECONDS" =~ ^[0-9]+$ ]] && (( REQUESTED_SECONDS >= 10 && REQUESTED_SECONDS <= 14400 )) || exit 2
+          mkdir -p long-soak-results
+          export PEERLUME_SOAK_SECONDS="$REQUESTED_SECONDS"
+          export PEERLUME_SOAK_REPORT="$PWD/long-soak-results/resources.jsonl"
+          cargo +stable test --locked --no-default-features --lib reliability_resource_soak -- --ignored --test-threads=1 --nocapture
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: hosted-long-soak
+          path: long-soak-results/
+          if-no-files-found: warn
+          retention-days: 14
+  continuous:
+    needs: validate
+    if: inputs.runner == 'continuous-24h'
+    name: Continuous 24 hour release gate
+    runs-on: [self-hosted, Linux, '${{ inputs.runner_label }}']
+    timeout-minutes: 1500
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - name: Run without segmentation or automatic process restart
+        run: |
+          mkdir -p long-soak-results
+          export PEERLUME_SOAK_SECONDS=86400
+          export PEERLUME_SOAK_REPORT="$PWD/long-soak-results/resources.jsonl"
+          cargo +stable test --locked --no-default-features --lib reliability_resource_soak -- --ignored --test-threads=1 --nocapture
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: continuous-24h-release-evidence
+          path: long-soak-results/
+          if-no-files-found: warn
+          retention-days: 14

@@ -29,6 +29,7 @@ pub struct AgentService {
     pub import_root: PathBuf,
     pub export_root: PathBuf,
     pub download_root: PathBuf,
+    download_cap: Option<crate::storage::sandbox::Directory>,
     pub(crate) client_settings: crate::settings::ClientSettings,
 }
 
@@ -66,6 +67,7 @@ impl AgentService {
             import_root: directory.join("imports"),
             export_root: directory.join("exports"),
             download_root,
+            download_cap: None,
             client_settings: Default::default(),
         })
     }
@@ -579,13 +581,22 @@ impl AgentService {
                 start,
                 ..
             } => {
-                let path = access::confined_existing(&self.import_root, source)?;
-                let output = access::confined_existing(&self.download_root, destination)?;
-                if !output.is_dir() {
-                    return Err(ErrorCode::PathDenied);
+                let (bytes, meta) = super::filesystem::Root::open(&self.import_root)?
+                    .read_metainfo_bytes(source)?;
+                if self.download_cap.is_none() {
+                    self.download_cap = Some(
+                        crate::storage::sandbox::Directory::open(&self.download_root)
+                            .map_err(|_| ErrorCode::PathDenied)?,
+                    );
                 }
-                let meta =
-                    super::filesystem::Root::open(&self.import_root)?.read_metainfo(source)?;
+                let directory = self
+                    .download_cap
+                    .as_ref()
+                    .ok_or(ErrorCode::PathDenied)?
+                    .descendant(destination)
+                    .map_err(|_| ErrorCode::PathDenied)?;
+                let path = self.import_root.join(source);
+                let output = self.download_root.join(destination);
                 let settings = self.client_settings.clone();
                 let mut item = crate::torrent::TorrentItem {
                     runtime: Default::default(),
@@ -626,7 +637,14 @@ impl AgentService {
                 pending.operation.torrent_id = item.info_hashes.join(";");
                 self.store.save(&pending.operation)?;
                 control
-                    .add(item, &settings, None)
+                    .add_prepared(
+                        item,
+                        &settings,
+                        crate::session::PreparedTorrent {
+                            bytes: bytes.into(),
+                            directory,
+                        },
+                    )
                     .map_err(|_| ErrorCode::EngineRejected)?;
                 Ok(true)
             }

@@ -7,3 +7,6 @@
 /.tools/fuzz
 /reliability-results
 /fuzz/artifacts
+/native-results
+/long-soak-results
+__pycache__/

@@ -2544,6 +2544,7 @@ dependencies = [
 name = "peerlume"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cap-fs-ext",
  "cap-std",
  "crc32fast",

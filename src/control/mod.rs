@@ -279,6 +279,25 @@ impl Controller {
         settings: &crate::settings::ClientSettings,
         audit: Option<crate::state::StoredTrackerAuditProfile>,
     ) -> Result<(), String> {
+        self.add_internal(torrent, settings, audit, None)
+    }
+
+    pub(crate) fn add_prepared(
+        &mut self,
+        torrent: TorrentItem,
+        settings: &crate::settings::ClientSettings,
+        prepared: crate::session::PreparedTorrent,
+    ) -> Result<(), String> {
+        self.add_internal(torrent, settings, None, Some(prepared))
+    }
+
+    fn add_internal(
+        &mut self,
+        torrent: TorrentItem,
+        settings: &crate::settings::ClientSettings,
+        audit: Option<crate::state::StoredTrackerAuditProfile>,
+        prepared: Option<crate::session::PreparedTorrent>,
+    ) -> Result<(), String> {
         let id = torrent.info_hashes.join(";");
         if id.is_empty()
             || self.torrents.iter().any(|item| {
@@ -303,10 +322,15 @@ impl Controller {
         }
         let record = crate::client::torrent_to_record(&torrent, audit);
         self.backend.save_torrent(&record)?;
-        if let Err(error) = self
-            .backend
-            .send_checked(crate::client::add_torrent_command(&torrent, settings))
-        {
+        let command = crate::client::add_torrent_command(&torrent, settings);
+        let command = match prepared {
+            Some(prepared) => crate::session::SessionCommand::PreparedAdd {
+                command: Box::new(command),
+                prepared,
+            },
+            None => command,
+        };
+        if let Err(error) = self.backend.send_checked(command) {
             let _ = self.backend.remove_torrent(&id);
             return Err(format!("Transfer engine rejected add: {error:?}"));
         }
