@@ -204,7 +204,10 @@ class Desktop:
         return token
 
     def close(self):
-        subprocess.run(["xdotool", "windowclose", self.window], check=True)
+        # Ask the window manager to send WM_DELETE_WINDOW. `windowclose` destroys
+        # the X11 surface directly and can crash a still-running event loop.
+        subprocess.run(["xdotool", "windowactivate", "--sync", self.window], check=True)
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "alt+F4"], check=True)
 
 
 def run(args):
@@ -308,7 +311,7 @@ def run(args):
                 assert database.execute("SELECT state FROM torrents").fetchone()[0] == "paused"
             old_instance = instance
             desktop.close()
-            app.wait(timeout=20)
+            assert app.wait(timeout=20) == 0, "GUI did not shut down cleanly before restart"
             app = launch(False)
             desktop.attach(app)
             desktop.grant(new=False)
@@ -319,11 +322,11 @@ def run(args):
             wait_for(lambda: row()["state"] == "paused" and row()["completion"] == "verified")
             assert verified_file()
             desktop.screenshot("05-restored-paused")
-            (report / "result.json").write_text(json.dumps({"native_window": True, "gui_mouse_add_pause_resume": True, "external_cli": True, "fresh_peer_download": True, "damaged_piece_refetched": after - before, "restart_preserved_pause": True, "reporting_mode": "normal"}, indent=2), encoding="utf-8")
             desktop.close()
-            app.wait(timeout=20)
+            assert app.wait(timeout=20) == 0, "Restored GUI did not shut down cleanly"
             app = None
             log.close()
+            (report / "result.json").write_text(json.dumps({"native_window": True, "gui_mouse_add_pause_resume": True, "external_cli": True, "fresh_peer_download": True, "damaged_piece_refetched": after - before, "restart_preserved_pause": True, "clean_shutdowns": 2, "reporting_mode": "normal"}, indent=2), encoding="utf-8")
     finally:
         if app is not None and app.poll() is None:
             desktop.screenshot("failure")

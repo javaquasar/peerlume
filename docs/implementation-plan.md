@@ -81,6 +81,18 @@ pass for `271068c`. The coverage baseline is the measured `f0bc306` result;
 the [Coverage workflow](https://github.com/javaquasar/peerlume/actions/workflows/coverage.yml)
 publishes current JSON, LCOV and HTML reports and rejects a lower result.
 
+The pinned backend storage, immutable agent input, native X11 scenario and
+continuous-workload workflows were introduced in `284c15e`, with CI corrections
+in `7a88af6` and `f104d04`. The
+[Windows/Linux test matrix](https://github.com/javaquasar/peerlume/actions/runs/40081776040)
+and [coverage gate](https://github.com/javaquasar/peerlume/actions/runs/40081776056)
+pass for `f104d04`: Linux core/TUI coverage is 88.438% of lines and 80% of
+functions. Native-window success additionally requires both GUI processes to
+exit cleanly; destroying the X11 surface is not a successful shutdown.
+A [four-hour hosted workload](https://github.com/javaquasar/peerlume/actions/runs/40082042583)
+was dispatched for the same source revision. Its final JSONL success record,
+not dispatch or a green smoke run, establishes completion of that experiment.
+
 - REL 1: implemented hot/archive retention with a 512-record hot set and a
   100,000-record archive. Tests run 1,536 sequential operations and check archived
   lookup, client isolation, restart, rollback, saturation and preservation of keys.
