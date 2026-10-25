@@ -145,7 +145,9 @@ impl Proof {
             .collect()
     }
     pub fn snapshot(&self) -> serde_json::Value {
-        serde_json::json!({"source_written_payload_bytes":self.source_bytes.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"verified_upload_bytes":self.uploads.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"source_connections":self.source_connections.load(Ordering::Relaxed),"leecher_connections":self.leecher_connections.load(Ordering::Relaxed),"anchor_connections":self.anchor_connections.load(Ordering::Relaxed),"source_disconnects":self.source_disconnects.load(Ordering::Relaxed),"truncated_frames":self.truncated_frames.load(Ordering::Relaxed),"tracker_faults":self.tracker_faults.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"tracker_replies":self.tracker_replies.load(Ordering::Relaxed),"peer_epoch":self.epoch.load(Ordering::Relaxed),"parallel_download_proven":self.overlapping.load(Ordering::Relaxed)})
+        let mut endpoints: Vec<_> = self.endpoints.lock().unwrap().iter().copied().collect();
+        endpoints.sort_unstable();
+        serde_json::json!({"source_written_payload_bytes":self.source_bytes.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"verified_upload_bytes":self.uploads.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"source_connections":self.source_connections.load(Ordering::Relaxed),"leecher_connections":self.leecher_connections.load(Ordering::Relaxed),"anchor_connections":self.anchor_connections.load(Ordering::Relaxed),"source_disconnects":self.source_disconnects.load(Ordering::Relaxed),"truncated_frames":self.truncated_frames.load(Ordering::Relaxed),"tracker_faults":self.tracker_faults.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"tracker_replies":self.tracker_replies.load(Ordering::Relaxed),"peer_epoch":self.epoch.load(Ordering::Relaxed),"source_endpoints":endpoints,"parallel_download_proven":self.overlapping.load(Ordering::Relaxed)})
     }
 }
 
@@ -350,9 +352,12 @@ fn tracker(
             }
         }
     }
-    let group = (proof.epoch.load(Ordering::Relaxed) % 2) as usize * 2;
-    let mut body = b"d8:intervali1e5:peers12:".to_vec();
-    for peer in &peers[group..group + 2] {
+    // Each rotating group has two copies of each complementary piece set.
+    // A deliberately truncated connection must leave an independent healthy
+    // source, not force repair to wait for one failed peer's retry cooldown.
+    let group = (proof.epoch.load(Ordering::Relaxed) % 2) as usize * 4;
+    let mut body = b"d8:intervali1e5:peers24:".to_vec();
+    for peer in &peers[group..group + 4] {
         body.extend([127, 0, 0, 1]);
         body.extend(peer.port().to_be_bytes());
     }
@@ -375,7 +380,7 @@ pub(super) struct Servers {
 impl Servers {
     pub fn start(data: Vec<Data>, proof: Arc<Proof>) -> Self {
         let data = Arc::new(data);
-        let listeners: Vec<_> = (0..4)
+        let listeners: Vec<_> = (0..8)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
         let peers: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();

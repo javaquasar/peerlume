@@ -296,6 +296,10 @@ fn reliability_realistic_swarm_soak() {
             .map(|e| e.sequence)
             .unwrap_or(0);
         let fault_before = proof.tracker_faults[fault.index()].load(Ordering::Relaxed);
+        record(
+            &report,
+            serde_json::json!({"kind":"phase","phase":"tracker_fault","cycle":cycle,"elapsed_ms":start.elapsed().as_millis(),"fault":fault.name()}),
+        );
         proof.arm(fault, 0);
         wait(&proof, 60, || {
             proof.tracker_faults[fault.index()].load(Ordering::Relaxed) > fault_before
@@ -326,6 +330,10 @@ fn reliability_realistic_swarm_soak() {
         );
         // Every receiver connection is new; offsets rotate through each large
         // torrent, including its tail beyond the signed 32-bit offset boundary.
+        record(
+            &report,
+            serde_json::json!({"kind":"phase","phase":"seeding","cycle":cycle,"elapsed_ms":start.elapsed().as_millis()}),
+        );
         for (index, torrent) in data.iter().enumerate().take(2) {
             let mut leecher =
                 Leecher::connect(address, torrent.clone(), proof.clone(), index).unwrap();
@@ -354,6 +362,10 @@ fn reliability_realistic_swarm_soak() {
                 vec![piece as u64 * PIECE as u64 + 17]
             };
             let before = proof.counts(index);
+            record(
+                &report,
+                serde_json::json!({"kind":"phase","phase":"repair","cycle":cycle,"elapsed_ms":start.elapsed().as_millis(),"torrent":torrent.hash_hex(),"piece":piece,"damaged_offsets":offsets}),
+            );
             torrent.corrupt(&path, &offsets).unwrap();
             assert!(torrent.verify_files(&path).is_err());
             let revision = owner.lock().unwrap().command_revision(&ids[index]).unwrap();
@@ -404,6 +416,16 @@ fn reliability_realistic_swarm_soak() {
         );
         assert!(proof.uploads[2].load(Ordering::Relaxed) > before_anchor);
         assert_eq!(proof.anchor_connections.load(Ordering::Relaxed), 1);
+        {
+            let endpoints = proof.endpoints.lock().unwrap();
+            for index in 0..2 {
+                assert!(endpoints.iter().any(|(i, peer)| *i == index && *peer < 4));
+                assert!(
+                    endpoints.iter().any(|(i, peer)| *i == index && *peer >= 4),
+                    "replacement peer group did not serve the repaired torrent"
+                );
+            }
+        }
         {
             let c = owner.lock().unwrap();
             let engine = c.backend.test_engine().unwrap();

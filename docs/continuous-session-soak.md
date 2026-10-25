@@ -110,7 +110,8 @@ download size. All traffic remains on loopback.
 Two complementary peers must contribute to each initial download. A barrier
 requires both torrents to request data before the fixture releases any response,
 proving overlapping downloads rather than sequential completion. Tracker replies
-rotate between two pairs of source endpoints. Each cycle reconnects validating
+rotate between two groups of four source endpoints, with redundant complementary
+piece sets so a deliberate disconnection leaves a healthy alternative. Each cycle reconnects validating
 receivers, exercises the large file tail, disconnects old source generations,
 truncates a real peer frame and repairs a damaged piece in each torrent. The first
 multi-file repair damages bytes on both sides of a file boundary within one piece.
