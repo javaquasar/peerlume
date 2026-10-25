@@ -94,3 +94,64 @@ positive download/upload/repair evidence, `session_starts=1`, unchanged engine
 identity, `permanent_seeding_connections=1` and `clean_shutdown=true`. A partial
 JSONL file or a passed smoke run does not establish a completed four-hour run.
 This experiment does not close the separate 24-hour release gate.
+
+## Realistic swarm and fault-recovery extension
+
+The separate `Realistic swarm soak` workflow retains the baseline experiment for
+comparison. Its one engine/controller/IPC owner manages three fixed private
+torrents: two initial parallel downloads and a pre-existing control seed. The
+`large` profile downloads a 2 GiB + 256 KiB single file and a 2 GiB, three-file
+torrent. File boundaries intentionally cross piece boundaries. The `smoke`
+profile uses the same code with approximately 16 MiB downloads. Both profiles
+keep only one 16 KiB deterministic template per torrent, a piece-sized hashing
+buffer and bounded connection pools; fixture memory is not proportional to the
+download size. All traffic remains on loopback.
+
+Two complementary peers must contribute to each initial download. A barrier
+requires both torrents to request data before the fixture releases any response,
+proving overlapping downloads rather than sequential completion. Tracker replies
+rotate between two pairs of source endpoints. Each cycle reconnects validating
+receivers, exercises the large file tail, disconnects old source generations,
+truncates a real peer frame and repairs a damaged piece in each torrent. The first
+multi-file repair damages bytes on both sides of a file boundary within one piece.
+Independent streaming byte comparison verifies every file after download/repair;
+healthy pieces must not be fetched again. The control seed retains one permanent
+TCP connection while this happens.
+
+Cycles rotate HTTP 503, dropped tracker replies and silent-response timeouts.
+Each injected failure must appear in the real announce journal and be followed by
+a successful reply before continuing. HTTP announces now have a ten-second
+request/body deadline, matching the bounded UDP request timeout. Additional
+HTTP/UDP regressions cover lost completion acknowledgements, timeout recovery,
+and truthful shutdown failures. A lost acknowledgement may make the tracker
+receive the same `completed` request twice; only a successful reply settles the
+client's lifecycle state. The journal must not invent tracker acceptance.
+
+Reliability CI runs the 180-second smoke profile; Coverage instruments 120 seconds
+and the same source. Each run requires at least three complete cycles, including
+all three tracker faults, even if setup/repair extends beyond the requested
+minimum duration. Before a four-hour run, execute a short `large` gate:
+
+```powershell
+gh workflow run realistic-swarm-soak.yml --repo javaquasar/peerlume --ref main -f seconds=180 -f profile=large
+gh workflow run realistic-swarm-soak.yml --repo javaquasar/peerlume --ref main -f seconds=14400 -f profile=large
+```
+
+Do not launch the second command until CI and the first run's complete evidence
+have passed review. A long run is never silently replaced after failure. The
+workflow requires 8 GiB free disk for the large profile and permits five hours
+including compilation and bounded final-cycle completion.
+
+The `realistic-swarm-soak` artifact contains `resources.jsonl` and `announces.jsonl`.
+The final result requires one unchanged engine, three fixed identities, concurrent
+verified initial downloads, positive validated uploads/refetches, peer churn and
+truncation evidence, all fault/recovery types, exactly one successful completion
+per newly downloaded torrent, no completion for the control seed, and final real
+successful stopped replies. Only the explicitly recorded injected failures may
+be non-successful journal entries. Actual counters remain cumulative and accurate.
+Source-written bytes can exceed client-received bytes when connections/frames
+are interrupted; compare network totals against the independently verified payload
+floor, not against every byte written by a fixture socket. Existing RSS/thread/
+handle growth and SQLite/journal/report budgets remain unchanged. Neither this
+loopback test nor its four-hour duration closes the 24-hour release gate or proves
+the absence of every memory leak.

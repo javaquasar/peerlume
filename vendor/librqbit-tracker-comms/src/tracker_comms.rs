@@ -19,6 +19,8 @@ pub use lifecycle::{forget_torrent_lifecycle, stop_session_announces, stop_torre
 
 /// Cap decoded HTTP bodies before bencode parsing or peer-list allocation.
 pub const MAX_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
+/// A silent HTTP tracker must not retain the worker/transport lock forever.
+pub const HTTP_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn bounded_response_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
     if response.content_length().is_some_and(|n| n > MAX_TRACKER_RESPONSE_BYTES as u64) { anyhow::bail!("Tracker response exceeds the 1 MiB limit"); }
@@ -350,7 +352,7 @@ impl TrackerComms {
 
         let result = async {
             let response: reqwest::Response =
-                self.reqwest_client.get(url).send().await.map_err(|e| {
+                self.reqwest_client.get(url).timeout(HTTP_ANNOUNCE_TIMEOUT).send().await.map_err(|e| {
                     log.record.outcome = if e.is_timeout() {
                         "timeout"
                     } else {
@@ -369,9 +371,9 @@ impl TrackerComms {
             let bytes = match bounded_response_body(response).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    log.record.outcome = "response_read_error".into();
+                    log.record.outcome = if error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_timeout()) { "timeout" } else { "response_read_error" }.into();
                     // Fixed wording: never propagate an HTTP error containing a credential URL.
-                    log.record.reply.failure = Some("Tracker response could not be read within the 1 MiB limit".into());
+                    log.record.reply.failure = Some("Tracker response could not be read within the size/time limits".into());
                     return Err(error);
                 }
             };

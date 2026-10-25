@@ -359,6 +359,8 @@ mod continuous_soak;
 #[cfg(test)]
 pub(crate) mod soak_tests;
 #[cfg(test)]
+mod swarm_soak;
+#[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

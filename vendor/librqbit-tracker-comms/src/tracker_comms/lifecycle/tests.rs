@@ -9,6 +9,8 @@ struct Tracker {
     worker: tokio::task::JoinHandle<()>,
     fail_completion: Arc<AtomicUsize>,
     wire_events: Arc<Mutex<Vec<Option<String>>>>,
+    drop_completion: Arc<AtomicUsize>,
+    stall_completion: Arc<AtomicUsize>,
 }
 impl Drop for Tracker {
     fn drop(&mut self) {
@@ -21,6 +23,10 @@ impl Tracker {
         let fail = fail_completion.clone();
         let wire_events = Arc::new(Mutex::new(Vec::new()));
         let received = wire_events.clone();
+        let drop_completion = Arc::new(AtomicUsize::new(0));
+        let drop_reply = drop_completion.clone();
+        let stall_completion = Arc::new(AtomicUsize::new(0));
+        let stall = stall_completion.clone();
         if udp {
             let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let url =
@@ -43,6 +49,15 @@ impl Tracker {
                             0 => None,
                             _ => panic!("invalid wire event"),
                         });
+                        if event == 1
+                            && drop_reply
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok()
+                        {
+                            continue;
+                        }
                         if hang_stop && event == 3 {
                             continue;
                         }
@@ -71,6 +86,8 @@ impl Tracker {
                 worker,
                 fail_completion,
                 wire_events,
+                drop_completion,
+                stall_completion,
             }
         } else {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -98,6 +115,20 @@ impl Tracker {
                         .find(|(k, _)| k == "event")
                         .map(|(_, v)| v.into_owned());
                     received.lock().unwrap().push(event.clone());
+                    if event.as_deref() == Some("completed")
+                        && drop_reply
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                n.checked_sub(1)
+                            })
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                    let delay = if event.as_deref() == Some("completed") {
+                        stall.swap(0, Ordering::Relaxed)
+                    } else {
+                        0
+                    };
                     if hang_stop && event.as_deref() == Some("stopped") {
                         std::future::pending::<()>().await;
                     }
@@ -117,7 +148,15 @@ impl Tracker {
                         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
+                    if delay == 1 {
+                        tokio::time::sleep(HTTP_ANNOUNCE_TIMEOUT + Duration::from_millis(300))
+                            .await;
+                    }
                     let _ = stream.write_all(header.as_bytes()).await;
+                    if delay == 2 {
+                        tokio::time::sleep(HTTP_ANNOUNCE_TIMEOUT + Duration::from_millis(300))
+                            .await;
+                    }
                     let _ = stream.write_all(&body).await;
                 }
             });
@@ -126,6 +165,8 @@ impl Tracker {
                 worker,
                 fail_completion,
                 wire_events,
+                drop_completion,
+                stall_completion,
             }
         }
     }
@@ -190,10 +231,7 @@ impl Harness {
             force_tracker_interval: None,
             tx,
             announce_port: 6881,
-            reqwest_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+            reqwest_client: reqwest::Client::builder().build().unwrap(),
             key: 17,
             reporting: Arc::new(ReportingPolicy::new(mode, 32768, 8192)),
             hooks: crate::observation::hooks_for(peer),
@@ -228,7 +266,11 @@ impl Harness {
         self.observations.lock().unwrap().clone()
     }
     async fn wait_for(&self, event: Option<&str>, outcome: &str) {
-        tokio::time::timeout(Duration::from_secs(4), async {
+        self.wait_for_with(event, outcome, Duration::from_secs(4))
+            .await;
+    }
+    async fn wait_for_with(&self, event: Option<&str>, outcome: &str, deadline: Duration) {
+        tokio::time::timeout(deadline, async {
             loop {
                 if self
                     .records()
@@ -474,6 +516,91 @@ fn unreachable_stop_is_bounded_and_never_logged_as_success() {
                 h.records()
                     .iter()
                     .any(|r| r.event.as_deref() == Some("stopped") && r.outcome == "cancelled")
+            );
+        }
+    });
+}
+
+#[test]
+fn lost_http_and_udp_completion_replies_are_not_acknowledged_and_are_retried() {
+    run(async {
+        for udp in [false, true] {
+            let tracker = Tracker::new(udp, 0, false).await;
+            let h = Harness::new(&tracker, ReportingMode::Accurate, 0, 0).await;
+            tracker.drop_completion.store(1, Ordering::Relaxed);
+            h.complete();
+            h.wait_for_with(
+                Some("completed"),
+                if udp { "udp_error" } else { "transport_error" },
+                Duration::from_secs(15),
+            )
+            .await;
+            assert_eq!(
+                h.successful("completed"),
+                0,
+                "a lost reply is not tracker acceptance"
+            );
+            h.stop().await;
+            assert_eq!(h.successful("completed"), 1);
+            assert_eq!(h.successful("stopped"), 1);
+            assert_eq!(
+                tracker
+                    .wire_events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.as_deref() == Some("completed"))
+                    .count(),
+                2,
+                "the real tracker receives a retry when its first acknowledgement is lost"
+            );
+            assert_eq!(
+                h.records()
+                    .iter()
+                    .filter(|r| r.event.as_deref() == Some("completed") && r.outcome != "ok")
+                    .count(),
+                1
+            );
+        }
+    });
+}
+
+#[test]
+fn silent_http_headers_and_bodies_time_out_then_recover_without_fake_success() {
+    run(async {
+        for delay in [1, 2] {
+            let tracker = Tracker::new(false, 0, false).await;
+            let h = Harness::new(&tracker, ReportingMode::Accurate, 0, 0).await;
+            tracker.stall_completion.store(delay, Ordering::Relaxed);
+            h.complete();
+            h.wait_for_with(
+                Some("completed"),
+                "timeout",
+                HTTP_ANNOUNCE_TIMEOUT + Duration::from_secs(5),
+            )
+            .await;
+            let failed = h
+                .records()
+                .into_iter()
+                .find(|r| r.outcome == "timeout")
+                .unwrap();
+            assert_eq!(
+                failed.request_transmitted,
+                if delay == 2 { Some(true) } else { None }
+            );
+            assert_eq!(h.successful("completed"), 0);
+            h.stop().await;
+            assert_eq!(h.successful("completed"), 1);
+            assert_eq!(h.successful("stopped"), 1);
+            assert_eq!(
+                tracker
+                    .wire_events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.as_deref() == Some("completed"))
+                    .count(),
+                2
             );
         }
     });

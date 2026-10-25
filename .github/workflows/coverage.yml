@@ -62,6 +62,14 @@ jobs:
             export PEERLUME_SOAK_REPORT="$PWD/coverage/continuous-$mode/resources.jsonl"
             cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
           done
+      - name: Include streamed multi-file swarm and network fault recovery
+        env:
+          PEERLUME_SWARM_SECONDS: '120'
+          PEERLUME_SWARM_PROFILE: smoke
+        run: |
+          mkdir -p coverage/swarm
+          export PEERLUME_SWARM_REPORT="$PWD/coverage/swarm/resources.jsonl"
+          cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_realistic_swarm_soak -- --ignored --test-threads=1 --nocapture
       - name: Generate LCOV and HTML reports without rerunning tests
         run: |
           cargo +stable llvm-cov report --json --summary-only --output-path coverage/summary.json
