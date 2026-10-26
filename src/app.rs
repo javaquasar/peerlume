@@ -15,6 +15,8 @@ use std::{
 use eframe::egui;
 
 mod file_location;
+#[cfg(test)]
+mod header_tests;
 
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
@@ -1422,57 +1424,11 @@ impl PeerLumeApp {
         let mut commands = Vec::new();
         let torrent = &mut self.control.torrents[self.selected_torrent];
         let torrent_id = torrent.info_hashes.join(";");
-        ui.horizontal(|ui| {
-            ui.heading(&torrent.name);
-            ui.separator();
-            if torrent.state == TorrentState::Paused {
-                if ui.button("Resume").clicked() {
-                    commands.push(TorrentCommand::Resume);
-                }
-            } else if ui.button("Pause").clicked() {
-                commands.push(TorrentCommand::Pause);
-            }
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Files,
-                DetailsTab::Files.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Info,
-                DetailsTab::Info.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Settings,
-                DetailsTab::Settings.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Peers,
-                DetailsTab::Peers.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Trackers,
-                DetailsTab::Trackers.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Pieces,
-                DetailsTab::Pieces.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Log,
-                DetailsTab::Log.label(),
-            );
-            ui.selectable_value(
-                &mut self.details_tab,
-                DetailsTab::Status,
-                DetailsTab::Status.label(),
-            );
-        });
+        if let Some(command) =
+            Self::show_torrent_header(ui, &torrent.name, torrent.state, &mut self.details_tab)
+        {
+            commands.push(command);
+        }
         match self.details_tab {
             DetailsTab::Status => {
                 let last = self.control.backend.journal().and_then(|j| {
@@ -1715,6 +1671,34 @@ impl PeerLumeApp {
         {
             self.add_status = status;
         }
+    }
+
+    fn show_torrent_header(
+        ui: &mut egui::Ui,
+        name: &str,
+        state: TorrentState,
+        details_tab: &mut DetailsTab,
+    ) -> Option<TorrentCommand> {
+        let mut command = None;
+        // Keep these as separate rows even inside a horizontal parent layout.
+        ui.vertical(|ui| {
+            ui.add(egui::Label::new(egui::RichText::new(name).heading()).wrap());
+            ui.horizontal_wrapped(|ui| {
+                let (label, action) = if state == TorrentState::Paused {
+                    ("Resume", TorrentCommand::Resume)
+                } else {
+                    ("Pause", TorrentCommand::Pause)
+                };
+                if ui.button(label).clicked() {
+                    command = Some(action);
+                }
+                ui.separator();
+                for tab in DetailsTab::ALL {
+                    ui.selectable_value(details_tab, tab, tab.label());
+                }
+            });
+        });
+        command
     }
 
     fn submit_torrent_commands(
