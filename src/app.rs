@@ -17,6 +17,10 @@ use eframe::egui;
 mod file_location;
 #[cfg(test)]
 mod header_tests;
+#[cfg(test)]
+mod name_tests;
+#[cfg(test)]
+mod torrent_menu_tests;
 
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
@@ -833,6 +837,7 @@ impl PeerLumeApp {
             ui.add_space(6.0);
             let mut directory_to_open = None;
             let mut trash_action = None;
+            let mut recheck_action = None;
             ui.scope(|ui| {
                 ui.style_mut().spacing.scroll.floating = false;
                 egui::ScrollArea::horizontal()
@@ -850,22 +855,17 @@ impl PeerLumeApp {
                                 }
                                 ui.end_row();
                                 for (index, torrent) in self.control.torrents.iter().enumerate() {
-                                    let name = if torrent.is_private {
-                                        format!("[Private] {}", torrent.name)
-                                    } else {
-                                        torrent.name.clone()
-                                    };
-                                    let response = ui
-                                        .add_sized(
-                                            [420.0, 20.0],
-                                            egui::Button::selectable(
-                                                self.selected_torrent == index,
-                                                name,
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&torrent.name);
+                                    let response = Self::show_torrent_name(
+                                        ui,
+                                        &torrent.name,
+                                        torrent.is_private,
+                                        self.selected_torrent == index,
+                                    );
                                     response.context_menu(|ui| {
+                                        if let Some(action) = Self::show_recheck_menu(ui, torrent) {
+                                            recheck_action = Some(action);
+                                        }
+                                        ui.separator();
                                         if ui.button("Open download folder").clicked() {
                                             let effective = EffectiveTorrentSettings::resolve(
                                                 &self.settings,
@@ -965,6 +965,11 @@ impl PeerLumeApp {
             }
             if let Some((id, scope)) = trash_action {
                 self.prepare_trash_request(&id, scope);
+            }
+            if let Some((id, command)) = recheck_action
+                && let Some(status) = Self::submit_torrent_commands(&mut self.control, &id, vec![command])
+            {
+                self.add_status = status;
             }
             ui.separator();
             self.show_selected_torrent(ui);
@@ -1671,6 +1676,46 @@ impl PeerLumeApp {
         {
             self.add_status = status;
         }
+    }
+
+    fn show_recheck_menu(
+        ui: &mut egui::Ui,
+        torrent: &TorrentItem,
+    ) -> Option<(String, TorrentCommand)> {
+        let checking = torrent.state == TorrentState::Checking
+            || matches!(
+                torrent.completion,
+                crate::completion::CompletionStatus::Checking { .. }
+            );
+        if ui.add_enabled(!checking, egui::Button::new("Force recheck and repair"))
+            .on_hover_text("Check the selected files, resume downloading missing or corrupt pieces, and verify again. Keeps the current tracker mode and saved automatic-repair setting.")
+            .clicked()
+        {
+            ui.close();
+            Some((torrent.info_hashes.join(";"), TorrentCommand::RecheckAndRepair))
+        } else {
+            None
+        }
+    }
+
+    fn show_torrent_name(
+        ui: &mut egui::Ui,
+        name: &str,
+        is_private: bool,
+        selected: bool,
+    ) -> egui::Response {
+        let label = if is_private {
+            format!("[Private] {name}")
+        } else {
+            name.to_owned()
+        };
+        ui.add_sized(
+            [420.0, 20.0],
+            // Put all spare space after the text, preserving the full clickable
+            // row, selection styling, truncation, and the existing context menu.
+            egui::Button::selectable(selected, (label, egui::Atom::grow())).truncate(),
+        )
+        .on_hover_text(name)
     }
 
     fn show_torrent_header(

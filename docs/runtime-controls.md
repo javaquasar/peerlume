@@ -38,6 +38,31 @@ Freeze snapshots survive pause, recheck and repair. Explicitly applying a mode
 (even the same freeze mode) replaces the policy and clears its snapshot. Restarting
 the application also creates a new snapshot; the byte threshold itself is saved.
 
+## Forced integrity check and repair
+
+In egui, right-click a torrent name and choose **Force recheck and repair**.
+The action targets that row, even when another torrent is selected. It is disabled
+while an integrity check is already running.
+
+This is an explicit, one-shot request to read and hash the selected payload,
+resume the torrent (including a previously paused torrent), download missing or
+corrupt required pieces, and hash the files again before showing **Done**. Valid
+pieces are not downloaded again. A missing source `.torrent` file is not required
+once the engine has resolved its metadata. The same engine, file selection,
+download directory, tracker URLs, reporting mode, freeze snapshot and cumulative
+network counters are retained.
+
+The action works even when automatic repair is disabled. It does not change the
+saved automatic-repair or post-download-verification settings. The existing repair
+attempt limit still applies (3 by default), and the normal stall timeout and
+storage-error handling remain in force. A user pause prevents automatic
+continuation; resuming an ongoing repair retains its consumed attempts. Plain
+**Recheck files** in the Log tab keeps its existing pause/policy semantics.
+
+The shared agent mutation command `{"kind":"recheck_and_repair"}` uses the same
+path and requires the management grant. Acceptance is not completion: the
+operation waits for a fresh check and actual verification, or reports failure.
+
 ## Automatic repair
 
 Automatic repair is **off by default**. Enable it when adding a torrent or in its

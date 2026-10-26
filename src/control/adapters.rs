@@ -207,7 +207,7 @@ pub fn input_schema() -> Value {
 }
 
 fn command_schema() -> Value {
-    let mut variants:Vec<Value>=["pause","resume","recheck","remove"].iter().map(|name|json!({"type":"object","properties":{"kind":{"const":name}},"required":["kind"],"additionalProperties":false})).collect();
+    let mut variants:Vec<Value>=["pause","resume","recheck","recheck_and_repair","remove"].iter().map(|name|json!({"type":"object","properties":{"kind":{"const":name}},"required":["kind"],"additionalProperties":false})).collect();
     for (kind, value) in [
         ("set_verify_after_download", json!({"type":"boolean"})),
         (

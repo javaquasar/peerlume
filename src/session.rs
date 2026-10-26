@@ -77,6 +77,9 @@ pub enum SessionCommand {
     Recheck {
         id: String,
     },
+    RecheckAndRepair {
+        id: String,
+    },
     SetVerifyAfterDownload {
         id: String,
         enabled: bool,
@@ -305,6 +308,7 @@ impl SessionRuntime {
                     let mut pending_modes = HashMap::<String, ModeConfig>::new();
                     let mut pending_resume = std::collections::HashSet::<String>::new();
                     let mut repairs = HashMap::<String, RepairBudget>::new();
+                    let mut manual_repairs = std::collections::HashSet::<String>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -320,6 +324,7 @@ impl SessionRuntime {
                                     let mut stats = handle.stats();
                                     if let Some(message) = stats.error.clone() {
                                         if checks.remove(&id).is_some() {
+                                            manual_repairs.remove(&id);
                                             check_failed.insert(id.clone());
                                             let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "Integrity check could not read or validate the files".into() } });
                                         } else { let _ = event_tx.send(SessionEvent::Error { id, message }); }
@@ -351,7 +356,7 @@ impl SessionRuntime {
                                     if let Some(run) = checks.remove(&id) {
                                         initializing.remove(&id);
                                         if run.require_complete && !stats.finished {
-                                            let policy = controls::repair_policy(added_commands.get(&id));
+                                            let policy = controls::recovery_policy(added_commands.get(&id), manual_repairs.contains(&id));
                                             let budget = repairs.entry(id.clone()).or_insert_with(|| RepairBudget::new(std::time::Instant::now()));
                                             if run.resume && budget.start(policy, stats.progress_bytes, std::time::Instant::now()) && session.unpause(&handle).await.is_ok() {
                                                     checked_after_download.remove(&id);
@@ -360,12 +365,13 @@ impl SessionRuntime {
                                                     let _ = event_tx.send(SessionEvent::StateChanged { id: id.clone(), state: "downloading" });
                                                     continue;
                                             }
-                                            if policy.enabled && run.resume { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Exhausted { attempts: budget.used, limit: policy.max_attempts, message: "Automatic recovery stopped; inspect peers and files before resuming".into() } }); }
+                                            if policy.enabled && run.resume { manual_repairs.remove(&id); let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Exhausted { attempts: budget.used, limit: policy.max_attempts, message: "Automatic recovery stopped; inspect peers and files before resuming".into() } }); }
                                             check_failed.insert(id.clone());
                                             let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message: "One or more selected pieces are missing or failed their hash check. Repair the files and recheck, or resume to download them again.".into() } });
                                             continue;
                                         }
                                         if stats.finished {
+                                            manual_repairs.remove(&id);
                                             checked_after_download.insert(id.clone());
                                             if let Some(budget) = repairs.remove(&id) && budget.used > 0 { let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Succeeded { attempts: budget.used } }); }
                                         }
@@ -390,7 +396,7 @@ impl SessionRuntime {
                                         let resume = !matches!(stats.state, TorrentStatsState::Paused);
                                         match restart_for_check(&session, &handle, &added_commands[&id], session_peer_id.0, &counters, storage_roots.get(&id)).await {
                                             Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id, CheckRun { resume, require_complete: true }); }
-                                            Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
+                                            Err(message) => { manual_repairs.remove(&id); check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id, status: CompletionStatus::Failed { message } }); }
                                         }
                                         continue;
                                     }
@@ -429,18 +435,33 @@ impl SessionRuntime {
                                     SessionCommand::PreparedAdd{command,prepared} if matches!(*command,SessionCommand::AddTorrent{..})=>(*command,Some(prepared)),
                                     other=>(other,None),
                                 };
-                                if let SessionCommand::Recheck { id } = &command {
-                                    if checks.contains_key(id) { continue; }
-                                    let Some(handle) = torrents.get(id).cloned() else { continue; };
+                                let recheck = match &command {
+                                    SessionCommand::Recheck { id } => Some((id, false)),
+                                    SessionCommand::RecheckAndRepair { id } => Some((id, true)),
+                                    _ => None,
+                                };
+                                if let Some((id, manual)) = recheck {
+                                    if checks.contains_key(id) {
+                                        if manual { let _ = event_tx.send(SessionEvent::Error { id: id.clone(), message: "An integrity check is already running".into() }); }
+                                        continue;
+                                    }
+                                    let Some(handle) = torrents.get(id).cloned() else {
+                                        if manual { let _ = event_tx.send(SessionEvent::Error { id: id.clone(), message: "Torrent is not registered in the transfer engine".into() }); }
+                                        continue;
+                                    };
                                     let stats = handle.stats();
-                                    let resume = !matches!(stats.state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
-                                    let require_complete = stats.finished || check_failed.contains(id);
+                                    let resume = manual || !matches!(stats.state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
+                                    let require_complete = manual || stats.finished || check_failed.contains(id);
                                     transfers(handle.info_hash().0);
                                     let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Checking { checked_bytes: 0, total_bytes: stats.total_bytes } });
                                     let Some(saved) = added_commands.get(id) else { continue; };
                                     match restart_for_check(&session, &handle, saved, session_peer_id.0, &counters, storage_roots.get(id)).await {
-                                        Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.send(SessionEvent::Added { id: id.clone() }); }
-                                        Err(message) => { check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
+                                        Ok(checked) => {
+                                            if manual { manual_repairs.insert(id.clone()); repairs.remove(id); let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Idle }); }
+                                            else { manual_repairs.remove(id); }
+                                            torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete }); check_failed.remove(id); checked_after_download.remove(id); let _ = event_tx.send(SessionEvent::Added { id: id.clone() });
+                                        }
+                                        Err(message) => { manual_repairs.remove(id); check_failed.insert(id.clone()); let _ = event_tx.send(SessionEvent::Verification { id: id.clone(), status: CompletionStatus::Failed { message } }); }
                                     }
                                     continue;
                                 }
@@ -565,7 +586,7 @@ impl SessionRuntime {
                                         if let Some(run) = checks.get_mut(&id) { run.resume = true; continue; }
                                         if check_failed.remove(&id) {
                                             checked_after_download.remove(&id);
-                                            let policy = controls::repair_policy(added_commands.get(&id));
+                                            let policy = controls::recovery_policy(added_commands.get(&id), manual_repairs.contains(&id));
                                             let mut budget = RepairBudget::new(std::time::Instant::now());
                                             if policy.enabled && budget.start(policy, torrents.get(&id).map(|h| h.stats().progress_bytes).unwrap_or(0), std::time::Instant::now()) {
                                                 let _ = event_tx.send(SessionEvent::Repair { id: id.clone(), status: RepairStatus::Downloading { attempt: budget.used, limit: policy.max_attempts } });
@@ -611,6 +632,7 @@ impl SessionRuntime {
                                                 pending_modes.remove(&id);
                                                 pending_resume.remove(&id);
                                                 repairs.remove(&id);
+                                                manual_repairs.remove(&id);
                                                 SessionEvent::Removed { id }
                                             },
                                             Err(message) => SessionEvent::Error { id, message },
@@ -629,7 +651,7 @@ impl SessionRuntime {
                                         let _ = event_tx.send(SessionEvent::Stopped);
                                         break;
                                     }
-                                    SessionCommand::Recheck { .. } => unreachable!("recheck expanded above"),
+                                    SessionCommand::Recheck { .. } | SessionCommand::RecheckAndRepair { .. } => unreachable!("recheck expanded above"),
                                     SessionCommand::SetVerifyAfterDownload { id, enabled } => {
                                         if let Some(SessionCommand::AddTorrent { verify_after_download, repair_policy, .. }) = added_commands.get_mut(&id) {
                                             *verify_after_download = enabled || repair_policy.enabled;

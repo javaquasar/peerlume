@@ -781,7 +781,7 @@ impl AgentService {
                 ) => id == target && config == actual,
                 (
                     Method::Mutate {
-                        command: TorrentCommand::Recheck,
+                        command: TorrentCommand::Recheck | TorrentCommand::RecheckAndRepair,
                         ..
                     },
                     SessionEvent::Verification { id, status },
@@ -882,6 +882,7 @@ fn command_name(command: &TorrentCommand) -> &'static str {
         TorrentCommand::Pause => "pause",
         TorrentCommand::Resume => "resume",
         TorrentCommand::Recheck => "recheck",
+        TorrentCommand::RecheckAndRepair => "recheck_and_repair",
         TorrentCommand::SetMode(_) => "set_mode",
         TorrentCommand::SetRepairPolicy(_) => "set_repair_policy",
         TorrentCommand::SetVerifyAfterDownload(_) => "set_verify_after_download",

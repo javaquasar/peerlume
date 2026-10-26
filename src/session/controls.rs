@@ -63,3 +63,48 @@ pub(super) fn repair_policy(saved: Option<&SessionCommand>) -> RepairPolicy {
         _ => RepairPolicy::default(),
     }
 }
+
+/// A manual recovery episode enables repair only in memory; saved settings and
+/// the configured attempt limit are unchanged.
+pub(super) fn recovery_policy(saved: Option<&SessionCommand>, manual: bool) -> RepairPolicy {
+    let mut policy = repair_policy(saved);
+    policy.enabled |= manual;
+    policy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_recovery_keeps_the_configured_limit_and_never_changes_saved_settings() {
+        let mut torrent = crate::client::tests::torrent();
+        torrent.overrides.repair_policy = RepairPolicy {
+            enabled: false,
+            max_attempts: 2,
+        };
+        let saved = crate::client::add_torrent_command(
+            &torrent,
+            &crate::settings::ClientSettings::default(),
+        );
+        let before = saved.clone();
+        let manual = recovery_policy(Some(&saved), true);
+        assert_eq!(
+            manual,
+            RepairPolicy {
+                enabled: true,
+                max_attempts: 2
+            }
+        );
+        let now = std::time::Instant::now();
+        let mut budget = RepairBudget::new(now);
+        assert!(budget.start(manual, 0, now));
+        assert!(budget.start(manual, 0, now));
+        assert!(!budget.start(manual, 0, now));
+        assert_eq!(
+            recovery_policy(Some(&saved), false),
+            torrent.overrides.repair_policy
+        );
+        assert_eq!(saved, before);
+    }
+}

@@ -29,6 +29,7 @@ fn every_existing_command_uses_canonical_identity_and_does_not_claim_completion(
         TorrentCommand::Pause,
         TorrentCommand::Resume,
         TorrentCommand::Recheck,
+        TorrentCommand::RecheckAndRepair,
         TorrentCommand::SetMode(ModeConfig::default()),
         TorrentCommand::SetRepairPolicy(RepairPolicy::default()),
         TorrentCommand::SetVerifyAfterDownload(true),
@@ -73,6 +74,71 @@ fn every_existing_command_uses_canonical_identity_and_does_not_claim_completion(
         assert_eq!(row.state, ObservedState::AwaitingEngine);
         assert_eq!(row.mode_state, ObservedModeState::AwaitingEngine);
     }
+}
+
+#[test]
+fn manual_recovery_maps_to_one_atomic_engine_command_without_changing_settings() {
+    let mut control = controller();
+    let before = control.torrents[0].overrides.clone();
+    assert_eq!(
+        accept(&mut control, TorrentCommand::RecheckAndRepair),
+        SessionCommand::RecheckAndRepair {
+            id: "v1: abc".into()
+        }
+    );
+    assert_eq!(
+        control.torrents[0].overrides.repair_policy,
+        before.repair_policy
+    );
+    assert_eq!(control.torrents[0].mode_config().mode, before.download_mode);
+    assert!(!control.torrents[0].overrides.verify_after_download);
+}
+
+#[test]
+fn manual_recovery_of_healthy_paused_files_resumes_and_preserves_persisted_policies() {
+    let mut fixture = LiveFixture::new();
+    let config = ModeConfig {
+        mode: DownloadMode::NoProgress,
+        ..Default::default()
+    };
+    fixture
+        .controller
+        .submit(&fixture.id, TorrentCommand::SetMode(config), None)
+        .unwrap();
+    fixture.wait_for(|f| f.controller.torrents[0].runtime.mode.active() == Some(config));
+    fixture
+        .controller
+        .submit(&fixture.id, TorrentCommand::RecheckAndRepair, None)
+        .unwrap();
+    fixture.wait_for(|f| {
+        matches!(
+            f.controller.torrents[0].completion,
+            CompletionStatus::Checking { .. }
+        )
+    });
+    fixture.wait_for(|f| {
+        f.controller.torrents[0].completion == CompletionStatus::Verified
+            && f.controller.torrents[0].state == TorrentState::Seeding
+    });
+    assert_eq!(
+        fixture.controller.torrents[0].runtime.mode.active(),
+        Some(config)
+    );
+    assert_eq!(
+        fixture.controller.torrents[0].overrides.repair_policy,
+        RepairPolicy::default()
+    );
+    let record = fixture
+        .controller
+        .backend
+        .load_torrents()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id == fixture.id)
+        .unwrap();
+    assert_eq!(record.repair_policy, RepairPolicy::default());
+    assert_eq!(record.download_mode, DownloadMode::NoProgress);
+    assert!(!record.verify_after_download);
 }
 
 #[test]

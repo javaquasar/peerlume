@@ -28,6 +28,7 @@ pub enum TorrentCommand {
     Pause,
     Resume,
     Recheck,
+    RecheckAndRepair,
     SetMode(ModeConfig),
     SetRepairPolicy(RepairPolicy),
     SetVerifyAfterDownload(bool),
@@ -94,6 +95,7 @@ impl TorrentCommand {
             Self::Pause => SessionCommand::Pause { id },
             Self::Resume => SessionCommand::Resume { id },
             Self::Recheck => SessionCommand::Recheck { id },
+            Self::RecheckAndRepair => SessionCommand::RecheckAndRepair { id },
             Self::Remove => SessionCommand::Remove { id },
             Self::SetMode(config) => {
                 config

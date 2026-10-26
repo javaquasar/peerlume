@@ -352,6 +352,20 @@ fn automatic_repair_does_not_override_a_user_paused_integrity_check() {
 
 #[test]
 pub(super) fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_reporting_mode() {
+    repair_download_scenario(false, false);
+}
+
+#[test]
+fn forced_recheck_repairs_corruption_from_paused_without_enabling_automatic_repair() {
+    repair_download_scenario(true, false);
+}
+
+#[test]
+fn forced_recheck_downloads_a_missing_file_then_verifies_it() {
+    repair_download_scenario(true, true);
+}
+
+fn repair_download_scenario(forced: bool, missing: bool) {
     use crate::protocol::{HANDSHAKE_LENGTH, Handshake, PeerMessage};
     use std::{
         io::{Read, Write},
@@ -469,45 +483,56 @@ pub(super) fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_repo
         })
         .unwrap();
     fixture.wait_for(|e| matches!(e, SessionEvent::Mode { application: ModeApplication::Active { config: actual, tracker_enabled: true }, .. } if *actual == config));
-    let mut damaged = fixture.payload.clone();
-    damaged[1] ^= 0xff;
-    fs::write(fixture.root.path().join("output/payload.bin"), damaged).unwrap();
-    fixture
-        .runtime()
-        .try_send(SessionCommand::Resume {
-            id: fixture.id.clone(),
-        })
-        .unwrap();
-    fixture.wait_for(|e| {
-        matches!(
-            e,
-            SessionEvent::StateChanged {
-                state: "downloading",
-                ..
-            }
-        )
-    });
-    fixture
-        .runtime()
-        .try_send(SessionCommand::SetRepairPolicy {
-            id: fixture.id.clone(),
-            policy: RepairPolicy {
-                enabled: true,
-                max_attempts: 2,
-            },
-        })
-        .unwrap();
-    fixture.wait_for(|e| {
-        matches!(
-            e,
-            SessionEvent::Repair {
-                status: RepairStatus::Downloading {
-                    attempt: 1,
-                    limit: 2
+    if missing {
+        fs::remove_file(fixture.root.path().join("output/payload.bin")).unwrap();
+    } else {
+        let mut damaged = fixture.payload.clone();
+        damaged[1] ^= 0xff;
+        fs::write(fixture.root.path().join("output/payload.bin"), damaged).unwrap();
+    }
+    let expected_download = if missing { 32768 } else { 16384 };
+    if forced {
+        // The action uses resolved metadata, not the original source file.
+        fs::remove_file(fixture.root.path().join("fixture.torrent")).unwrap();
+        fixture
+            .runtime()
+            .try_send(SessionCommand::RecheckAndRepair {
+                id: fixture.id.clone(),
+            })
+            .unwrap();
+    } else {
+        fixture
+            .runtime()
+            .try_send(SessionCommand::Resume {
+                id: fixture.id.clone(),
+            })
+            .unwrap();
+        fixture.wait_for(|e| {
+            matches!(
+                e,
+                SessionEvent::StateChanged {
+                    state: "downloading",
+                    ..
+                }
+            )
+        });
+        fixture
+            .runtime()
+            .try_send(SessionCommand::SetRepairPolicy {
+                id: fixture.id.clone(),
+                policy: RepairPolicy {
+                    enabled: true,
+                    max_attempts: 2,
                 },
-                ..
-            }
-        )
+            })
+            .unwrap();
+        fixture.wait_for(|e| matches!(e, SessionEvent::RepairPolicy { .. }));
+    }
+    let limit = if forced { 3 } else { 2 };
+    let engine = fixture.runtime().test_engine().unwrap();
+    fixture.wait_for(|e| {
+        assert!(!forced || !matches!(e, SessionEvent::RepairPolicy { .. }), "A one-shot repair changed the saved policy");
+        matches!(e, SessionEvent::Repair { status: RepairStatus::Downloading { attempt: 1, limit: actual_limit }, .. } if *actual_limit == limit)
     });
     fixture.wait_for(|e| {
         matches!(
@@ -533,19 +558,25 @@ pub(super) fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_repo
         fixture.payload
     );
     assert!(!requests.lock().unwrap().is_empty());
+    if missing {
+        let requests = requests.lock().unwrap();
+        assert!(requests.contains(&0) && requests.contains(&1));
+    } else {
+        assert!(
+            requests.lock().unwrap().iter().all(|index| *index == 0),
+            "healthy piece must not be downloaded again"
+        );
+    }
     assert!(
-        requests.lock().unwrap().iter().all(|index| *index == 0),
-        "healthy piece must not be downloaded again"
+        Arc::ptr_eq(&engine, &fixture.runtime().test_engine().unwrap()),
+        "repair replaced the engine"
     );
+    drop(engine);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if fixture
-            .runtime()
-            .journal
-            .entries(None)
-            .iter()
-            .any(|e| e.announce.actual.downloaded >= 16384 && e.announce.outcome == "ok")
-        {
+        if fixture.runtime().journal.entries(None).iter().any(|e| {
+            e.announce.actual.downloaded >= expected_download && e.announce.outcome == "ok"
+        }) {
             break;
         }
         assert!(Instant::now() < deadline, "no real repair announce");
@@ -587,7 +618,7 @@ pub(super) fn automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_repo
                 e.sequence > before && e.announce.mode == mode.id() && e.announce.outcome == "ok"
             }) {
                 assert_eq!(
-                    entry.announce.actual.downloaded, 16384,
+                    entry.announce.actual.downloaded, expected_download,
                     "mode changes must preserve real network totals"
                 );
                 let expected = mode

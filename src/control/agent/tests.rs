@@ -145,6 +145,7 @@ fn all_permission_combinations_are_enforced_for_every_command_kind() {
         TorrentCommand::Pause,
         TorrentCommand::Resume,
         TorrentCommand::Recheck,
+        TorrentCommand::RecheckAndRepair,
         TorrentCommand::SetFiles(vec![0]),
         TorrentCommand::SetVerifyAfterDownload(true),
         TorrentCommand::SetRepairPolicy(Default::default()),
@@ -559,6 +560,57 @@ fn stale_verified_status_cannot_complete_a_new_recheck() {
         status: crate::completion::CompletionStatus::Verified,
     });
     assert_eq!(f.record(&id).state, OperationState::Running);
+}
+
+#[test]
+fn manual_recovery_waits_through_download_and_checking_until_fresh_verification() {
+    let mut f = Fixture::manager();
+    let id = f.running(TorrentCommand::RecheckAndRepair);
+    f.emit(SessionEvent::Verification {
+        id: "v1: abc".into(),
+        status: crate::completion::CompletionStatus::Verified,
+    });
+    assert_eq!(f.record(&id).state, OperationState::Running);
+    for status in [
+        crate::completion::CompletionStatus::Checking {
+            checked_bytes: 0,
+            total_bytes: 100,
+        },
+        crate::completion::CompletionStatus::Pending,
+        crate::completion::CompletionStatus::Checking {
+            checked_bytes: 100,
+            total_bytes: 100,
+        },
+    ] {
+        f.emit(SessionEvent::Verification {
+            id: "v1: abc".into(),
+            status,
+        });
+        assert_eq!(f.record(&id).state, OperationState::Running);
+    }
+    f.emit(SessionEvent::Verification {
+        id: "v1: abc".into(),
+        status: crate::completion::CompletionStatus::Verified,
+    });
+    assert_eq!(f.record(&id).state, OperationState::Succeeded);
+}
+
+#[test]
+fn manual_recovery_reports_real_failure_without_leaking_engine_details() {
+    let mut f = Fixture::manager();
+    let id = f.running(TorrentCommand::RecheckAndRepair);
+    f.emit(SessionEvent::Verification {
+        id: "v1: abc".into(),
+        status: crate::completion::CompletionStatus::Failed {
+            message: "secret local path".into(),
+        },
+    });
+    assert_eq!(f.record(&id).state, OperationState::Failed);
+    assert!(
+        !serde_json::to_string(&operation_json(&f.record(&id)))
+            .unwrap()
+            .contains("secret")
+    );
 }
 #[test]
 fn fresh_checking_then_verified_completes_recheck() {
