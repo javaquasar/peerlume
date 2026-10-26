@@ -31,6 +31,7 @@ pub mod settings;
 pub mod state;
 pub mod storage;
 pub mod torrent;
+pub mod torrent_filter;
 pub mod tracker;
 pub mod tracker_behavior;
 pub mod transfer;

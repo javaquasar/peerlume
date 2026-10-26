@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PeerLume
+Comment=BitTorrent client
+Exec=peerlume %F
+Icon=peerlume
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;
+StartupNotify=true
+StartupWMClass=peerlume

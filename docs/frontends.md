@@ -62,6 +62,28 @@ TUI keys:
 
 ## Parity contract
 
+### Torrent status filter
+
+In egui, use **Status** next to the session counter. The dropdown shows **All**,
+**Downloading**, **Seeding**, **Paused**, **Checking**, **Done**,
+**Waiting for transfer engine**, **Verification failed** and **Error**, each
+with its current count. The existing active/total counter remains session-wide
+(active means Downloading); a filtered view also reports how many rows are shown.
+In ratatui, press **f** to cycle the same choices; the list title shows the
+current filter and visible/total counts.
+
+Filtering is temporary frontend state and does not modify transfers or saved
+torrent settings. **Done** requires the same verified completion as the green
+progress indicator, including completed paused torrents; a raw 100% or unverified
+seed alone does not qualify. Other filters match the engine's current state.
+If the selected row disappears, selection moves to the first visible torrent.
+If none match, details are empty and selected-torrent actions cannot target a
+hidden row. Commands and context menus retain original torrent identities, not
+filtered row numbers. **Pause all** and **Resume all** still apply to the entire
+session, including hidden torrents. Choose **All** to restore the full list.
+
+### Shared controls
+
 Both frontends expose the shared torrent table, add torrent/magnet operations,
 pause/resume/remove actions, file selection, Info, per-torrent Settings, peer
 counts, tracker audit, piece progress, real announce journal/JSONL export, and all nine preference

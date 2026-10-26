@@ -17,10 +17,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1_080.0, 720.0])
+        .with_min_inner_size([820.0, 560.0])
+        .with_icon(peerlume::app::application_icon());
+    #[cfg(target_os = "linux")]
+    let viewport = viewport.with_app_id("peerlume");
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1_080.0, 720.0])
-            .with_min_inner_size([820.0, 560.0]),
+        viewport,
         ..Default::default()
     };
 

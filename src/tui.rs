@@ -41,6 +41,7 @@ use crate::{
     settings::ClientSettings,
     state::{StoredTrackerAuditProfile, StoredTrackerAuditStep},
     torrent::{EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentState},
+    torrent_filter::StatusFilter,
     tracker::{AnnounceEvent, AnnounceRequest, parse_info_hash_hex},
     tracker_behavior::BehaviorCatalog,
     ui_schema::{COMPONENTS, MainPage, PreferencesTab, TorrentDetailsTab},
@@ -79,6 +80,7 @@ pub struct TuiApp {
     details_tab: TorrentDetailsTab,
     preferences_tab: PreferencesTab,
     selected_torrent: usize,
+    status_filter: StatusFilter,
     selected_file: usize,
     input: Option<InputPrompt>,
     status: String,
@@ -138,6 +140,7 @@ impl TuiApp {
             details_tab: TorrentDetailsTab::Files,
             preferences_tab,
             selected_torrent: 0,
+            status_filter: StatusFilter::default(),
             journal_page: 0,
             selected_file: 0,
             input: None,
@@ -206,8 +209,9 @@ impl TuiApp {
 
     fn clamp_selection(&mut self) {
         self.selected_torrent = self
-            .selected_torrent
-            .min(self.control.torrents.len().saturating_sub(1));
+            .status_filter
+            .selected_index(&self.control.torrents, self.selected_torrent)
+            .unwrap_or(0);
         let file_count = self
             .control
             .torrents
@@ -267,6 +271,12 @@ impl TuiApp {
             KeyCode::Char('2') => self.page = MainPage::Preferences,
             KeyCode::Char('a') if self.page == MainPage::Torrents => {
                 self.open_prompt(PromptKind::TorrentPath, "Add .torrent path", String::new());
+            }
+            KeyCode::Char('f') if self.page == MainPage::Torrents => {
+                self.status_filter = self.status_filter.next();
+                self.clamp_selection();
+                self.selected_file = 0;
+                self.show_tracker_identity = false;
             }
             KeyCode::Char('m') if self.page == MainPage::Torrents => {
                 self.open_prompt(PromptKind::Magnet, "Add magnet URI", String::new());
@@ -521,21 +531,31 @@ impl TuiApp {
                 move_index(self.selected_file, torrent.files.files().len(), direction);
             return;
         }
-        self.selected_torrent = move_index(
-            self.selected_torrent,
-            self.control.torrents.len(),
-            direction,
-        );
+        let visible: Vec<_> = self.status_filter.indices(&self.control.torrents).collect();
+        let position = visible
+            .iter()
+            .position(|index| *index == self.selected_torrent)
+            .unwrap_or(0);
+        self.selected_torrent = visible
+            .get(move_index(position, visible.len(), direction))
+            .copied()
+            .unwrap_or(0);
         self.selected_file = 0;
         self.show_tracker_identity = false;
     }
 
     fn selected(&self) -> Option<&TorrentItem> {
-        self.control.torrents.get(self.selected_torrent)
+        self.control
+            .torrents
+            .get(self.selected_torrent)
+            .filter(|torrent| self.status_filter.matches(torrent))
     }
 
     fn selected_mut(&mut self) -> Option<&mut TorrentItem> {
-        self.control.torrents.get_mut(self.selected_torrent)
+        self.control
+            .torrents
+            .get_mut(self.selected_torrent)
+            .filter(|torrent| self.status_filter.matches(torrent))
     }
 
     fn submit_selected(&mut self, command: TorrentCommand) -> Result<String, String> {
@@ -571,10 +591,9 @@ impl TuiApp {
     }
 
     fn remove_selected(&mut self) {
-        if self.control.torrents.is_empty() {
+        let Some(torrent) = self.selected() else {
             return;
-        }
-        let torrent = &self.control.torrents[self.selected_torrent];
+        };
         let id = torrent.info_hashes.join(";");
         self.status = self
             .control
@@ -1153,7 +1172,7 @@ impl TuiApp {
             areas[2],
         );
         let help = if self.page == MainPage::Torrents {
-            "1/2 pages · ↑↓ select · Tab details · a add · m magnet · p/r pause/resume · P/R all · d remove · q quit"
+            "1/2 pages · ↑↓ select · f status filter · Tab details · a add · m magnet · p/r pause/resume · P/R all · d remove · q quit"
         } else {
             "1/2 pages · ←→ section · Space toggle highlighted option · s save · D defaults · q quit"
         };
@@ -1215,7 +1234,10 @@ impl TuiApp {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
             .split(area);
-        let rows = self.control.torrents.iter().map(|torrent| {
+        self.clamp_selection();
+        let visible: Vec<_> = self.status_filter.indices(&self.control.torrents).collect();
+        let rows = visible.iter().map(|index| {
+            let torrent = &self.control.torrents[*index];
             let progress_style = if torrent.completed_successfully() {
                 Style::default().fg(Color::Black).bg(Color::Green)
             } else if torrent.state == TorrentState::Checking {
@@ -1244,13 +1266,24 @@ impl TuiApp {
         .header(
             Row::new(["Name", "%", "State", "Down/s"]).style(Style::default().fg(Color::Yellow)),
         )
-        .block(Block::default().title(" Torrents ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(format!(
+                    " Torrents · {} ({}/{}) · f filter ",
+                    self.status_filter.label(),
+                    visible.len(),
+                    self.control.torrents.len()
+                ))
+                .borders(Borders::ALL),
+        )
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
         let mut state = ratatui::widgets::TableState::default();
-        if !self.control.torrents.is_empty() {
-            state.select(Some(self.selected_torrent));
-        }
+        state.select(
+            visible
+                .iter()
+                .position(|index| *index == self.selected_torrent),
+        );
         frame.render_stateful_widget(table, columns[0], &mut state);
         self.render_details(frame, columns[1]);
     }
@@ -1271,10 +1304,19 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
-        let Some(torrent) = self.control.torrents.get(self.selected_torrent) else {
+        let Some(torrent) = self
+            .control
+            .torrents
+            .get(self.selected_torrent)
+            .filter(|torrent| self.status_filter.matches(torrent))
+        else {
             frame.render_widget(
-                Paragraph::new("No torrents. Press a to add a .torrent or m for a magnet.")
-                    .block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(if self.control.torrents.is_empty() {
+                    "No torrents. Press a to add a .torrent or m for a magnet."
+                } else {
+                    "No torrents match this status. Press f to change the filter."
+                })
+                .block(Block::default().borders(Borders::ALL)),
                 areas[1],
             );
             return;
@@ -2298,6 +2340,63 @@ mod tests {
         assert_eq!(move_index(0, 2, -1), 0);
         assert_eq!(move_index(0, 2, 1), 1);
         assert_eq!(move_index(1, 2, 1), 1);
+    }
+
+    #[test]
+    fn status_filter_cycles_and_navigation_retains_the_original_torrent_target() {
+        let mut app = app();
+        let mut paused = test_torrent();
+        paused.name = "Hidden paused torrent".into();
+        paused.state = TorrentState::Paused;
+        let mut first = test_torrent();
+        first.name = "Visible download one".into();
+        first.info_hashes = vec!["v1: first".into()];
+        let mut second = first.clone();
+        second.name = "Visible download two".into();
+        second.info_hashes = vec!["v1: second".into()];
+        app.control.torrents = vec![paused.clone(), first, paused, second];
+        app.details_tab = TorrentDetailsTab::Info;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.status_filter, StatusFilter::Downloading);
+        assert_eq!(app.selected_torrent, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected_torrent, 3);
+        assert_eq!(app.selected().unwrap().info_hashes, ["v1: second"]);
+        let mut terminal = Terminal::new(TestBackend::new(220, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("Hidden paused torrent"));
+        assert!(text.contains("Downloading (2/4)"));
+        app.control.torrents[3].state = TorrentState::Seeding;
+        app.clamp_selection();
+        assert_eq!(app.selected_torrent, 1);
+        app.status_filter = StatusFilter::Error;
+        app.clamp_selection();
+        assert!(app.selected().is_none());
+        assert!(app.selected_mut().is_none());
+        app.pause_selected();
+        app.resume_selected();
+        app.remove_selected();
+        assert_eq!(app.control.torrents.len(), 4);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("No torrents match this status"));
+        assert!(!text.contains("Hidden paused torrent"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.status_filter, StatusFilter::All);
+        assert_eq!(app.control.torrents.len(), 4);
     }
 
     #[test]

@@ -106,8 +106,11 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ runner.os }}-native-x11-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-      - name: Test file navigation and the isolated Linux FileManager1 protocol
-        run: cargo +stable test --locked --lib app::file_location
+      - name: Test status filter, application icon and Linux file navigation
+        run: |
+          cargo +stable test --locked --lib app::file_location
+          cargo +stable test --locked --lib app::icon
+          cargo +stable test --locked --lib app::status_filter
       - run: cargo +stable build --locked --features tui --bin peerlume --bin peerlume-control
       - name: Operate the actual installed GUI and collect screenshots
         env:

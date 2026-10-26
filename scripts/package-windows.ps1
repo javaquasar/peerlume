@@ -11,6 +11,7 @@ $names = @('peerlume.exe', 'peerlume-tui.exe', 'peerlume-control.exe', 'peerlume
 foreach ($name in $names) {
     if (-not (Test-Path -LiteralPath (Join-Path $binaries $name))) { throw "Missing binary: $name. Build with cargo build --locked --all-features --bins." }
 }
+& (Join-Path $PSScriptRoot 'check-app-icon.ps1') -BinaryPath (Join-Path $binaries 'peerlume.exe')
 New-Item -ItemType Directory -Path $destination | Out-Null
 foreach ($name in $names) { Copy-Item -LiteralPath (Join-Path $binaries $name) -Destination $destination }
 Copy-Item -LiteralPath (Join-Path $repository 'docs/agent-control.md') -Destination $destination

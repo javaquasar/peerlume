@@ -15,10 +15,13 @@ use std::{
 use eframe::egui;
 
 mod file_location;
+mod icon;
+pub use icon::application_icon;
 #[cfg(test)]
 mod header_tests;
 #[cfg(test)]
 mod name_tests;
+mod status_filter;
 #[cfg(test)]
 mod torrent_menu_tests;
 
@@ -367,6 +370,7 @@ pub struct PeerLumeApp {
     details_tab: DetailsTab,
     preferences_tab: PreferencesTab,
     selected_torrent: usize,
+    status_filter: crate::torrent_filter::StatusFilter,
     settings: ClientSettings,
     saved_settings: ClientSettings,
     settings_draft: ClientSettings,
@@ -495,6 +499,7 @@ impl Default for PeerLumeApp {
             log_torrent: String::new(),
             preferences_tab,
             selected_torrent: 0,
+            status_filter: Default::default(),
             settings,
             saved_settings,
             settings_draft,
@@ -792,22 +797,19 @@ impl PeerLumeApp {
                     MainPage::Preferences.label(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let active = self
-                        .control
-                        .torrents
-                        .iter()
-                        .filter(|torrent| torrent.state == TorrentState::Downloading)
-                        .count();
-                    ui.label(format!(
-                        "{active} active / {} total",
-                        self.control.torrents.len()
-                    ));
+                    status_filter::show(ui, &mut self.status_filter, &self.control.torrents);
                 });
             });
         });
     }
 
     fn show_torrents(&mut self, ctx: &egui::Context) {
+        let visible_selection = self
+            .status_filter
+            .selected_index(&self.control.torrents, self.selected_torrent);
+        if let Some(index) = visible_selection {
+            self.selected_torrent = index;
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("+ Add torrent").clicked() {
@@ -821,14 +823,14 @@ impl PeerLumeApp {
                 if ui.button("Add magnet").clicked() {
                     self.add_magnet();
                 }
-                if ui.button("Pause all").clicked() {
+                if ui.button("Pause all").on_hover_text("Applies to all torrents, including hidden rows").clicked() {
                     self.add_status = self.control.submit_batch(false);
                 }
-                if ui.button("Resume all").clicked() {
+                if ui.button("Resume all").on_hover_text("Applies to all torrents, including hidden rows").clicked() {
                     self.add_status = self.control.submit_batch(true);
                 }
-                if ui.button("Remove selected (keep data)").clicked() && !self.control.torrents.is_empty() {
-                    let index = self.selected_torrent.min(self.control.torrents.len() - 1);
+                if ui.add_enabled(visible_selection.is_some(), egui::Button::new("Remove selected (keep data)")).clicked() {
+                    let index = visible_selection.expect("enabled for a visible selection");
                     let id = self.control.torrents[index].info_hashes.join(";");
                     self.add_status = self.control.remove(&id).map(|_|"Removal queued; data will be kept".into()).unwrap_or_else(|error|error.to_string());
                 }
@@ -858,6 +860,9 @@ impl PeerLumeApp {
                                 }
                                 ui.end_row();
                                 for (index, torrent) in self.control.torrents.iter().enumerate() {
+                                    if !self.status_filter.matches(torrent) {
+                                        continue;
+                                    }
                                     let response = Self::show_torrent_name(
                                         ui,
                                         &torrent.name,
@@ -1430,7 +1435,14 @@ impl PeerLumeApp {
             ui.label("No torrents");
             return;
         }
-        self.selected_torrent = self.selected_torrent.min(self.control.torrents.len() - 1);
+        let Some(index) = self
+            .status_filter
+            .selected_index(&self.control.torrents, self.selected_torrent)
+        else {
+            ui.label("No torrents match this status. Choose All to show every torrent.");
+            return;
+        };
+        self.selected_torrent = index;
         let mut commands = Vec::new();
         let torrent = &mut self.control.torrents[self.selected_torrent];
         let torrent_id = torrent.info_hashes.join(";");
