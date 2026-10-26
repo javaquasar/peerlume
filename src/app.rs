@@ -14,6 +14,8 @@ use std::{
 
 use eframe::egui;
 
+mod file_location;
+
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
     client::{
@@ -1482,8 +1484,15 @@ impl PeerLumeApp {
                 show_runtime_status(ui, torrent, last.as_deref());
             }
             DetailsTab::Files => {
-                if let Some(indices) = Self::show_file_tree(ui, torrent) {
+                let (selection, reveal) = Self::show_file_tree(ui, torrent);
+                if let Some(indices) = selection {
                     commands.push(TorrentCommand::SetFiles(indices));
+                }
+                if let Some(index) = reveal {
+                    self.add_status = match file_location::reveal(torrent, &self.settings, index) {
+                        Ok(status) => status,
+                        Err(error) => format!("Could not show file in folder: {error}"),
+                    };
                 }
             }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
@@ -1735,9 +1744,13 @@ impl PeerLumeApp {
         }
     }
 
-    fn show_file_tree(ui: &mut egui::Ui, torrent: &TorrentItem) -> Option<Vec<usize>> {
+    fn show_file_tree(
+        ui: &mut egui::Ui,
+        torrent: &TorrentItem,
+    ) -> (Option<Vec<usize>>, Option<usize>) {
         let mut select_all = None;
         let mut changes = std::collections::BTreeMap::new();
+        let mut reveal = None;
         ui.horizontal(|ui| {
             if ui.small_button("Select all").clicked() {
                 select_all = Some(true);
@@ -1779,10 +1792,15 @@ impl PeerLumeApp {
                                 if ui.checkbox(&mut selected, "").changed() {
                                     changes.insert(*index, selected);
                                 }
-                                ui.add_sized(
+                                let response = ui.add_sized(
                                     [(ui.available_width() - 220.0).max(80.0), 20.0],
-                                    egui::Label::new(&file.path[*display_start..]).truncate(),
+                                    egui::Label::new(&file.path[*display_start..])
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
                                 );
+                                if file_location::context_menu(&response) {
+                                    reveal = Some(*index);
+                                }
                                 ui.add(
                                     egui::ProgressBar::new(progress)
                                         .desired_width(80.0)
@@ -1794,7 +1812,10 @@ impl PeerLumeApp {
                     }
                 }
             });
-        torrent.files.selection_after_edit(select_all, &changes)
+        (
+            torrent.files.selection_after_edit(select_all, &changes),
+            reveal,
+        )
     }
 
     fn show_torrent_info(ui: &mut egui::Ui, torrent: &TorrentItem, global: &ClientSettings) {
@@ -3286,6 +3307,97 @@ fn show_runtime_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_context_menu_requests_only_navigation_not_a_selection_or_transfer_change() {
+        fn frame(
+            context: &egui::Context,
+            torrent: &TorrentItem,
+            events: Vec<egui::Event>,
+        ) -> (egui::FullOutput, (Option<Vec<usize>>, Option<usize>)) {
+            let mut action = (None, None);
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = PeerLumeApp::show_file_tree(ui, torrent);
+                    });
+                },
+            );
+            (output, action)
+        }
+        fn text_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing rendered text: {label}"))
+        }
+        fn pointer(
+            pos: egui::Pos2,
+            button: egui::PointerButton,
+            pressed: bool,
+        ) -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        }
+        let context = egui::Context::default();
+        let mut torrent = crate::client::tests::torrent();
+        torrent.files =
+            FileSelectionModel::from_files([("another.bin".into(), 100), ("file.bin".into(), 100)]);
+        let state = torrent.state;
+        frame(&context, &torrent, vec![]);
+        let (output, action) = frame(&context, &torrent, vec![]);
+        assert_eq!(action, (None, None));
+        let file = text_center(&output, "file.bin");
+        frame(
+            &context,
+            &torrent,
+            pointer(file, egui::PointerButton::Secondary, true),
+        );
+        frame(
+            &context,
+            &torrent,
+            pointer(file, egui::PointerButton::Secondary, false),
+        );
+        let (output, action) = frame(&context, &torrent, vec![]);
+        assert_eq!(action, (None, None));
+        let menu = text_center(&output, "Show in folder");
+        frame(
+            &context,
+            &torrent,
+            pointer(menu, egui::PointerButton::Primary, true),
+        );
+        let (_, action) = frame(
+            &context,
+            &torrent,
+            pointer(menu, egui::PointerButton::Primary, false),
+        );
+        assert_eq!(action, (None, Some(1)));
+        assert!(torrent.files.files()[0].selected);
+        assert!(torrent.files.files()[1].selected);
+        assert_eq!(torrent.downloaded_bytes, 0);
+        assert_eq!(torrent.state, state);
+    }
 
     #[test]
     #[ignore = "installed frontend workflow; Reliability CI supplies the copied adapter"]
