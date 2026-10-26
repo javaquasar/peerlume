@@ -4,6 +4,29 @@ These controls belong to each torrent. Both egui and ratatui use the same comman
 event reducer, persisted configuration and status-card model. They do not change
 the standalone tracker-audit scenario editor.
 
+## Showing a file in its folder
+
+In egui, right-click a file in **Files** and choose **Show in folder**, or
+right-click a torrent row and choose **Open .torrent location** for its source.
+Both actions pass the complete file path and request selection, not merely an
+open parent directory. **Open download folder** remains a folder-only action.
+
+Windows uses the Shell item identity and `SHOpenFolderAndSelectItems`, without
+Explorer command-line parsing. Linux uses the desktop session bus and
+`org.freedesktop.FileManager1.ShowItems` with an encoded file URI (supported by
+Nautilus, Dolphin and compatible file managers). A missing session bus, unavailable
+interface, rejected request or five-second method timeout is reported as a
+selection error; it is not silently reported as success after opening only a
+folder. A successful API reply acknowledges the request, not a visual inspection
+of the file-manager window.
+
+If a payload file does not exist yet, only the nearest existing directory inside
+its configured download root is opened, and the status explicitly says that no
+file could be selected. Navigation does not create payload files, change file
+selection or send torrent commands. Desktop requests run on a separate worker;
+at most one is outstanding, so a slow file manager does not block the GUI or
+controller owner.
+
 ## Changing an existing download mode
 
 In egui, select the torrent, open **Torrent settings**, select a download mode and

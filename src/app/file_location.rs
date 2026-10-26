@@ -1,5 +1,11 @@
 //! Desktop-only file navigation. Never sends transfer commands or modifies payloads.
-use std::{fs, io, path::PathBuf, process::Command};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+};
+
+mod desktop;
 
 use eframe::egui;
 
@@ -22,19 +28,90 @@ pub(super) fn context_menu(response: &egui::Response) -> bool {
     reveal
 }
 
-pub(super) fn reveal(
-    torrent: &TorrentItem,
-    settings: &ClientSettings,
-    index: usize,
-) -> Result<String, String> {
-    let location = resolve(torrent, settings, index)?;
-    command(&location, std::env::consts::OS)
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    Ok(if location.select_file {
-        "Opened file location".into()
+/// Only one desktop request may be outstanding. Shell/DBus calls never hold
+/// the GUI/controller owner lock or run on an existing COM/runtime thread.
+#[derive(Default)]
+pub(super) struct Navigator {
+    pending: Option<Receiver<Result<String, String>>>,
+}
+
+impl Navigator {
+    pub(super) fn reveal(
+        &mut self,
+        torrent: &TorrentItem,
+        settings: &ClientSettings,
+        index: usize,
+    ) -> String {
+        self.start(resolve(torrent, settings, index))
+    }
+
+    pub(super) fn reveal_source(&mut self, path: &Path) -> String {
+        self.start(source_location(path))
+    }
+
+    fn start(&mut self, location: Result<Location, String>) -> String {
+        if self.pending.is_some() {
+            return "A file location request is still pending".into();
+        }
+        let location = match location {
+            Ok(location) => location,
+            Err(error) => return navigation_status(Err(error)),
+        };
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("file-location".into())
+            .spawn(move || {
+                let result = desktop::show(&location.path, location.select_file).map(|()| {
+                    if location.select_file {
+                        "Requested file selection in its containing folder".into()
+                    } else {
+                        "File is not on disk yet; opened the nearest existing folder".into()
+                    }
+                });
+                let _ = sender.send(result);
+            });
+        match worker {
+            Ok(_) => {
+                self.pending = Some(receiver);
+                "Opening file location...".into()
+            }
+            Err(error) => navigation_status(Err(error.to_string())),
+        }
+    }
+
+    pub(super) fn poll(&mut self) -> Option<String> {
+        let result = match self.pending.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                Err("Desktop navigation worker stopped unexpectedly".into())
+            }
+        };
+        self.pending = None;
+        Some(navigation_status(result))
+    }
+}
+
+fn navigation_status(result: Result<String, String>) -> String {
+    result.unwrap_or_else(|error| format!("Could not show file in folder: {error}"))
+}
+
+fn source_location(path: &Path) -> Result<Location, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        "File is not on disk yet; opened the nearest existing folder".into()
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(path)
+    };
+    if !path.is_file() {
+        return Err("Source .torrent file is not on disk".into());
+    }
+    // Keep the filename, not just its parent. Sources need not be inside the
+    // download root; payload resolution below remains confined to that root.
+    Ok(Location {
+        path,
+        select_file: true,
     })
 }
 
@@ -98,41 +175,6 @@ fn resolve(
                 }
             }
             Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-fn command(location: &Location, os: &str) -> Command {
-    match os {
-        "windows" => {
-            let mut command = Command::new("explorer.exe");
-            if location.select_file {
-                command.arg("/select,");
-            }
-            command.arg(&location.path);
-            command
-        }
-        "macos" => {
-            let mut command = Command::new("open");
-            if location.select_file {
-                command.arg("-R");
-            }
-            command.arg(&location.path);
-            command
-        }
-        _ => {
-            // xdg-open has no portable select-file operation. Open its parent
-            // rather than launching a media player for the payload itself.
-            let mut command = Command::new("xdg-open");
-            command.arg(if location.select_file {
-                location
-                    .path
-                    .parent()
-                    .expect("resolved files have a parent")
-            } else {
-                &location.path
-            });
-            command
         }
     }
 }
@@ -256,39 +298,54 @@ mod tests {
     }
 
     #[test]
-    fn platform_commands_select_files_without_shell_interpretation() {
-        let path = PathBuf::from("download folder").join("caf\u{e9}, & sample.bin");
-        let location = Location {
-            path: path.clone(),
-            select_file: true,
-        };
-        for (os, program, prefix) in [
-            ("windows", "explorer.exe", "/select,"),
-            ("macos", "open", "-R"),
-        ] {
-            let cmd = command(&location, os);
-            assert_eq!(cmd.get_program(), program);
+    fn source_location_preserves_the_actual_filename_and_rejects_missing_files() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let path = root.path().join("caf\u{e9}, & #100%.torrent");
+        fs::write(&path, b"source metadata").unwrap();
+        for input in [path.clone(), path.strip_prefix(&cwd).unwrap().to_path_buf()] {
             assert_eq!(
-                cmd.get_args().collect::<Vec<_>>(),
-                vec![std::ffi::OsStr::new(prefix), path.as_os_str()]
+                source_location(&input).unwrap(),
+                Location {
+                    path: path.clone(),
+                    select_file: true
+                }
             );
         }
-        let cmd = command(&location, "linux");
-        assert_eq!(cmd.get_program(), "xdg-open");
+        assert!(source_location(root.path()).is_err());
+        assert!(source_location(&root.path().join("missing.torrent")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"source metadata");
+    }
+
+    #[test]
+    fn navigator_polls_without_blocking_and_reports_failure_not_success() {
+        let (sender, receiver) = mpsc::channel();
+        let mut navigator = Navigator {
+            pending: Some(receiver),
+        };
+        assert!(navigator.poll().is_none());
+        assert!(navigator.start(Err("unused".into())).contains("pending"));
+        sender
+            .send(Err("FileManager1 is unavailable".into()))
+            .unwrap();
         assert_eq!(
-            cmd.get_args().collect::<Vec<_>>(),
-            vec![path.parent().unwrap().as_os_str()]
+            navigator.poll().unwrap(),
+            "Could not show file in folder: FileManager1 is unavailable"
         );
-        let folder = Location {
-            path,
-            select_file: false,
-        };
-        for os in ["windows", "macos", "linux"] {
-            assert_eq!(
-                command(&folder, os).get_args().collect::<Vec<_>>(),
-                vec![folder.path.as_os_str()]
-            );
-        }
+        assert!(navigator.pending.is_none());
+        assert!(navigator.poll().is_none());
+        assert!(
+            navigator
+                .start(Err("missing file".into()))
+                .contains("Could not")
+        );
+        navigator.pending = Some(receiver_after_worker_exit());
+        assert!(navigator.poll().unwrap().contains("stopped unexpectedly"));
+    }
+
+    fn receiver_after_worker_exit() -> Receiver<Result<String, String>> {
+        let (_, receiver) = mpsc::channel();
+        receiver
     }
 
     #[cfg(unix)]

@@ -382,6 +382,7 @@ pub struct PeerLumeApp {
     last_download_directory: Option<String>,
     pending_torrent_paths: VecDeque<PathBuf>,
     add_status: String,
+    file_navigation: file_location::Navigator,
     magnet_input: String,
     control: Controller,
     tracker_audits: HashMap<String, TorrentTrackerAudit>,
@@ -509,6 +510,7 @@ impl Default for PeerLumeApp {
             last_download_directory: None,
             pending_torrent_paths: VecDeque::new(),
             add_status: restore_status.unwrap_or_default().into(),
+            file_navigation: file_location::Navigator::default(),
             magnet_input: String::new(),
             control: Controller::new(backend, torrents),
             tracker_audits,
@@ -836,6 +838,7 @@ impl PeerLumeApp {
             });
             ui.add_space(6.0);
             let mut directory_to_open = None;
+            let mut source_to_reveal = None;
             let mut trash_action = None;
             let mut recheck_action = None;
             ui.scope(|ui| {
@@ -880,8 +883,7 @@ impl PeerLumeApp {
                                         if source.is_file()
                                             && ui.button("Open .torrent location").clicked()
                                         {
-                                            directory_to_open =
-                                                source.parent().map(Path::to_path_buf);
+                                            source_to_reveal = Some(source.clone());
                                             ui.close();
                                         }
                                         ui.separator();
@@ -962,6 +964,9 @@ impl PeerLumeApp {
                     }
                     Err(error) => self.add_status = format!("Could not open folder: {error}"),
                 }
+            }
+            if let Some(path) = source_to_reveal {
+                self.add_status = self.file_navigation.reveal_source(&path);
             }
             if let Some((id, scope)) = trash_action {
                 self.prepare_trash_request(&id, scope);
@@ -1450,10 +1455,7 @@ impl PeerLumeApp {
                     commands.push(TorrentCommand::SetFiles(indices));
                 }
                 if let Some(index) = reveal {
-                    self.add_status = match file_location::reveal(torrent, &self.settings, index) {
-                        Ok(status) => status,
-                        Err(error) => format!("Could not show file in folder: {error}"),
-                    };
+                    self.add_status = self.file_navigation.reveal(torrent, &self.settings, index);
                 }
             }
             DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
@@ -2188,6 +2190,9 @@ impl eframe::App for PeerLumeApp {
         self.handle_dropped_files(dropped_count, dropped_paths);
         self.poll_session_events();
         self.poll_blocklist_update();
+        if let Some(status) = self.file_navigation.poll() {
+            self.add_status = status;
+        }
         self.show_header(ctx);
         match self.page {
             MainPage::Torrents => self.show_torrents(ctx),
