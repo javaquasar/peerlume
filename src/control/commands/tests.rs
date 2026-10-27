@@ -211,8 +211,20 @@ fn invalid_modes_policies_and_file_indices_have_no_effects() {
     let cases = [
         (
             TorrentCommand::SetMode(ModeConfig {
+                mode: DownloadMode::UploadRatio15,
+                upload_ratio: crate::download_mode::UploadRatioRange {
+                    min_milli: 2501,
+                    max_milli: 2500,
+                },
+                ..Default::default()
+            }),
+            CommandError::InvalidMode,
+        ),
+        (
+            TorrentCommand::SetMode(ModeConfig {
                 mode: DownloadMode::FreezeAfter,
                 freeze_after_bytes: 0,
+                upload_ratio: Default::default(),
             }),
             CommandError::InvalidMode,
         ),

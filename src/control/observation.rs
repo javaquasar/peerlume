@@ -111,6 +111,8 @@ pub struct TorrentObservation {
     pub mode_state: ObservedModeState,
     pub active_mode: Option<DownloadMode>,
     pub active_freeze_after_bytes: Option<u64>,
+    #[serde(default)]
+    pub active_upload_ratio: Option<crate::download_mode::UploadRatioRange>,
     pub tracker_enabled: Option<bool>,
 }
 
@@ -131,6 +133,7 @@ impl TorrentObservation {
             mode_state: ObservedModeState::AwaitingEngine,
             active_mode: None,
             active_freeze_after_bytes: None,
+            active_upload_ratio: None,
             tracker_enabled: None,
         }
     }
@@ -206,6 +209,11 @@ impl TorrentObservation {
             self.network_downloaded_bytes = torrent.runtime.network_downloaded;
         }
         if matches!(event, UpdateKind::Mode) {
+            self.active_upload_ratio = torrent
+                .runtime
+                .mode
+                .active()
+                .map(|config| config.upload_ratio);
             self.active_mode = torrent.runtime.mode.active().map(|config| config.mode);
             self.active_freeze_after_bytes = torrent
                 .runtime

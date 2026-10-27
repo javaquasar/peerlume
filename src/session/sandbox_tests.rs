@@ -32,6 +32,7 @@ fn add(id: &str, source: &Path, output: &Path) -> SessionCommand {
         verify_after_download: false,
         download_mode: DownloadMode::Normal,
         freeze_after_bytes: 0,
+        upload_ratio: Default::default(),
         full_size: 8,
         id: id.into(),
         source: source.display().to_string(),

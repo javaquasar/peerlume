@@ -216,7 +216,7 @@ fn command_schema() -> Value {
         ),
         (
             "set_mode",
-            json!({"type":"object","properties":{"mode":{"enum":["normal","no_progress","upload_ratio_1_5","hide_downloaded","freeze_after"]},"freeze_after_bytes":{"type":"integer","minimum":0}},"required":["mode","freeze_after_bytes"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"mode":{"enum":["normal","no_progress","upload_ratio_1_5","hide_downloaded","freeze_after"]},"freeze_after_bytes":{"type":"integer","minimum":0},"upload_ratio":{"type":"object","properties":{"min_milli":{"type":"integer","minimum":1,"maximum":4294967295_u64},"max_milli":{"type":"integer","minimum":1,"maximum":4294967295_u64}},"required":["min_milli","max_milli"],"additionalProperties":false}},"required":["mode","freeze_after_bytes"],"additionalProperties":false}),
         ),
         (
             "set_repair_policy",

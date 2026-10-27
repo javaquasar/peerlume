@@ -17,13 +17,8 @@ fn menu_frame(
         },
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let response = PeerLumeApp::show_torrent_name(
-                    ui,
-                    &torrent.name,
-                    false,
-                    false,
-                    name_column::DEFAULT_WIDTH,
-                );
+                let response =
+                    PeerLumeApp::show_torrent_name(ui, &torrent.name, false, false, 420.0);
                 response.context_menu(|ui| {
                     action = PeerLumeApp::show_recheck_menu(ui, torrent);
                 });

@@ -66,6 +66,10 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
         verify_after_download: false,
         download_mode: peerlume::download_mode::DownloadMode::UploadRatio15,
         freeze_after_bytes: 12345,
+        upload_ratio: peerlume::download_mode::UploadRatioRange {
+            min_milli: 1750,
+            max_milli: 2750,
+        },
         id: "v1:integration".into(),
         name: "integration".into(),
         source: "fixture.torrent".into(),

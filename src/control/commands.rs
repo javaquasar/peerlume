@@ -98,10 +98,7 @@ impl TorrentCommand {
             Self::RecheckAndRepair => SessionCommand::RecheckAndRepair { id },
             Self::Remove => SessionCommand::Remove { id },
             Self::SetMode(config) => {
-                config
-                    .mode
-                    .validate_threshold(config.freeze_after_bytes)
-                    .map_err(|_| CommandError::InvalidMode)?;
+                config.validate().map_err(|_| CommandError::InvalidMode)?;
                 let full_size = torrent
                     .files
                     .files()

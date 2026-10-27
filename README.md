@@ -136,10 +136,13 @@ Private torrent requirements and tracker accounting rules are documented in
 effect after restarting the application.
 
 When adding a `.torrent`, choose Normal download (the default), Download without
-reporting progress, reported upload = downloaded × 1.5, hide downloaded only, or
+reporting progress, reported upload = downloaded × a random multiplier, hide downloaded only, or
 freeze metrics after a configurable received-byte threshold. All five
 download data from peers; the chosen mode is saved per torrent and restored after
 restart. The global `disabled` setting still disables all tracker communication.
+The upload multiplier is sampled independently for every announce from a configurable
+range (default ×1.5–×2.5); equal bounds give a fixed multiplier. Only reported
+statistics change, not actual transfer totals. See [runtime controls](docs/runtime-controls.md).
 
 The selected torrent's **Log** tab shows real HTTP/HTTPS and UDP download announces:
 actual vs sent counters, checked disk bytes, events, tracker replies and returned

@@ -526,6 +526,7 @@ fn pause_resume_and_mode_reset_follow_engine_confirmations() {
                 config: ModeConfig {
                     mode: DownloadMode::FreezeAfter,
                     freeze_after_bytes: 1024,
+                    upload_ratio: Default::default(),
                 },
                 tracker_enabled: true,
             },

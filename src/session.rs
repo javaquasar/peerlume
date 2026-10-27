@@ -56,6 +56,7 @@ pub enum SessionCommand {
         verify_after_download: bool,
         download_mode: DownloadMode,
         freeze_after_bytes: u64,
+        upload_ratio: crate::download_mode::UploadRatioRange,
         full_size: u64,
         id: String,
         source: String,
@@ -340,7 +341,7 @@ impl SessionRuntime {
                                             Ok((guard, resume_error)) => {
                                                 if let Some(guard) = guard { reporting_policies.insert(id.clone(), guard); }
                                                 active_modes.insert(id.clone(), config);
-                                                if let Some(SessionCommand::AddTorrent { download_mode, freeze_after_bytes, .. }) = added_commands.get_mut(&id) { *download_mode = config.mode; *freeze_after_bytes = config.freeze_after_bytes; }
+                                                if let Some(SessionCommand::AddTorrent { download_mode, freeze_after_bytes, upload_ratio, .. }) = added_commands.get_mut(&id) { *download_mode = config.mode; *freeze_after_bytes = config.freeze_after_bytes; *upload_ratio = config.upload_ratio; }
                                                 let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
                                                 if pending_resume.remove(&id) && !checks.contains_key(&id) {
                                                     let result = session.unpause(&handle).await.map_err(|_| "Mode applied, but resuming failed".to_owned());
@@ -470,7 +471,7 @@ impl SessionRuntime {
                                 match command {
                                     SessionCommand::SetDownloadMode { id, config } => {
                                         let active = active_modes.get(&id).copied();
-                                        if !torrents.contains_key(&id) || config.mode.validate_threshold(config.freeze_after_bytes).is_err() {
+                                        if !torrents.contains_key(&id) || config.validate().is_err() {
                                             let _ = event_tx.send(SessionEvent::Mode { id, application: ModeApplication::Failed { requested: config, active, message: "Torrent unavailable or invalid freeze threshold".into() } });
                                         } else {
                                             pending_modes.insert(id.clone(), config);
@@ -491,6 +492,7 @@ impl SessionRuntime {
                                         verify_after_download: _,
                                         download_mode,
                                         freeze_after_bytes,
+                                        upload_ratio,
                                         full_size,
                                         id,
                                         source,
@@ -509,7 +511,7 @@ impl SessionRuntime {
                                             Ok(root)=>root,
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
                                         };
-                                        let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes) {
+                                        let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes, upload_ratio) {
                                             Ok(registration) => registration,
                                             Err(message) => {
                                                 let _ = event_tx.send(SessionEvent::Error { id, message });
@@ -556,7 +558,7 @@ impl SessionRuntime {
                                                     reporting_policies.insert(id.clone(), registration);
                                                 }
                                                 torrents.insert(id.clone(), handle);
-                                                let config = ModeConfig { mode: download_mode, freeze_after_bytes };
+                                                let config = ModeConfig { mode: download_mode, freeze_after_bytes, upload_ratio };
                                                 active_modes.insert(id.clone(), config);
                                                 let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Active { config, tracker_enabled } });
                                                 let _ = event_tx.send(SessionEvent::Added { id });
@@ -764,6 +766,7 @@ fn register_download_mode(
         mode,
         full_size,
         crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES,
+        Default::default(),
     )
 }
 
@@ -773,8 +776,14 @@ fn register_download_mode_with_threshold(
     mode: DownloadMode,
     full_size: u64,
     threshold: u64,
+    upload_ratio: crate::download_mode::UploadRatioRange,
 ) -> Result<Option<librqbit_tracker_comms::ReportingRegistration>, String> {
-    mode.validate_threshold(threshold)?;
+    let config = ModeConfig {
+        mode,
+        freeze_after_bytes: threshold,
+        upload_ratio,
+    };
+    config.validate()?;
     if mode == DownloadMode::Normal {
         return Ok(None);
     }
@@ -791,7 +800,7 @@ fn register_download_mode_with_threshold(
     librqbit_tracker_comms::register_reporting_policy(
         info_hash,
         peer_id,
-        mode.reporting_policy_with_threshold(full_size, threshold),
+        config.reporting_policy(full_size)?,
     )
     .map(Some)
     .map_err(str::to_owned)
@@ -1165,6 +1174,10 @@ mod tests {
                 peer_limit: Some(5),
                 download_mode: mode,
                 freeze_after_bytes: 8192,
+                upload_ratio: crate::download_mode::UploadRatioRange {
+                    min_milli: 1750,
+                    max_milli: 1750,
+                },
                 full_size: payload.len() as u64,
             })
             .unwrap();
@@ -1193,14 +1206,22 @@ mod tests {
             .recv_timeout(Duration::from_secs(8))
             .unwrap_or_else(|error| panic!("{mode:?}, UDP={udp}: {error}"));
         let total = payload.len() as u64;
-        let expected =
-            mode.reporting_policy(total)
-                .apply(librqbit_tracker_comms::TrackerCommsStats {
-                    downloaded_bytes: total,
-                    total_bytes: total,
-                    uploaded_bytes: 0,
-                    torrent_state: librqbit_tracker_comms::TrackerCommsStatsState::Live,
-                });
+        let expected = ModeConfig {
+            mode,
+            upload_ratio: crate::download_mode::UploadRatioRange {
+                min_milli: 1750,
+                max_milli: 1750,
+            },
+            ..Default::default()
+        }
+        .reporting_policy(total)
+        .unwrap()
+        .apply(librqbit_tracker_comms::TrackerCommsStats {
+            downloaded_bytes: total,
+            total_bytes: total,
+            uploaded_bytes: 0,
+            torrent_state: librqbit_tracker_comms::TrackerCommsStatsState::Live,
+        });
         assert_eq!(
             reported["uploaded"],
             expected.uploaded_bytes.to_string(),
@@ -1447,6 +1468,7 @@ mod tests {
                 peer_limit: Some(2),
                 download_mode: DownloadMode::Normal,
                 freeze_after_bytes: 1,
+                upload_ratio: Default::default(),
                 full_size: 32768,
             })
             .unwrap();
@@ -1660,6 +1682,7 @@ mod tests {
                     peer_limit: Some(1),
                     download_mode: DownloadMode::Normal,
                     freeze_after_bytes: 1,
+                    upload_ratio: Default::default(),
                     full_size: 1,
                 })
                 .unwrap();
@@ -1800,6 +1823,7 @@ mod tests {
                     peer_limit: Some(1),
                     download_mode: DownloadMode::Normal,
                     freeze_after_bytes: 1,
+                    upload_ratio: Default::default(),
                     full_size: 1,
                 })
                 .unwrap();

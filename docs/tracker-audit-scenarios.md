@@ -535,16 +535,19 @@ restart. Older SQLite records migrate to `normal`.
 | --- | --- | --- |
 | `normal` | Ordinary peer transfer | Actual `uploaded`, `downloaded`, and `left` |
 | `no_progress` | Ordinary peer transfer | `uploaded=0`, `downloaded=0`, `left=full torrent size`; completion is not reported as `completed` |
-| `upload_ratio_1_5` | Ordinary peer transfer | Actual `downloaded` and `left`; `uploaded=floor(downloaded * 3 / 2)` |
+| `upload_ratio_1_5` | Ordinary peer transfer | Actual `downloaded` and `left`; `uploaded=floor(downloaded * multiplier)`, with a new random multiplier per announce |
 | `hide_downloaded` | Ordinary peer transfer | Only `downloaded=0`; actual `uploaded` and `left` are retained |
 | `freeze_after` | Ordinary peer transfer | Actual metrics before the threshold, then one frozen snapshot of all three counters |
 
 `no_progress` continues periodic announces and receives updated peer lists.
 It differs from **Started-only observation**, which sends one separate audit
 request, leaves the real transfer paused, and then observes silently.
-`upload_ratio_1_5` recalculates its ratio at every announce rather than using
-a constant counter. Odd byte counts round down; arithmetic saturates at
-the maximum `u64` value.
+`upload_ratio_1_5` samples a new multiplier at each real announce attempt from a
+per-torrent inclusive range, default **1.5–2.5**, at 0.001 precision. Equal bounds
+give a fixed multiplier. Bytes round down and arithmetic saturates at `u64::MAX`.
+Reported uploaded counters can decrease when the multiplier decreases; they are
+not clamped to the previous announce. Local counters remain actual. The legacy
+mode ID is preserved; see `runtime-controls.md` for GUI, TUI and CLI inputs.
 
 In every mode, the GUI and TUI display actual local counters. Transformations
 occur only at the HTTP/HTTPS and UDP announce transport boundary. Tracker

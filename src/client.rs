@@ -59,6 +59,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                     crate::runtime_status::ModeApplication::Active { config, .. } => {
                         torrent.overrides.download_mode = config.mode;
                         torrent.overrides.freeze_after_bytes = config.freeze_after_bytes;
+                        torrent.overrides.upload_ratio = config.upload_ratio;
                         torrent.runtime.mode_draft = None;
                         return SessionNotice::SettingsApplied { id };
                     }
@@ -231,6 +232,7 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         .collect();
     let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
     SessionCommand::AddTorrent {
+        upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
         verify_after_download: torrent.overrides.verify_after_download
             || torrent.overrides.repair_policy.enabled,
@@ -270,6 +272,7 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
+        upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
         verify_after_download: torrent.overrides.verify_after_download
             || torrent.overrides.repair_policy.enabled,
@@ -311,7 +314,7 @@ pub fn mode_change_command(
     torrent: &mut TorrentItem,
     config: crate::runtime_status::ModeConfig,
 ) -> Result<SessionCommand, String> {
-    config.mode.validate_threshold(config.freeze_after_bytes)?;
+    config.validate()?;
     config.mode.validate_metadata(
         torrent.info_hashes.iter().any(|h| h.starts_with("v1: ")),
         torrent.files.files().iter().map(|f| f.size_bytes).sum(),
@@ -384,6 +387,7 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
             repair_policy: record.repair_policy,
             download_mode: record.download_mode,
             freeze_after_bytes: record.freeze_after_bytes,
+            upload_ratio: record.upload_ratio,
             download_directory: record.download_directory,
             ..Default::default()
         },
@@ -662,6 +666,7 @@ pub(crate) mod tests {
             verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
+            upload_ratio: Default::default(),
             id: "test".into(),
             name: "test".into(),
             source: "test.torrent".into(),
@@ -839,6 +844,10 @@ pub(crate) mod tests {
         let config = ModeConfig {
             mode: crate::download_mode::DownloadMode::NoProgress,
             freeze_after_bytes: 123,
+            upload_ratio: crate::download_mode::UploadRatioRange {
+                min_milli: 1250,
+                max_milli: 3750,
+            },
         };
         item.runtime.mode = ModeApplication::Active {
             config: ModeConfig::default(),

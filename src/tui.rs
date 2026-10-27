@@ -56,6 +56,7 @@ enum PromptKind {
     TorrentPath,
     DownloadMode,
     FreezeAfterBytes,
+    UploadRatioRange,
     ExportJournal,
     ExportSessionJournal,
     Magnet,
@@ -250,7 +251,9 @@ impl TuiApp {
             ) || self.input.as_ref().is_some_and(|p| {
                 matches!(
                     p.kind,
-                    PromptKind::DownloadMode | PromptKind::FreezeAfterBytes
+                    PromptKind::DownloadMode
+                        | PromptKind::FreezeAfterBytes
+                        | PromptKind::UploadRatioRange
                 )
             }))
         {
@@ -282,7 +285,7 @@ impl TuiApp {
                 self.open_prompt(PromptKind::Magnet, "Add magnet URI", String::new());
             }
             KeyCode::Char('M') if self.page == MainPage::Torrents => {
-                self.open_prompt(PromptKind::ExistingMode, "Mode: 1 normal, 2 no progress, 3 upload x1.5, 4 hide downloaded, 5 freeze [bytes]", "1".into());
+                self.open_prompt(PromptKind::ExistingMode, "Mode: 1 normal, 2 no progress, 3 upload [min max], 4 hide downloaded, 5 freeze [bytes]", "1".into());
             }
             KeyCode::Char('H') if self.page == MainPage::Torrents => {
                 if let Some(torrent) = self.control.torrents.get(self.selected_torrent) {
@@ -481,6 +484,7 @@ impl TuiApp {
             PromptKind::TorrentPath => self.prepare_torrent_add(PathBuf::from(prompt.value)),
             PromptKind::DownloadMode => self.confirm_torrent_mode(prompt.value.trim()),
             PromptKind::FreezeAfterBytes => self.confirm_freeze_threshold(prompt.value.trim()),
+            PromptKind::UploadRatioRange => self.confirm_upload_ratio(prompt.value.trim()),
             PromptKind::ExportJournal => self.export_journal(Path::new(&prompt.value), false),
             PromptKind::ExportSessionJournal => self.export_journal(Path::new(&prompt.value), true),
             PromptKind::Magnet => self.add_magnet(&prompt.value),
@@ -498,7 +502,9 @@ impl TuiApp {
                 if self.pending_add.is_some()
                     && matches!(
                         retry.kind,
-                        PromptKind::DownloadMode | PromptKind::FreezeAfterBytes
+                        PromptKind::DownloadMode
+                            | PromptKind::FreezeAfterBytes
+                            | PromptKind::UploadRatioRange
                     )
                 {
                     self.input = Some(retry);
@@ -657,19 +663,30 @@ impl TuiApp {
             .torrents
             .get(self.selected_torrent)
             .ok_or("No selected torrent")?;
-        let freeze_after_bytes = match parts.next() {
-            Some(value) => value
+        let mut config = torrent.mode_config();
+        config.mode = mode;
+        if mode == DownloadMode::UploadRatio15 {
+            if let Some(minimum) = parts.next() {
+                let maximum = parts
+                    .next()
+                    .ok_or("Enter both minimum and maximum upload multipliers")?;
+                config.upload_ratio = crate::download_mode::UploadRatioRange {
+                    min_milli: crate::download_mode::UploadRatioRange::parse_multiplier(minimum)?,
+                    max_milli: crate::download_mode::UploadRatioRange::parse_multiplier(maximum)?,
+                };
+            }
+        } else if let Some(value) = parts.next() {
+            config.freeze_after_bytes = value
                 .parse()
-                .map_err(|_| "Freeze threshold must be a positive byte count")?,
-            None => torrent.mode_config().freeze_after_bytes,
-        };
-        if parts.next().is_some() {
-            return Err("Expected a mode number and optional freeze threshold".into());
+                .map_err(|_| "Freeze threshold must be a positive byte count")?;
         }
-        let config = crate::runtime_status::ModeConfig {
-            mode,
-            freeze_after_bytes,
-        };
+        if parts.next().is_some() {
+            return Err(
+                "Expected a mode number, optional multiplier minimum/maximum or freeze threshold"
+                    .into(),
+            );
+        }
+        config.validate()?;
         self.submit_selected(TorrentCommand::SetMode(config))
     }
 
@@ -727,6 +744,14 @@ impl TuiApp {
             );
             return Ok("Choose the network-received byte threshold before adding".into());
         }
+        if mode == DownloadMode::UploadRatio15 {
+            self.open_prompt(
+                PromptKind::UploadRatioRange,
+                "Upload multiplier minimum maximum",
+                "1.5 2.5".into(),
+            );
+            return Ok("Choose the upload multiplier range before adding".into());
+        }
         let (path, metainfo) = self
             .pending_add
             .take()
@@ -742,6 +767,31 @@ impl TuiApp {
             .take()
             .ok_or("No torrent pending addition")?;
         self.add_torrent_with_threshold(path, meta, DownloadMode::FreezeAfter, threshold)
+    }
+
+    fn confirm_upload_ratio(&mut self, value: &str) -> Result<String, String> {
+        let parts: Vec<_> = value.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err("Enter the minimum and maximum upload multipliers".into());
+        }
+        let upload_ratio = crate::download_mode::UploadRatioRange {
+            min_milli: crate::download_mode::UploadRatioRange::parse_multiplier(parts[0])?,
+            max_milli: crate::download_mode::UploadRatioRange::parse_multiplier(parts[1])?,
+        };
+        upload_ratio.validate()?;
+        let (path, meta) = self
+            .pending_add
+            .take()
+            .ok_or("No torrent pending addition")?;
+        self.add_torrent_with_config(
+            path,
+            meta,
+            crate::runtime_status::ModeConfig {
+                mode: DownloadMode::UploadRatio15,
+                upload_ratio,
+                ..Default::default()
+            },
+        )
     }
 
     fn export_journal(&self, path: &Path, all: bool) -> Result<String, String> {
@@ -786,6 +836,26 @@ impl TuiApp {
         download_mode: DownloadMode,
         freeze_after_bytes: u64,
     ) -> Result<String, String> {
+        self.add_torrent_with_config(
+            path,
+            metainfo,
+            crate::runtime_status::ModeConfig {
+                mode: download_mode,
+                freeze_after_bytes,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn add_torrent_with_config(
+        &mut self,
+        path: PathBuf,
+        metainfo: TorrentMetainfo,
+        config: crate::runtime_status::ModeConfig,
+    ) -> Result<String, String> {
+        config.validate()?;
+        let download_mode = config.mode;
+        let freeze_after_bytes = config.freeze_after_bytes;
         let total_size = metainfo.total_size();
         download_mode.validate_metadata(metainfo.info_hash_v1_hex.is_some(), total_size)?;
         let mut files = FileSelectionModel::from_metainfo_files(metainfo.files);
@@ -829,6 +899,7 @@ impl TuiApp {
                 repair_policy: self.pending_repair,
                 download_mode,
                 freeze_after_bytes,
+                upload_ratio: config.upload_ratio,
                 download_directory: Some(download_directory),
                 ..Default::default()
             },
@@ -1202,7 +1273,9 @@ impl TuiApp {
             }
             if matches!(
                 prompt.kind,
-                PromptKind::DownloadMode | PromptKind::FreezeAfterBytes
+                PromptKind::DownloadMode
+                    | PromptKind::FreezeAfterBytes
+                    | PromptKind::UploadRatioRange
             ) && let Some((_, metadata)) = &self.pending_add
             {
                 let tracker = metadata
@@ -1385,10 +1458,7 @@ impl TuiApp {
                     Line::from(format!("Source: {}", torrent.source)),
                     Line::from(format!("Info hashes: {}", torrent.info_hashes.join(", "))),
                     Line::from(format!("Audit Peer ID: {}", torrent.peer_id)),
-                    Line::from(format!(
-                        "Download mode: {}",
-                        torrent.overrides.download_mode.label()
-                    )),
+                    Line::from(format!("Download mode: {}", torrent.mode_config().label())),
                     Line::from(format!(
                         "Freeze threshold: {} bytes",
                         if torrent.overrides.freeze_after_bytes == 0 {
@@ -2422,6 +2492,40 @@ mod tests {
         app.handle_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pending_add.is_none());
         assert!(app.input.is_none());
+    }
+
+    #[test]
+    fn upload_multiplier_prompt_uses_default_bounds_and_rejects_invalid_ranges_without_adding() {
+        let mut app = app();
+        app.behavior_catalog =
+            BehaviorCatalog::from_toml(include_str!("../config/tracker-behaviors.example.toml"));
+        app.pending_add = Some((
+            PathBuf::from("test.torrent"),
+            TorrentMetainfo {
+                name: "pending".into(),
+                files: vec![metainfo::MetainfoFile {
+                    path: "pending".into(),
+                    size_bytes: 100,
+                }],
+                trackers: vec![],
+                is_private: false,
+                info_hash_v1_hex: Some("01".repeat(20)),
+                info_hash_v2_hex: None,
+            },
+        ));
+        let count = app.control.torrents.len();
+        app.confirm_torrent_mode("3").unwrap();
+        let prompt = app.input.as_ref().unwrap();
+        assert_eq!(prompt.kind, PromptKind::UploadRatioRange);
+        assert_eq!(prompt.value, "1.5 2.5");
+        for text in ["0 2.5", "2.6 2.5", "NaN 2.5", "1.5", "1.5 2.5 3"] {
+            assert!(app.confirm_upload_ratio(text).is_err(), "{text}");
+            assert!(app.pending_add.is_some());
+            assert_eq!(app.control.torrents.len(), count);
+        }
+        app.handle_prompt_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.input.is_none());
+        assert!(app.pending_add.is_none());
     }
 
     #[test]

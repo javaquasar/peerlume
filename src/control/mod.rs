@@ -308,10 +308,7 @@ impl Controller {
         {
             return Err("Torrent is already added or has no identity".into());
         }
-        torrent
-            .overrides
-            .download_mode
-            .validate_threshold(torrent.overrides.freeze_after_bytes)?;
+        torrent.mode_config().validate()?;
         torrent.overrides.repair_policy.validate()?;
         crate::limits::validate_relative_paths(
             torrent.files.files().iter().map(|file| file.path.as_str()),

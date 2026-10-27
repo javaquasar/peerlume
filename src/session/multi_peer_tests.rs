@@ -451,6 +451,7 @@ fn download_torrents_with_verification(
                 verify_after_download,
                 download_mode: torrent.mode,
                 freeze_after_bytes: 16384,
+                upload_ratio: Default::default(),
                 full_size: torrent.payload.len() as u64,
                 id: torrent.id.clone(),
                 source: torrent.source.display().to_string(),

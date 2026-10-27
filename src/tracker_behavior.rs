@@ -429,6 +429,7 @@ mod tests {
             verify_after_download: false,
             download_mode: Default::default(),
             freeze_after_bytes: 0,
+            upload_ratio: Default::default(),
             id: "v1: abc".into(),
             name: "test".into(),
             source: "test.torrent".into(),

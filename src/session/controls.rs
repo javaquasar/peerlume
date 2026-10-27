@@ -16,7 +16,7 @@ pub(super) async fn apply_mode(
     ),
     String,
 > {
-    config.mode.validate_threshold(config.freeze_after_bytes)?;
+    config.validate()?;
     let full_size = handle
         .with_metadata(|m| m.lengths().total_length())
         .map_err(|_| "Resolve torrent metadata before changing the mode".to_owned())?;
@@ -29,9 +29,7 @@ pub(super) async fn apply_mode(
         sample();
         result.map_err(|_| "Could not pause the torrent to apply the mode".to_owned())?;
     }
-    let policy = config
-        .mode
-        .reporting_policy_with_threshold(full_size, config.freeze_after_bytes);
+    let policy = config.reporting_policy(full_size)?;
     let result = match registration {
         Some(guard) => guard.replace(policy).map(|()| None),
         None => {

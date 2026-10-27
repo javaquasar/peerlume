@@ -415,7 +415,8 @@ fn reporting_modes_preserve_completion_suppression_and_wire_metrics() {
                 );
                 assert_eq!(h.successful("completed"), usize::from(allowed), "{mode:?}");
                 assert_eq!(h.successful("stopped"), 1);
-                for r in h.records() {
+                let records = h.records();
+                for r in records {
                     match mode {
                         ReportingMode::FrozenProgress => {
                             assert_eq!(r.sent.downloaded, 0);
@@ -424,7 +425,13 @@ fn reporting_modes_preserve_completion_suppression_and_wire_metrics() {
                         }
                         ReportingMode::HideDownloaded => assert_eq!(r.sent.downloaded, 0),
                         ReportingMode::UploadRatio15 => {
-                            assert_eq!(r.sent.uploaded, r.actual.downloaded * 3 / 2)
+                            assert!(
+                                (r.actual.downloaded * 1500 / 1000
+                                    ..=r.actual.downloaded * 2500 / 1000)
+                                    .contains(&r.sent.uploaded)
+                            );
+                            assert_eq!(r.sent.downloaded, r.actual.downloaded);
+                            assert_eq!(r.sent.left, r.actual.left);
                         }
                         ReportingMode::FreezeAfter => assert_eq!(r.sent.left, 16384),
                         _ => unreachable!(),

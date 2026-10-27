@@ -85,14 +85,17 @@ session, including hidden torrents. Choose **All** to restore the full list.
 ### Desktop torrent Name column
 
 Drag the separator between **Name** and **Progress** in the table header to
-resize the Name column. Double-click the separator to restore the 420-point
-default. Names stay left-aligned, truncated to one line and clickable across
-the full row, including their context menus.
+resize the Name column. By default it fills all space left after the other
+columns, and grows automatically when the window widens. Double-click the
+separator to restore this automatic fill. Names stay left-aligned, truncated to
+one line and clickable across the full row, including their context menus.
 
-The chosen width is remembered for the current GUI session. Narrowing the
-window temporarily clamps the visible width and widening it restores the chosen
-width. The resize budget reserves space for Progress and the current status,
-rates, peer counts, ETA and ratio; hidden rows do not consume extra width.
+If manually narrowed, only the user-created trailing gap is remembered for the
+current GUI session; newly available window space still goes to Name. Narrowing
+the window clamps Name at its minimum, and enlarging it restores the gap without
+accumulating extra empty space. The resize budget reserves space for Progress
+and the current status, rates, peer counts, ETA and ratio; hidden rows do not
+consume extra width.
 Name cannot shrink below 160 points. If the essential columns themselves cannot
 fit, the existing horizontal scrollbar remains available. Resizing never changes
 the torrent selection, transfer state, payloads or saved preferences.
@@ -103,7 +106,25 @@ cannot enlarge the viewport and shorten the scroll range. After shrinking or
 expanding the window, the scrollbar can still reach **Ratio** on the right and
 return to **Name** on the left.
 
-### Desktop file-list scrolling
+### Desktop vertical split and scrolling
+
+Drag the horizontal divider between the torrent table and the selected torrent's
+details to change their heights. The table keeps its height for the current GUI
+session; increasing the window height gives the extra space to the details and
+Files list. Minimum pane sizes keep both sections usable, with automatic clamping
+when the window shrinks.
+
+The torrent table has its own vertical scrollbar when rows do not fit, independent
+of the Files scrollbar. Horizontal scrolling remains available for narrow windows.
+The Files list fills the entire remaining details height, even with few or no
+files, instead of stopping at a fixed maximum height.
+
+### Desktop file-list appearance
+
+The scrolling Files list has a visible border in both light and dark themes;
+the count and selection controls remain above it. Names start next to the
+checkboxes at a common left edge, with the full name cell retaining its context
+menu and long names truncated to one line.
 
 The Files list reserves a separate gutter for its vertical scrollbar, including
 when hovered. File names use the remaining row width after the progress and

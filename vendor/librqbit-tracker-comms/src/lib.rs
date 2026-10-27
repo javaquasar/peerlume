@@ -9,7 +9,7 @@ pub use observation::{
     TransferMetricsProvider, TransferSnapshot, register_observer,
 };
 pub use reporting::{
-    ReportingMode, ReportingPolicy, ReportingRegistration, register_reporting_policy,
+    ReportingMode, ReportingPolicy, ReportingRegistration, UploadRatioRange, register_reporting_policy,
 };
 pub use tracker_comms::*;
 pub use tracker_comms_udp::UdpTrackerClient;

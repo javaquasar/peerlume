@@ -46,6 +46,7 @@ pub struct TorrentOverrides {
     pub download_mode: crate::download_mode::DownloadMode,
     /// Zero means use the shared default (1 GiB); only relevant to FreezeAfter.
     pub freeze_after_bytes: u64,
+    pub upload_ratio: crate::download_mode::UploadRatioRange,
     pub download_directory: Option<String>,
     pub sequential_download: Option<bool>,
     pub priority: TorrentPriority,
@@ -147,6 +148,7 @@ pub struct TorrentItem {
 impl TorrentItem {
     pub fn mode_config(&self) -> crate::runtime_status::ModeConfig {
         crate::runtime_status::ModeConfig {
+            upload_ratio: self.overrides.upload_ratio,
             mode: self.overrides.download_mode,
             freeze_after_bytes: if self.overrides.freeze_after_bytes == 0 {
                 crate::download_mode::DEFAULT_FREEZE_AFTER_BYTES

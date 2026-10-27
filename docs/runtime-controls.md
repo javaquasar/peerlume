@@ -32,9 +32,28 @@ controller owner.
 In egui, select the torrent, open **Torrent settings**, select a download mode and
 press **Apply download mode**. Freeze mode also requires a positive byte threshold.
 In ratatui, press **M** and enter a mode number and optional threshold, for example
-`5 1048576`. Numbers are 1 normal, 2 no progress, 3 upload x1.5, 4 hide downloaded,
+`5 1048576`. Numbers are 1 normal, 2 no progress, 3 random upload multiplier, 4 hide downloaded,
 and 5 freeze. Existing-torrent numbers always follow this order, independently of
 the external add-dialog mode list.
+
+The upload-multiplier mode exposes **Minimum ×** and **Maximum ×** in the add
+dialog and Torrent settings. Defaults are **1.5–2.5**. Ratatui asks for the range
+when adding; for an existing torrent, **M** accepts `3 1.5 2.5`. Enter equal bounds
+(for example `3 1.75 1.75`) for a fixed multiplier. Bounds are positive, ordered,
+and support three decimal places. They are saved only after engine confirmation
+and restored after restart; old records/commands use the 1.5–2.5 default.
+
+A new multiplier is sampled uniformly from the inclusive range for **every real
+announce attempt**, including retries and stopped/completed requests. The sent
+upload is `floor(actual_downloaded * multiplier)`, saturating at `u64::MAX`.
+Downloaded/left and all local transfer counters stay actual. A smaller sampled
+multiplier can decrease reported uploaded bytes even as downloads grow; the mode
+does not silently clamp the counter or cache one multiplier for the torrent.
+This mode therefore does not guarantee monotonic tracker-upload counters.
+
+CLI/MCP `set_mode` optionally accepts `upload_ratio` with integer `min_milli` and
+`max_milli` fields: 1500 means ×1.5 and 2500 means ×2.5. The legacy mode identifier
+`upload_ratio_1_5` remains unchanged for compatibility.
 
 Changing the dropdown edits a draft, not the saved configuration. The UI displays:
 

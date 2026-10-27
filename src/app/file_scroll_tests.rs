@@ -1,6 +1,213 @@
 use super::*;
 
 #[test]
+fn file_region_fills_remaining_height_for_empty_short_and_long_lists() {
+    for count in [0, 3, 65] {
+        let context = egui::Context::default();
+        let mut torrent = crate::client::tests::torrent();
+        torrent.files = FileSelectionModel::from_files(
+            (0..count).map(|index| (format!("file-{index:04}.bin"), 100)),
+        );
+        for height in [360.0, 600.0, 1000.0, 600.0] {
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let border = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.stroke.width > 0.0 && rect.rect.width() > 900.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("file-list border");
+            assert!(
+                (border.bottom() - (height - 8.0)).abs() <= 1.0,
+                "file region leaves unused height for {count} files at {height}: {border:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn blank_space_after_a_left_aligned_file_name_keeps_its_context_menu() {
+    let context = egui::Context::default();
+    let mut torrent = crate::client::tests::torrent();
+    torrent.files = FileSelectionModel::from_files([("a.bin".into(), 100)]);
+    let frame = |events| {
+        let mut action = (None, None);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = PeerLumeApp::show_file_tree(ui, &torrent);
+                });
+            },
+        );
+        (output, action)
+    };
+    let text_center = |output: &egui::FullOutput, label: &str| {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing rendered text: {label}"))
+    };
+    let pointer = |pos, button, pressed| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    frame(vec![]);
+    let (output, action) = frame(vec![]);
+    assert_eq!(action, (None, None));
+    let name = text_center(&output, "a.bin");
+    assert!(name.x < 100.0);
+    let blank = egui::pos2(400.0, name.y);
+    frame(pointer(blank, egui::PointerButton::Secondary, true));
+    frame(pointer(blank, egui::PointerButton::Secondary, false));
+    let (output, action) = frame(vec![]);
+    assert_eq!(action, (None, None));
+    let menu = text_center(&output, "Show in folder");
+    frame(pointer(menu, egui::PointerButton::Primary, true));
+    let (_, action) = frame(pointer(menu, egui::PointerButton::Primary, false));
+    assert_eq!(action, (None, Some(0)));
+    assert!(torrent.files.files()[0].selected);
+    assert_eq!(torrent.downloaded_bytes, 0);
+}
+
+#[test]
+fn file_names_start_at_the_left_inside_a_visible_list_border() {
+    for dark in [false, true] {
+        for width in [420.0, 1000.0, 1453.0] {
+            let context = egui::Context::default();
+            context.set_visuals(if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            let mut torrent = crate::client::tests::torrent();
+            let names = [
+                "a.bin".to_owned(),
+                "normal file name.mkv".to_owned(),
+                "long name ".repeat(60),
+            ];
+            torrent.files =
+                FileSelectionModel::from_files(names.iter().map(|name| (name.clone(), 100)));
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let text = |name: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.job.text == name => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let left = text(&names[0]).pos.x;
+            assert!(
+                left < 50.0,
+                "file name is centered at width {width}: {left}"
+            );
+            for name in &names {
+                let label = text(name);
+                assert!(
+                    (label.pos.x - left).abs() <= 1.0,
+                    "all file names must share a left edge"
+                );
+                assert_eq!(
+                    label.galley.rows.len(),
+                    1,
+                    "long names must stay on one line"
+                );
+            }
+            let border = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Rect(rect)
+                        if rect.stroke.width > 0.0
+                            && rect.rect.width() > width * 0.8
+                            && rect.rect.height() > 40.0 =>
+                    {
+                        Some(rect)
+                    }
+                    _ => None,
+                })
+                .expect("a visible frame must enclose the file list");
+            assert_ne!(border.stroke.color, egui::Color32::TRANSPARENT);
+            assert!(border.rect.left() >= 7.0 && border.rect.right() <= width - 7.0);
+            let header = text("Files/ (3 files)");
+            assert!(header.pos.y + header.galley.size().y < border.rect.top());
+            for name in &names {
+                let label = text(name);
+                assert!(
+                    border
+                        .rect
+                        .contains_rect(egui::Rect::from_min_size(label.pos, label.galley.size()))
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn file_count_header_stays_fixed_while_rows_scroll_to_the_end_and_back() {
     fn frame(
         context: &egui::Context,

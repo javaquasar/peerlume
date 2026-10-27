@@ -2,7 +2,6 @@
 use crate::{torrent::TorrentItem, torrent_filter::StatusFilter};
 use eframe::egui;
 
-pub(super) const DEFAULT_WIDTH: f32 = 420.0;
 pub(super) const MIN_WIDTH: f32 = 160.0;
 pub(super) const PROGRESS_WIDTH: f32 = 145.0;
 const MIN_OTHER_WIDTH: f32 = 72.0;
@@ -24,20 +23,13 @@ pub(super) fn scroll_area(width: f32) -> egui::ScrollArea {
         .auto_shrink([false, true])
 }
 
+#[derive(Default)]
 pub(super) struct NameColumn {
-    preferred_width: f32,
+    // Zero fills the viewport. A user-created gap stays constant when the
+    // window grows, so all newly available space still goes to Name.
+    trailing_space: f32,
     last_layout_width: Option<f32>,
     last_input_frame: Option<u64>,
-}
-
-impl Default for NameColumn {
-    fn default() -> Self {
-        Self {
-            preferred_width: DEFAULT_WIDTH,
-            last_layout_width: None,
-            last_input_frame: None,
-        }
-    }
 }
 
 pub(super) struct ColumnLayout {
@@ -66,8 +58,7 @@ impl ColumnLayout {
 
 impl NameColumn {
     fn width(&self, available: f32, reserved: f32) -> f32 {
-        self.preferred_width
-            .clamp(MIN_WIDTH, (available - reserved).max(MIN_WIDTH))
+        (available - reserved - self.trailing_space).max(MIN_WIDTH)
     }
 
     /// Call inside the table's horizontal scroll area, with the OUTER viewport
@@ -93,17 +84,18 @@ impl NameColumn {
                 egui::CursorIcon::Default
             })
             .on_hover_text(
-                "Drag to resize Name. Double-click to reset. The other columns keep their space.",
+                "Drag to resize Name. Double-click to fill the available width. The other columns keep their space.",
             );
         let frame = ui.ctx().cumulative_frame_nr();
         if self.last_input_frame != Some(frame) {
             if response.double_clicked_by(egui::PointerButton::Primary) {
-                self.preferred_width = DEFAULT_WIDTH;
+                self.trailing_space = 0.0;
                 self.last_input_frame = Some(frame);
             } else if response.dragged_by(egui::PointerButton::Primary)
                 && response.drag_delta().x != 0.0
             {
-                self.preferred_width = (width + response.drag_delta().x).clamp(MIN_WIDTH, maximum);
+                self.trailing_space =
+                    maximum - (width + response.drag_delta().x).clamp(MIN_WIDTH, maximum);
                 self.last_input_frame = Some(frame);
             }
             width = self.width(available, reserved);
@@ -133,7 +125,11 @@ pub(super) fn headers(ui: &mut egui::Ui, width: f32) {
             .halign(egui::Align::Min)
             .truncate(),
     );
-    ui.strong("Progress");
+    // Reserve the same column width even when a filter shows no torrent rows.
+    ui.add_sized(
+        [PROGRESS_WIDTH, 20.0],
+        egui::Label::new(egui::RichText::new("Progress").strong()).truncate(),
+    );
     for title in HEADERS {
         ui.strong(title);
     }

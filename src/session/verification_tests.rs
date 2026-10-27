@@ -51,6 +51,7 @@ impl CheckedFixture {
                 verify_after_download: false,
                 download_mode: DownloadMode::Normal,
                 freeze_after_bytes: 0,
+                upload_ratio: Default::default(),
                 full_size: payload.len() as u64,
                 id: id.clone(),
                 source: source.display().to_string(),
@@ -225,6 +226,7 @@ fn every_mode_transition_preserves_paused_payload_and_rejects_invalid_threshold(
                 let config = ModeConfig {
                     mode,
                     freeze_after_bytes: 16384,
+                    upload_ratio: Default::default(),
                 };
                 fixture
                     .runtime()
@@ -255,6 +257,7 @@ fn every_mode_transition_preserves_paused_payload_and_rejects_invalid_threshold(
     let invalid = ModeConfig {
         mode: DownloadMode::FreezeAfter,
         freeze_after_bytes: 0,
+        upload_ratio: Default::default(),
     };
     fixture
         .runtime()
@@ -327,6 +330,7 @@ fn automatic_repair_does_not_override_a_user_paused_integrity_check() {
     let config = ModeConfig {
         mode: DownloadMode::NoProgress,
         freeze_after_bytes: 16384,
+        upload_ratio: Default::default(),
     };
     fixture
         .runtime()
@@ -474,6 +478,7 @@ fn repair_download_scenario(forced: bool, missing: bool) {
     let config = ModeConfig {
         mode: DownloadMode::NoProgress,
         freeze_after_bytes: 16384,
+        upload_ratio: Default::default(),
     };
     fixture
         .runtime()
@@ -603,6 +608,10 @@ fn repair_download_scenario(forced: bool, missing: bool) {
         let config = ModeConfig {
             mode,
             freeze_after_bytes: 16384,
+            upload_ratio: crate::download_mode::UploadRatioRange {
+                min_milli: 1750,
+                max_milli: 2750,
+            },
         };
         fixture
             .runtime()
@@ -621,10 +630,25 @@ fn repair_download_scenario(forced: bool, missing: bool) {
                     entry.announce.actual.downloaded, expected_download,
                     "mode changes must preserve real network totals"
                 );
-                let expected = mode
-                    .reporting_policy_with_threshold(32768, 16384)
-                    .apply_metrics(entry.announce.actual);
-                assert_eq!(entry.announce.sent, expected);
+                if mode == DownloadMode::UploadRatio15 {
+                    // Each announce chooses independently: a second policy call
+                    // must not be used as the expected random wire value.
+                    let actual = entry.announce.actual;
+                    let sent = entry.announce.sent;
+                    assert_eq!(sent.downloaded, actual.downloaded);
+                    assert_eq!(sent.left, actual.left);
+                    let minimum =
+                        actual.downloaded * u64::from(config.upload_ratio.min_milli) / 1000;
+                    let maximum =
+                        actual.downloaded * u64::from(config.upload_ratio.max_milli) / 1000;
+                    assert!((minimum..=maximum).contains(&sent.uploaded));
+                } else {
+                    let expected = config
+                        .reporting_policy(32768)
+                        .unwrap()
+                        .apply_metrics(entry.announce.actual);
+                    assert_eq!(entry.announce.sent, expected);
+                }
                 break;
             }
             assert!(

@@ -195,22 +195,52 @@ fn assert_fits(observation: &Observation) {
 }
 
 #[test]
+fn default_name_column_fills_the_visible_width_when_the_window_grows() {
+    for torrents in [fixture(), vec![]] {
+        let ctx = egui::Context::default();
+        let mut column = NameColumn::default();
+        let mut previous: Option<(f32, f32)> = None;
+        for window in [1080.0, 1453.0, 1920.0, 2560.0, 3840.0, 820.0, 1920.0] {
+            let view = settle(&ctx, &mut column, window, &torrents);
+            assert_fits(&view);
+            assert!(
+                (view.width - (view.available - view.reserved)).abs() <= 1.0,
+                "Name must absorb unused space at window width {window}"
+            );
+            assert!(
+                (view.table.right() - view.viewport.right()).abs() <= 1.0,
+                "Table leaves unused space at window width {window}: {:?}, {:?}",
+                view.table,
+                view.viewport
+            );
+            assert!(view.content_width <= view.viewport.width() + 1.0);
+            if let Some((last_window, last_width)) = previous
+                && window > last_window
+            {
+                assert!((view.width - last_width - (window - last_window)).abs() <= 1.0);
+            }
+            previous = Some((window, view.width));
+        }
+    }
+}
+
+#[test]
 fn real_header_drag_grows_shrinks_and_clamps_without_hiding_other_columns() {
     let ctx = egui::Context::default();
     let mut column = NameColumn::default();
     let torrents = fixture();
     let initial = settle(&ctx, &mut column, 1920.0, &torrents);
-    assert_eq!(initial.width, DEFAULT_WIDTH);
-    let wider = drag(&ctx, &mut column, 1920.0, &torrents, 300.0);
+    assert_eq!(initial.width, initial.available - initial.reserved);
+    let narrower = drag(&ctx, &mut column, 1920.0, &torrents, -300.0);
     assert_eq!(
-        wider.width,
-        DEFAULT_WIDTH + 300.0,
+        narrower.width,
+        initial.width - 300.0,
         "Input must not accumulate twice in multi-pass layout"
     );
-    assert_fits(&wider);
-    let narrower = drag(&ctx, &mut column, 1920.0, &torrents, -200.0);
-    assert_eq!(narrower.width, DEFAULT_WIDTH + 100.0);
     assert_fits(&narrower);
+    let wider = drag(&ctx, &mut column, 1920.0, &torrents, 200.0);
+    assert_eq!(wider.width, initial.width - 100.0);
+    assert_fits(&wider);
     let maximum = drag(&ctx, &mut column, 1920.0, &torrents, 5000.0);
     assert_eq!(maximum.width, maximum.available - maximum.reserved);
     assert_fits(&maximum);
@@ -220,19 +250,27 @@ fn real_header_drag_grows_shrinks_and_clamps_without_hiding_other_columns() {
 }
 
 #[test]
-fn shrinking_window_temporarily_clamps_and_growing_restores_the_chosen_width() {
+fn manual_resize_keeps_only_the_user_created_gap_as_the_window_changes() {
     let ctx = egui::Context::default();
     let mut column = NameColumn::default();
     let torrents = fixture();
-    let chosen = drag(&ctx, &mut column, 1920.0, &torrents, 400.0).width;
-    for window in [1080.0, 820.0, 1920.0] {
+    let chosen = drag(&ctx, &mut column, 1920.0, &torrents, -400.0).width;
+    let chosen_gap = column.trailing_space;
+    assert_eq!(chosen_gap, 400.0);
+    for window in [1080.0, 820.0, 1920.0, 2560.0, 1920.0] {
         let view = settle(&ctx, &mut column, window, &torrents);
         assert_fits(&view);
         assert_eq!(
             view.width,
-            chosen.min((view.available - view.reserved).max(MIN_WIDTH))
+            (view.available - view.reserved - chosen_gap).max(MIN_WIDTH)
         );
-        assert_eq!(column.preferred_width, chosen);
+        assert_eq!(column.trailing_space, chosen_gap);
+        if window == 1920.0 {
+            assert_eq!(view.width, chosen);
+        }
+        if window == 2560.0 {
+            assert_eq!(view.width, chosen + 640.0);
+        }
     }
 }
 
@@ -240,8 +278,8 @@ fn shrinking_window_temporarily_clamps_and_growing_restores_the_chosen_width() {
 fn double_click_resets_and_empty_filtered_lists_still_have_a_resizable_header() {
     let ctx = egui::Context::default();
     let mut column = NameColumn::default();
-    let resized = drag(&ctx, &mut column, 1920.0, &[], 200.0);
-    assert_eq!(resized.width, DEFAULT_WIDTH + 200.0);
+    let resized = drag(&ctx, &mut column, 1920.0, &[], -200.0);
+    assert_eq!(resized.width, resized.available - resized.reserved - 200.0);
     for _ in 0..2 {
         frame(
             &ctx,
@@ -258,7 +296,10 @@ fn double_click_resets_and_empty_filtered_lists_still_have_a_resizable_header() 
             pointer(resized.handle, egui::PointerButton::Primary, false),
         );
     }
-    assert_eq!(settle(&ctx, &mut column, 1920.0, &[]).width, DEFAULT_WIDTH);
+    let reset = settle(&ctx, &mut column, 1920.0, &[]);
+    assert_eq!(reset.width, reset.available - reset.reserved);
+    assert_eq!(column.trailing_space, 0.0);
+    assert_fits(&reset);
 }
 
 #[test]
@@ -281,14 +322,14 @@ fn long_status_and_counters_are_reserved_before_allowing_a_wider_name() {
 
 #[test]
 fn variable_width_keeps_left_alignment_truncation_and_full_row_clicks() {
-    for width in [MIN_WIDTH, DEFAULT_WIDTH, 1000.0] {
+    for width in [MIN_WIDTH, 420.0, 1000.0] {
         for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
             let ctx = egui::Context::default();
-            let mut column = NameColumn {
-                preferred_width: width,
-                ..Default::default()
-            };
+            let mut column = NameColumn::default();
             let torrents = fixture();
+            let initial = settle(&ctx, &mut column, 1920.0, &torrents);
+            column.trailing_space = initial.width - width;
+            let chosen_gap = column.trailing_space;
             let view = settle(&ctx, &mut column, 1920.0, &torrents);
             let (output, _) = frame(&ctx, &mut column, 1920.0, &torrents, vec![]);
             let name = view.name.unwrap();
@@ -332,7 +373,7 @@ fn variable_width_keeps_left_alignment_truncation_and_full_row_clicks() {
                 clicked.secondary_clicked(),
                 button == egui::PointerButton::Secondary
             );
-            assert_eq!(column.preferred_width, width);
+            assert_eq!(column.trailing_space, chosen_gap);
         }
     }
 }

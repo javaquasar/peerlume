@@ -11,18 +11,40 @@ use std::time::{Duration, Instant};
 pub struct ModeConfig {
     pub mode: DownloadMode,
     pub freeze_after_bytes: u64,
+    #[serde(default)]
+    pub upload_ratio: crate::download_mode::UploadRatioRange,
 }
 impl Default for ModeConfig {
     fn default() -> Self {
         Self {
             mode: DownloadMode::Normal,
             freeze_after_bytes: DEFAULT_FREEZE_AFTER_BYTES,
+            upload_ratio: Default::default(),
         }
     }
 }
 impl ModeConfig {
+    pub fn validate(self) -> Result<(), String> {
+        self.mode.validate_threshold(self.freeze_after_bytes)?;
+        self.upload_ratio.validate().map_err(str::to_owned)
+    }
+    pub fn reporting_policy(
+        self,
+        full_size: u64,
+    ) -> Result<librqbit_tracker_comms::ReportingPolicy, String> {
+        self.validate()?;
+        librqbit_tracker_comms::ReportingPolicy::with_upload_ratio_range(
+            self.mode.reporting_mode(),
+            full_size,
+            self.freeze_after_bytes,
+            self.upload_ratio,
+        )
+        .map_err(str::to_owned)
+    }
     pub fn label(self) -> String {
-        if self.mode == DownloadMode::FreezeAfter {
+        if self.mode == DownloadMode::UploadRatio15 {
+            format!("{} (×{})", self.mode.label(), self.upload_ratio.label())
+        } else if self.mode == DownloadMode::FreezeAfter {
             format!("{} ({} bytes)", self.mode.label(), self.freeze_after_bytes)
         } else {
             self.mode.label().into()
@@ -279,6 +301,36 @@ fn redacted_endpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiplier_config_defaults_round_trips_and_rejects_invalid_wire_ranges() {
+        let legacy: ModeConfig =
+            serde_json::from_str(r#"{"mode":"upload_ratio_1_5","freeze_after_bytes":0}"#).unwrap();
+        assert_eq!(legacy.upload_ratio, Default::default());
+        let config = ModeConfig {
+            mode: DownloadMode::UploadRatio15,
+            upload_ratio: crate::download_mode::UploadRatioRange {
+                min_milli: 1250,
+                max_milli: 3750,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_str::<ModeConfig>(&serde_json::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        assert!(config.label().contains("1.25–3.75"));
+        for range in [
+            r#"{"min_milli":0,"max_milli":2500}"#,
+            r#"{"min_milli":2501,"max_milli":2500}"#,
+            r#"{"min_milli":-1,"max_milli":2500}"#,
+            r#"{"min_milli":1500,"max_milli":2500,"approved":true}"#,
+        ] {
+            let json = format!(
+                r#"{{"mode":"upload_ratio_1_5","freeze_after_bytes":0,"upload_ratio":{range}}}"#
+            );
+            assert!(serde_json::from_str::<ModeConfig>(&json).is_err(), "{json}");
+        }
+    }
     #[test]
     fn repair_is_bounded_and_only_verified_progress_restarts_stall_timer() {
         let now = Instant::now();

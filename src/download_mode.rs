@@ -1,5 +1,6 @@
 //! Download-time announce behavior, shared by the GUI, TUI and persistence.
 
+pub use librqbit_tracker_comms::UploadRatioRange;
 use serde::{Deserialize, Serialize};
 pub const DEFAULT_FREEZE_AFTER_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -38,7 +39,7 @@ impl DownloadMode {
         match self {
             Self::Normal => "Normal download",
             Self::NoProgress => "Download without reporting progress",
-            Self::UploadRatio15 => "Download; reported upload = download × 1.5",
+            Self::UploadRatio15 => "Download; random reported-upload multiplier",
             Self::HideDownloaded => "Hide downloaded only; actual upload and left",
             Self::FreezeAfter => "Freeze metrics after a received-byte threshold",
         }
@@ -65,18 +66,18 @@ impl DownloadMode {
         full_size: u64,
         threshold: u64,
     ) -> librqbit_tracker_comms::ReportingPolicy {
+        librqbit_tracker_comms::ReportingPolicy::new(self.reporting_mode(), full_size, threshold)
+    }
+
+    pub(crate) fn reporting_mode(self) -> librqbit_tracker_comms::ReportingMode {
         use librqbit_tracker_comms::ReportingMode;
-        librqbit_tracker_comms::ReportingPolicy::new(
-            match self {
-                Self::Normal => ReportingMode::Accurate,
-                Self::NoProgress => ReportingMode::FrozenProgress,
-                Self::UploadRatio15 => ReportingMode::UploadRatio15,
-                Self::HideDownloaded => ReportingMode::HideDownloaded,
-                Self::FreezeAfter => ReportingMode::FreezeAfter,
-            },
-            full_size,
-            threshold,
-        )
+        match self {
+            Self::Normal => ReportingMode::Accurate,
+            Self::NoProgress => ReportingMode::FrozenProgress,
+            Self::UploadRatio15 => ReportingMode::UploadRatio15,
+            Self::HideDownloaded => ReportingMode::HideDownloaded,
+            Self::FreezeAfter => ReportingMode::FreezeAfter,
+        }
     }
 
     pub fn validate_metadata(self, has_v1: bool, full_size: u64) -> Result<(), String> {
@@ -95,7 +96,7 @@ impl DownloadMode {
                 "Download normally; announce uploaded=0, downloaded=0, left=full torrent size. Do not report completed."
             }
             Self::UploadRatio15 => {
-                "Download normally; announce actual downloaded/left and uploaded=floor(downloaded × 1.5). Local transfer totals remain actual."
+                "Download normally; announce actual downloaded/left and uploaded=floor(downloaded × multiplier). Choose a new random multiplier from the configured range for every announce. Equal bounds give a fixed multiplier. Reported upload may decrease; local transfer totals remain actual."
             }
             Self::HideDownloaded => {
                 "Download normally; announce downloaded=0 while uploaded and left remain actual. Existing files and checked progress are logged separately from network bytes."
@@ -144,9 +145,17 @@ mod tests {
             (0, 0, 100)
         );
         assert!(!hidden.is_completed());
-        let ratio = DownloadMode::UploadRatio15
-            .reporting_policy(100)
-            .apply(stats(21));
+        let ratio = crate::runtime_status::ModeConfig {
+            mode: DownloadMode::UploadRatio15,
+            upload_ratio: UploadRatioRange {
+                min_milli: 1500,
+                max_milli: 1500,
+            },
+            ..Default::default()
+        }
+        .reporting_policy(100)
+        .unwrap()
+        .apply(stats(21));
         assert_eq!(
             (
                 ratio.uploaded_bytes,
