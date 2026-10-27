@@ -82,6 +82,41 @@ hidden row. Commands and context menus retain original torrent identities, not
 filtered row numbers. **Pause all** and **Resume all** still apply to the entire
 session, including hidden torrents. Choose **All** to restore the full list.
 
+### Desktop torrent Name column
+
+Drag the separator between **Name** and **Progress** in the table header to
+resize the Name column. Double-click the separator to restore the 420-point
+default. Names stay left-aligned, truncated to one line and clickable across
+the full row, including their context menus.
+
+The chosen width is remembered for the current GUI session. Narrowing the
+window temporarily clamps the visible width and widening it restores the chosen
+width. The resize budget reserves space for Progress and the current status,
+rates, peer counts, ETA and ratio; hidden rows do not consume extra width.
+Name cannot shrink below 160 points. If the essential columns themselves cannot
+fit, the existing horizontal scrollbar remains available. Resizing never changes
+the torrent selection, transfer state, payloads or saved preferences.
+
+The table's horizontal viewport is bounded to the visible panel width captured
+before laying out the action toolbar. An oversized toolbar or status message
+cannot enlarge the viewport and shorten the scroll range. After shrinking or
+expanding the window, the scrollbar can still reach **Ratio** on the right and
+return to **Name** on the left.
+
+### Desktop file-list scrolling
+
+The Files list reserves a separate gutter for its vertical scrollbar, including
+when hovered. File names use the remaining row width after the progress and
+measured size labels; they stay left-aligned and truncate rather than pushing
+the size under the scrollbar. The viewport is bounded to the visible panel even
+if a toolbar is wider than the window. Selection and file context menus are
+unchanged, and only visible rows are rendered for large file lists.
+
+The file-count heading stays above the scroll viewport alongside the selection
+controls. A single root's heading is displayed there once, not repeated as a
+scrollable row. With multiple roots, the fixed heading shows the total file count
+while the individual folder headings remain in the scrolling list.
+
 ### Shared controls
 
 Both frontends expose the shared torrent table, add torrent/magnet operations,

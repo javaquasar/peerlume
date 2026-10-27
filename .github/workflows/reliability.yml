@@ -111,6 +111,8 @@ jobs:
           cargo +stable test --locked --lib app::file_location
           cargo +stable test --locked --lib app::icon
           cargo +stable test --locked --lib app::status_filter
+          cargo +stable test --locked --lib app::name_column
+          cargo +stable test --locked --lib app::file_scroll_tests
       - run: cargo +stable build --locked --features tui --bin peerlume --bin peerlume-control
       - name: Operate the actual installed GUI and collect screenshots
         env:

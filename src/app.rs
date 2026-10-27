@@ -15,10 +15,13 @@ use std::{
 use eframe::egui;
 
 mod file_location;
+#[cfg(test)]
+mod file_scroll_tests;
 mod icon;
 pub use icon::application_icon;
 #[cfg(test)]
 mod header_tests;
+mod name_column;
 #[cfg(test)]
 mod name_tests;
 mod status_filter;
@@ -371,6 +374,7 @@ pub struct PeerLumeApp {
     preferences_tab: PreferencesTab,
     selected_torrent: usize,
     status_filter: crate::torrent_filter::StatusFilter,
+    name_column: name_column::NameColumn,
     settings: ClientSettings,
     saved_settings: ClientSettings,
     settings_draft: ClientSettings,
@@ -500,6 +504,7 @@ impl Default for PeerLumeApp {
             preferences_tab,
             selected_torrent: 0,
             status_filter: Default::default(),
+            name_column: Default::default(),
             settings,
             saved_settings,
             settings_draft,
@@ -811,6 +816,7 @@ impl PeerLumeApp {
             self.selected_torrent = index;
         }
         egui::CentralPanel::default().show(ctx, |ui| {
+            let table_available_width = name_column::viewport_width(ui);
             ui.horizontal(|ui| {
                 if ui.button("+ Add torrent").clicked() {
                     self.open_torrent_picker();
@@ -823,16 +829,34 @@ impl PeerLumeApp {
                 if ui.button("Add magnet").clicked() {
                     self.add_magnet();
                 }
-                if ui.button("Pause all").on_hover_text("Applies to all torrents, including hidden rows").clicked() {
+                if ui
+                    .button("Pause all")
+                    .on_hover_text("Applies to all torrents, including hidden rows")
+                    .clicked()
+                {
                     self.add_status = self.control.submit_batch(false);
                 }
-                if ui.button("Resume all").on_hover_text("Applies to all torrents, including hidden rows").clicked() {
+                if ui
+                    .button("Resume all")
+                    .on_hover_text("Applies to all torrents, including hidden rows")
+                    .clicked()
+                {
                     self.add_status = self.control.submit_batch(true);
                 }
-                if ui.add_enabled(visible_selection.is_some(), egui::Button::new("Remove selected (keep data)")).clicked() {
+                if ui
+                    .add_enabled(
+                        visible_selection.is_some(),
+                        egui::Button::new("Remove selected (keep data)"),
+                    )
+                    .clicked()
+                {
                     let index = visible_selection.expect("enabled for a visible selection");
                     let id = self.control.torrents[index].info_hashes.join(";");
-                    self.add_status = self.control.remove(&id).map(|_|"Removal queued; data will be kept".into()).unwrap_or_else(|error|error.to_string());
+                    self.add_status = self
+                        .control
+                        .remove(&id)
+                        .map(|_| "Removal queued; data will be kept".into())
+                        .unwrap_or_else(|error| error.to_string());
                 }
                 if !self.add_status.is_empty() {
                     ui.label(&self.add_status);
@@ -843,124 +867,119 @@ impl PeerLumeApp {
             let mut source_to_reveal = None;
             let mut trash_action = None;
             let mut recheck_action = None;
+            let other_columns_width =
+                name_column::reserved_width(ui, &self.control.torrents, self.status_filter);
             ui.scope(|ui| {
                 ui.style_mut().spacing.scroll.floating = false;
-                egui::ScrollArea::horizontal()
-                    .id_salt("torrent_table_scroll")
-                    .show(ui, |ui| {
-                        egui::Grid::new("torrent_table")
-                            .striped(true)
-                            .min_col_width(72.0)
-                            .show(ui, |ui| {
-                                for title in [
-                                    "Name", "Progress", "Status", "Down", "Up", "Peers", "ETA",
-                                    "Ratio",
-                                ] {
-                                    ui.strong(title);
+                name_column::scroll_area(table_available_width).show(ui, |ui| {
+                    let name_layout =
+                        self.name_column
+                            .begin(ui, table_available_width, other_columns_width);
+                    let table = egui::Grid::new("torrent_table")
+                        .striped(true)
+                        .min_col_width(72.0)
+                        .show(ui, |ui| {
+                            name_column::headers(ui, name_layout.width);
+                            for (index, torrent) in self.control.torrents.iter().enumerate() {
+                                if !self.status_filter.matches(torrent) {
+                                    continue;
+                                }
+                                let response = Self::show_torrent_name(
+                                    ui,
+                                    &torrent.name,
+                                    torrent.is_private,
+                                    self.selected_torrent == index,
+                                    name_layout.width,
+                                );
+                                response.context_menu(|ui| {
+                                    if let Some(action) = Self::show_recheck_menu(ui, torrent) {
+                                        recheck_action = Some(action);
+                                    }
+                                    ui.separator();
+                                    if ui.button("Open download folder").clicked() {
+                                        let effective = EffectiveTorrentSettings::resolve(
+                                            &self.settings,
+                                            &torrent.overrides,
+                                            torrent.is_private,
+                                        );
+                                        directory_to_open =
+                                            Some(PathBuf::from(effective.download_directory));
+                                        ui.close();
+                                    }
+                                    let source = PathBuf::from(&torrent.source);
+                                    if source.is_file()
+                                        && ui.button("Open .torrent location").clicked()
+                                    {
+                                        source_to_reveal = Some(source.clone());
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Move downloaded files to Recycle Bin").clicked() {
+                                        trash_action = Some((
+                                            torrent.info_hashes.join(";"),
+                                            TrashScope::DownloadedFiles,
+                                        ));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            source.is_file(),
+                                            egui::Button::new(
+                                                "Move source .torrent to Recycle Bin",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        trash_action = Some((
+                                            torrent.info_hashes.join(";"),
+                                            TrashScope::TorrentFile,
+                                        ));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            source.is_file(),
+                                            egui::Button::new(
+                                                "Move torrent and downloaded files to Recycle Bin",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        trash_action = Some((
+                                            torrent.info_hashes.join(";"),
+                                            TrashScope::Everything,
+                                        ));
+                                        ui.close();
+                                    }
+                                });
+                                if response.clicked() {
+                                    self.selected_torrent = index;
+                                }
+                                ui.add(
+                                    egui::ProgressBar::new(torrent.display_progress())
+                                        .desired_width(name_column::PROGRESS_WIDTH)
+                                        .text(torrent.progress_text())
+                                        .fill(if torrent.completed_successfully() {
+                                            egui::Color32::from_rgb(32, 135, 65)
+                                        } else if matches!(
+                                            torrent.completion,
+                                            crate::completion::CompletionStatus::Failed { .. }
+                                        ) {
+                                            egui::Color32::from_rgb(170, 45, 45)
+                                        } else if torrent.state == TorrentState::Checking {
+                                            egui::Color32::from_rgb(170, 125, 25)
+                                        } else {
+                                            ui.visuals().selection.bg_fill
+                                        }),
+                                );
+                                for text in name_column::metrics(torrent) {
+                                    ui.label(text);
                                 }
                                 ui.end_row();
-                                for (index, torrent) in self.control.torrents.iter().enumerate() {
-                                    if !self.status_filter.matches(torrent) {
-                                        continue;
-                                    }
-                                    let response = Self::show_torrent_name(
-                                        ui,
-                                        &torrent.name,
-                                        torrent.is_private,
-                                        self.selected_torrent == index,
-                                    );
-                                    response.context_menu(|ui| {
-                                        if let Some(action) = Self::show_recheck_menu(ui, torrent) {
-                                            recheck_action = Some(action);
-                                        }
-                                        ui.separator();
-                                        if ui.button("Open download folder").clicked() {
-                                            let effective = EffectiveTorrentSettings::resolve(
-                                                &self.settings,
-                                                &torrent.overrides,
-                                                torrent.is_private,
-                                            );
-                                            directory_to_open =
-                                                Some(PathBuf::from(effective.download_directory));
-                                            ui.close();
-                                        }
-                                        let source = PathBuf::from(&torrent.source);
-                                        if source.is_file()
-                                            && ui.button("Open .torrent location").clicked()
-                                        {
-                                            source_to_reveal = Some(source.clone());
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Move downloaded files to Recycle Bin").clicked()
-                                        {
-                                            trash_action = Some((
-                                                torrent.info_hashes.join(";"),
-                                                TrashScope::DownloadedFiles,
-                                            ));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                source.is_file(),
-                                                egui::Button::new(
-                                                    "Move source .torrent to Recycle Bin",
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            trash_action = Some((
-                                                torrent.info_hashes.join(";"),
-                                                TrashScope::TorrentFile,
-                                            ));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                source.is_file(),
-                                                egui::Button::new(
-                                                    "Move torrent and downloaded files to Recycle Bin",
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            trash_action = Some((
-                                                torrent.info_hashes.join(";"),
-                                                TrashScope::Everything,
-                                            ));
-                                            ui.close();
-                                        }
-                                    });
-                                    if response.clicked() {
-                                        self.selected_torrent = index;
-                                    }
-                                    ui.add(
-                                        egui::ProgressBar::new(torrent.display_progress())
-                                            .desired_width(145.0)
-                                            .text(torrent.progress_text())
-                                            .fill(if torrent.completed_successfully() {
-                                                egui::Color32::from_rgb(32, 135, 65)
-                                            } else if matches!(torrent.completion, crate::completion::CompletionStatus::Failed { .. }) {
-                                                egui::Color32::from_rgb(170, 45, 45)
-                                            } else if torrent.state == TorrentState::Checking {
-                                                egui::Color32::from_rgb(170, 125, 25)
-                                            } else { ui.visuals().selection.bg_fill }),
-                                    );
-                                    ui.label(torrent.status_text());
-                                    ui.label(format_rate(torrent.download_rate));
-                                    ui.label(format_rate(torrent.upload_rate));
-                                    ui.label(format!("{} / {}", torrent.peers, torrent.seeds));
-                                    ui.label(
-                                        torrent
-                                            .eta_seconds()
-                                            .map(format_duration)
-                                            .unwrap_or_else(|| "--".into()),
-                                    );
-                                    ui.label(format!("{:.2}", torrent.ratio()));
-                                    ui.end_row();
-                                }
-                            });
-                    });
+                            }
+                        });
+                    name_layout.paint_divider(ui, table.response.rect);
+                });
             });
             if let Some(path) = directory_to_open {
                 match open_directory(&path) {
@@ -977,7 +996,8 @@ impl PeerLumeApp {
                 self.prepare_trash_request(&id, scope);
             }
             if let Some((id, command)) = recheck_action
-                && let Some(status) = Self::submit_torrent_commands(&mut self.control, &id, vec![command])
+                && let Some(status) =
+                    Self::submit_torrent_commands(&mut self.control, &id, vec![command])
             {
                 self.add_status = status;
             }
@@ -1717,6 +1737,7 @@ impl PeerLumeApp {
         name: &str,
         is_private: bool,
         selected: bool,
+        width: f32,
     ) -> egui::Response {
         let label = if is_private {
             format!("[Private] {name}")
@@ -1724,7 +1745,7 @@ impl PeerLumeApp {
             name.to_owned()
         };
         ui.add_sized(
-            [420.0, 20.0],
+            [width, 20.0],
             // Put all spare space after the text, preserving the full clickable
             // row, selection styling, truncation, and the existing context menu.
             egui::Button::selectable(selected, (label, egui::Atom::grow())).truncate(),
@@ -1791,6 +1812,7 @@ impl PeerLumeApp {
         ui: &mut egui::Ui,
         torrent: &TorrentItem,
     ) -> (Option<Vec<usize>>, Option<usize>) {
+        let visible_width = name_column::viewport_width(ui);
         let mut select_all = None;
         let mut changes = std::collections::BTreeMap::new();
         let mut reveal = None;
@@ -1809,52 +1831,87 @@ impl PeerLumeApp {
                 format_size(torrent.files.selected_downloaded())
             ));
         });
-        egui::ScrollArea::vertical()
-            .id_salt("selected_torrent_files_scroll")
-            .max_height(270.0)
-            .show_rows(ui, 22.0, torrent.files.row_count(), |ui, rows_range| {
-                let rows = torrent.files.rows();
-                let files = torrent.files.files();
-                for row in &rows[rows_range] {
-                    match row {
-                        FileTreeRow::Group { name, file_count } => {
-                            ui.strong(format!("{name}/ ({file_count} files)"));
-                        }
-                        FileTreeRow::File {
-                            index,
-                            display_start,
-                        } => {
-                            let file = &files[*index];
-                            let progress = if file.size_bytes == 0 {
-                                0.0
-                            } else {
-                                file.downloaded_bytes as f32 / file.size_bytes as f32
-                            };
-                            ui.horizontal(|ui| {
-                                let mut selected = select_all.unwrap_or(file.selected);
-                                if ui.checkbox(&mut selected, "").changed() {
-                                    changes.insert(*index, selected);
-                                }
-                                let response = ui.add_sized(
-                                    [(ui.available_width() - 220.0).max(80.0), 20.0],
-                                    egui::Label::new(&file.path[*display_start..])
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
-                                );
-                                if file_location::context_menu(&response) {
-                                    reveal = Some(*index);
-                                }
-                                ui.add(
-                                    egui::ProgressBar::new(progress)
-                                        .desired_width(80.0)
-                                        .show_percentage(),
-                                );
-                                ui.label(format_size(file.size_bytes));
-                            });
+        let rows = torrent.files.rows();
+        // A single root group's count belongs to the fixed header, not the
+        // virtualized rows. With multiple roots, keep their folder headings in
+        // the list and show a fixed total above them instead.
+        let rows = if let Some(FileTreeRow::Group { name, file_count }) = rows.first()
+            && rows.len() == torrent.files.files().len() + 1
+        {
+            ui.strong(format!("{name}/ ({file_count} files)"));
+            &rows[1..]
+        } else {
+            ui.strong(format!("Files/ ({} files)", torrent.files.files().len()));
+            rows
+        };
+        ui.scope(|ui| {
+            // Reserve a separate gutter instead of expanding a floating scrollbar
+            // over the size labels. Keep this style change local to the file list.
+            ui.style_mut().spacing.scroll.floating = false;
+            egui::ScrollArea::vertical()
+                .id_salt("selected_torrent_files_scroll")
+                .max_width(visible_width)
+                .auto_shrink([false, true])
+                .max_height(270.0)
+                .show_rows(ui, 22.0, rows.len(), |ui, rows_range| {
+                    let files = torrent.files.files();
+                    for row in &rows[rows_range] {
+                        match row {
+                            FileTreeRow::Group { name, file_count } => {
+                                ui.strong(format!("{name}/ ({file_count} files)"));
+                            }
+                            FileTreeRow::File {
+                                index,
+                                display_start,
+                            } => {
+                                let file = &files[*index];
+                                let progress = if file.size_bytes == 0 {
+                                    0.0
+                                } else {
+                                    file.downloaded_bytes as f32 / file.size_bytes as f32
+                                };
+                                ui.horizontal(|ui| {
+                                    let mut selected = select_all.unwrap_or(file.selected);
+                                    if ui.checkbox(&mut selected, "").changed() {
+                                        changes.insert(*index, selected);
+                                    }
+                                    let size = format_size(file.size_bytes);
+                                    let size_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            size.clone(),
+                                            egui::TextStyle::Body.resolve(ui.style()),
+                                            ui.visuals().text_color(),
+                                        )
+                                        .size()
+                                        .x;
+                                    let name_width = (ui.available_width()
+                                        - 80.0
+                                        - size_width
+                                        - 2.0 * ui.spacing().item_spacing.x)
+                                        .max(0.0);
+                                    let response = ui.add_sized(
+                                        [name_width, 20.0],
+                                        egui::Label::new(&file.path[*display_start..])
+                                            .halign(egui::Align::Min)
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    if file_location::context_menu(&response) {
+                                        reveal = Some(*index);
+                                    }
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .desired_width(80.0)
+                                            .show_percentage(),
+                                    );
+                                    ui.label(size);
+                                });
+                            }
                         }
                     }
-                }
-            });
+                });
+        });
         (
             torrent.files.selection_after_edit(select_all, &changes),
             reveal,

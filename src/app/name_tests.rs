@@ -26,8 +26,13 @@ fn frame(
                         ui.strong("Name");
                         ui.strong("Progress");
                         ui.end_row();
-                        response =
-                            Some(PeerLumeApp::show_torrent_name(ui, name, private, selected));
+                        response = Some(PeerLumeApp::show_torrent_name(
+                            ui,
+                            name,
+                            private,
+                            selected,
+                            name_column::DEFAULT_WIDTH,
+                        ));
                         ui.label("50%");
                         ui.end_row();
                     });
