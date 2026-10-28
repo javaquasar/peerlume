@@ -2383,6 +2383,16 @@ fn trash_paths(
 }
 
 fn is_safe_relative_path(path: &Path) -> bool {
+    // Path::components uses the host OS syntax. Reject Windows roots/drives and
+    // backslash traversal explicitly, including when this code runs on Linux.
+    let portable = path.to_string_lossy();
+    let bytes = portable.as_bytes();
+    if portable.starts_with('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || portable.split(['/', '\\']).any(|part| part == "..")
+    {
+        return false;
+    }
     let mut has_component = false;
     for component in path.components() {
         if !matches!(component, std::path::Component::Normal(_)) {
@@ -3876,9 +3886,24 @@ mod tests {
     #[test]
     fn recycle_bin_paths_reject_parent_and_absolute_components() {
         assert!(is_safe_relative_path(Path::new("Movie/video.mkv")));
-        assert!(!is_safe_relative_path(Path::new("../outside.mkv")));
-        assert!(!is_safe_relative_path(Path::new(r"C:\outside.mkv")));
-        assert!(!is_safe_relative_path(Path::new("")));
+        assert!(is_safe_relative_path(Path::new("Movie/日本語.mkv")));
+        for path in [
+            "../outside.mkv",
+            "Movie/../../outside.mkv",
+            "/outside.mkv",
+            r"C:\outside.mkv",
+            "C:/outside.mkv",
+            "C:outside.mkv",
+            "C:",
+            r"\\server\share\outside.mkv",
+            r"\\?\C:\outside.mkv",
+            r"\outside.mkv",
+            r"..\outside.mkv",
+            r"Movie\..\outside.mkv",
+            "",
+        ] {
+            assert!(!is_safe_relative_path(Path::new(path)), "Accepted {path:?}");
+        }
     }
 
     #[test]
