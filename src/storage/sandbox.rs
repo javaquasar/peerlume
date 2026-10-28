@@ -72,7 +72,7 @@ impl Directory {
         }
         self.dir.create_dir(name)?;
         #[cfg(unix)]
-        self.dir.try_clone()?.into_std_file().sync_all()?;
+        self.dir.open(".")?.sync_all()?;
         self.descendant(name)
     }
     pub(crate) fn read_payload(&self, relative: &Path) -> io::Result<File> {
@@ -132,8 +132,10 @@ impl Directory {
         target.sync_payload(relative)?;
         #[cfg(unix)]
         {
-            from.into_std_file().sync_all()?;
-            to.into_std_file().sync_all()?;
+            // cap-std may hold O_PATH descriptors on Linux: reopen "." for fsync.
+            // The lookup remains relative to the same pinned directory identity.
+            from.open(".")?.sync_all()?;
+            to.open(".")?.sync_all()?;
         }
         Ok(())
     }
@@ -210,7 +212,7 @@ impl Directory {
                     Ok(()) => {
                         // Persist each new parent link before a move unlinks its source.
                         #[cfg(unix)]
-                        dir.try_clone()?.into_std_file().sync_all()?;
+                        dir.open(".")?.sync_all()?;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),

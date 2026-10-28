@@ -1,4 +1,17 @@
 use super::*;
+#[cfg(unix)]
+#[test]
+fn metadata_sync_reopens_a_readable_handle_relative_to_the_pinned_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let before = parent.path().join("before");
+    let after = parent.path().join("after");
+    std::fs::create_dir(&before).unwrap();
+    let pinned = Directory::open(&before).unwrap();
+    std::fs::rename(&before, &after).unwrap();
+    pinned.new_child("child").unwrap();
+    assert!(after.join("child").is_dir());
+    assert!(!before.exists());
+}
 fn payload(root: &Directory, path: &str, len: u64) -> Payload {
     let file = root.open_payload(Path::new(path), true).unwrap();
     file.set_len(len).unwrap();
