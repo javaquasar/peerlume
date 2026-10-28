@@ -47,6 +47,7 @@ pub struct Controller {
     pub(crate) agent: Option<agent::AgentService>,
     pending_removals: std::collections::BTreeSet<String>,
     notices: std::collections::VecDeque<SessionNotice>,
+    last_checkpoint: std::time::Instant,
 }
 
 impl Controller {
@@ -62,6 +63,7 @@ impl Controller {
             agent: None,
             pending_removals: Default::default(),
             notices: Default::default(),
+            last_checkpoint: std::time::Instant::now(),
         };
         controller.publish();
         controller
@@ -87,7 +89,13 @@ impl Controller {
         let acknowledgement = if self.agent.is_some()
             && !matches!(
                 event,
-                SessionEvent::Stats { .. } | SessionEvent::NetworkTotals { .. }
+                SessionEvent::Stats { .. }
+                    | SessionEvent::NetworkTotals { .. }
+                    | SessionEvent::Peers { .. }
+                    | SessionEvent::Storage {
+                        status: crate::storage::relocation::StorageStatus::Copying { .. },
+                        ..
+                    }
             ) {
             Some(event.clone())
         } else {
@@ -98,6 +106,8 @@ impl Controller {
         // mode drafts, restored counters and local errors are not acknowledgements.
         let event_id = match &event {
             SessionEvent::Mode { id, .. }
+            | SessionEvent::Storage { id, .. }
+            | SessionEvent::Peers { id, .. }
             | SessionEvent::RepairPolicy { id, .. }
             | SessionEvent::Repair { id, .. }
             | SessionEvent::NetworkTotals { id, .. }
@@ -258,6 +268,89 @@ impl Controller {
             self.agent = Some(service);
         }
         self.publish();
+        if self.last_checkpoint.elapsed() >= std::time::Duration::from_secs(5) {
+            let _ = self.checkpoint();
+            self.last_checkpoint = std::time::Instant::now();
+        }
+    }
+
+    /// Flush measured counters without persisting UI drafts or fake engine states.
+    pub fn checkpoint(&mut self) -> Result<(), String> {
+        let result = self.backend.checkpoint_resumes(&self.torrents);
+        if let Err(message) = &result {
+            if self.notices.len() == 256 {
+                self.notices.pop_front();
+            }
+            self.notices.push_back(SessionNotice::Error {
+                id: String::new(),
+                message: format!("Checkpoint failed: {message}"),
+            });
+        }
+        result
+    }
+
+    /// Trusted local frontend only. Paths and filesystem-copy authority are NOT
+    /// added to the agent protocol or arbitrary remote mutation schema.
+    pub fn select_storage(&self, id: &str, directory: String, copy: bool) -> Result<(), String> {
+        let torrent = self
+            .torrents
+            .iter()
+            .find(|torrent| torrent.info_hashes.join(";") == id)
+            .ok_or("Torrent unavailable")?;
+        if torrent.state != crate::torrent::TorrentState::Paused {
+            return Err("Pause the torrent before changing storage".into());
+        }
+        if self.agent.as_ref().is_some_and(|agent| agent.busy(id)) {
+            return Err("Wait for the pending agent operation".into());
+        }
+        if !self.backend.persistence_available() {
+            return Err("Persistent state unavailable".into());
+        }
+        self.backend
+            .send(crate::session::SessionCommand::SelectStorage {
+                id: id.into(),
+                directory,
+                copy,
+            })
+    }
+    pub fn cancel_storage(&self, id: &str) -> Result<(), String> {
+        self.backend
+            .send(crate::session::SessionCommand::CancelStorage { id: id.into() })
+    }
+
+    /// Stop the owner before releasing its profile lock. Drain final real network
+    /// totals before the last SQLite checkpoint, not just the last UI frame.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        if !self.backend.session_available() {
+            return self.checkpoint();
+        }
+        self.backend
+            .send(crate::session::SessionCommand::Shutdown)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            if let Some(event) = self.backend.try_recv() {
+                let stopped = event == crate::session::SessionEvent::Stopped;
+                self.apply(event);
+                if stopped {
+                    let mut persisted = Ok(());
+                    for id in self.unpersisted_updates.iter().cloned().collect::<Vec<_>>() {
+                        if let Err(error) = self.persist_preserving_audit(&id) {
+                            persisted = Err(error);
+                        }
+                    }
+                    let checkpoint = self.checkpoint();
+                    self.backend.finish_shutdown();
+                    return persisted.and(checkpoint);
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "Shutdown acknowledgement timed out; last periodic checkpoint retained".into(),
+                );
+            }
+        }
     }
 
     pub fn has_confirmed_update(&self, id: &str) -> bool {

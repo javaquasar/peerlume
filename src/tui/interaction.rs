@@ -30,17 +30,12 @@ pub(super) struct PendingBatch {
 
 impl TuiApp {
     pub(super) fn visible_indices(&self) -> Vec<usize> {
-        let query = self.search.to_lowercase();
-        self.status_filter
-            .indices(&self.control.torrents)
-            .filter(|index| {
-                query.is_empty()
-                    || self.control.torrents[*index]
-                        .name
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .collect()
+        crate::torrent_view::indices_with_query(
+            &self.control.torrents,
+            self.status_filter,
+            &self.settings.ui,
+            &self.search,
+        )
     }
 
     pub(super) fn retain_visible_marks(&mut self) {
@@ -267,6 +262,63 @@ impl TuiApp {
             .split_once(' ')
             .unwrap_or((command.trim(), ""));
         match verb {
+            "use-data" | "copy-data" => {
+                let id = self
+                    .selected()
+                    .ok_or("No selected torrent")?
+                    .info_hashes
+                    .join(";");
+                self.control
+                    .select_storage(&id, argument.into(), verb == "copy-data")?;
+                return Ok(COMMAND_ACCEPTED.into());
+            }
+            "cancel-copy" => {
+                let id = self
+                    .selected()
+                    .ok_or("No selected torrent")?
+                    .info_hashes
+                    .join(";");
+                self.control.cancel_storage(&id)?;
+                return Ok("Copy cancellation queued; originals retained".into());
+            }
+            "sort" => {
+                self.settings.ui.sort = crate::torrent_view::Sort::ALL
+                    .into_iter()
+                    .find(|sort| sort.label().eq_ignore_ascii_case(argument))
+                    .ok_or("Sort: added, name, progress, download, upload, size")?
+            }
+            "descending" => {
+                self.settings.ui.descending =
+                    argument.parse().map_err(|_| "Use :descending true|false")?
+            }
+            "category" => self.settings.ui.category_filter = argument.into(),
+            "label" | "categorize" => {
+                let id = self
+                    .selected()
+                    .ok_or("No selected torrent")?
+                    .info_hashes
+                    .join(";");
+                let map = if verb == "label" {
+                    &mut self.settings.ui.labels
+                } else {
+                    &mut self.settings.ui.categories
+                };
+                map.insert(id, argument.into());
+            }
+            "save-view" => {
+                let path = crate::settings::data_directory().join("settings.toml");
+                let mut saved = match ClientSettings::load_from(&path) {
+                    Ok(saved) => saved,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        ClientSettings::default()
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                saved.ui = self.settings.ui.clone();
+                saved.ui.search = self.search.clone();
+                saved.ui.torrent_pane_percent = self.split_percent;
+                saved.save_to(&path).map_err(|error| error.to_string())?;
+            }
             "set" => return self.set_transfer_field(argument),
             "help" => self.help = true,
             "pause" => self.execute_batch(BatchAction::Pause, None),

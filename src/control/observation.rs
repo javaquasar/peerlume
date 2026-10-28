@@ -53,6 +53,8 @@ impl UpdateKind {
             SessionEvent::VerifyAfterDownload { .. } => Self::Other,
             SessionEvent::TransferSettingsApplied { .. } => Self::Other,
             SessionEvent::FilesApplied { .. } => Self::Selection,
+            SessionEvent::Peers { .. } => Self::Other,
+            SessionEvent::Storage { .. } => Self::Other,
         }
     }
 }

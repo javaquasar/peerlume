@@ -57,6 +57,15 @@ impl ColumnLayout {
 }
 
 impl NameColumn {
+    pub fn from_gap(gap: u32) -> Self {
+        Self {
+            trailing_space: gap.min(10_000) as f32,
+            ..Default::default()
+        }
+    }
+    pub fn saved_gap(&self) -> u32 {
+        self.trailing_space.round().clamp(0.0, 10_000.0) as u32
+    }
     fn width(&self, available: f32, reserved: f32) -> f32 {
         (available - reserved - self.trailing_space).max(MIN_WIDTH)
     }

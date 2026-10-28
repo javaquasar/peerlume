@@ -32,12 +32,13 @@ librqbit-tracker-comms = "9.0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rfd = { version = "0.15", optional = true }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"], optional = true }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 sha1 = "0.10"
 sha2 = "0.10"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+tempfile = "3.27.0"
 toml = "1.1.6"
 trash = "5.2.9"
 url = "2.5.8"
@@ -46,7 +47,6 @@ url = "2.5.8"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
 proptest = "1.11.0"
 testcontainers = { version = "0.28.0", features = ["blocking"] }
 

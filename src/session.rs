@@ -47,11 +47,20 @@ fn read_metainfo_snapshot(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
+    SelectStorage {
+        id: String,
+        directory: String,
+        copy: bool,
+    },
+    CancelStorage {
+        id: String,
+    },
     PreparedAdd {
         command: Box<SessionCommand>,
         prepared: PreparedTorrent,
     },
     AddTorrent {
+        resume: crate::resume::ResumeCounters,
         transfer: crate::transfer_settings::TransferSettings,
         repair_policy: RepairPolicy,
         verify_after_download: bool,
@@ -110,6 +119,14 @@ pub enum SessionCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    Storage {
+        id: String,
+        status: crate::storage::relocation::StorageStatus,
+    },
+    Peers {
+        id: String,
+        peers: Vec<crate::diagnostics::PeerSnapshot>,
+    },
     TransferSettingsApplied {
         id: String,
         settings: crate::transfer_settings::TransferSettings,
@@ -135,6 +152,7 @@ pub enum SessionEvent {
         status: RepairStatus,
     },
     NetworkTotals {
+        seeded_seconds: u64,
         id: String,
         uploaded: u64,
         downloaded: u64,
@@ -169,6 +187,28 @@ pub enum SessionEvent {
         id: String,
     },
     Stopped,
+}
+
+impl SessionCommand {
+    fn target_id(&self) -> Option<&str> {
+        match self {
+            Self::AddTorrent { id, .. }
+            | Self::Pause { id }
+            | Self::Resume { id }
+            | Self::Remove { id }
+            | Self::Recheck { id }
+            | Self::RecheckAndRepair { id }
+            | Self::SetVerifyAfterDownload { id, .. }
+            | Self::SetFiles { id, .. }
+            | Self::SetDownloadMode { id, .. }
+            | Self::SetRepairPolicy { id, .. }
+            | Self::SetTransferSettings { id, .. }
+            | Self::SelectStorage { id, .. }
+            | Self::CancelStorage { id } => Some(id),
+            Self::PreparedAdd { command, .. } => command.target_id(),
+            Self::Shutdown | Self::ConfigureQueue { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +279,7 @@ impl SessionRuntime {
         }
         let (commands, mut command_rx) = tokio_mpsc::channel(capacity);
         let (event_tx, events) = events::channel(capacity);
+        let (ready, initialized) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
         let thread_journal = journal.clone();
         #[cfg(test)]
         let test_engine = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
@@ -247,11 +288,13 @@ impl SessionRuntime {
         let thread = thread::Builder::new()
             .name("peerlume-session".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
-                    .build()
-                    .expect("Tokio runtime creation failed");
+                    .build() {
+                        Ok(runtime)=>runtime,
+                        Err(error)=>{let _=ready.send(Err(format!("Could not create transfer runtime: {error}")));return;}
+                    };
                 runtime.block_on(async move {
                     // Keep the pinned librqbit 9.0.1 default fingerprint while
                     // knowing the exact session identity before its first announce.
@@ -259,20 +302,22 @@ impl SessionRuntime {
                         librqbit::generate_azereus_style(*b"rQ", (9, 0, 1, 0)));
                     options.peer_id = Some(session_peer_id);
                     let tracker_enabled = !options.disable_trackers;
-                    let session = match Session::new_with_opts(
+                    let session = match tokio::time::timeout(Duration::from_secs(5),Session::new_with_opts(
                         default_output_folder,
                         options,
-                    )
+                    ))
                     .await
                     {
-                        Ok(session) => session,
-                        Err(error) => {
+                        Ok(Ok(session)) => session,
+                        Ok(Err(error)) => {
+                            let _=ready.send(Err(format!("Could not start transfer engine: {error:#}")));
                             let _ = event_tx.send(SessionEvent::Error {
                                 id: String::new(),
                                 message: format!("Could not start transfer engine: {error:#}"),
                             });
                             return;
                         }
+                        Err(_)=>{let _=ready.send(Err("Transfer engine initialization exceeded five seconds".into()));return;}
                     };
                     // The provider samples network payload independently of checked disk pieces.
                     #[cfg(test)]
@@ -307,7 +352,7 @@ impl SessionRuntime {
                     });
                     let _observer = match librqbit_tracker_comms::register_observer(session_peer_id.0, thread_journal.observer(), transfers.clone()) {
                         Ok(guard) => guard,
-                        Err(message) => { let _ = event_tx.send(SessionEvent::Error { id: String::new(), message: message.into() }); return; }
+                        Err(message) => {let _=ready.send(Err(message.into()));session.stop().await;let _ = event_tx.send(SessionEvent::Error { id: String::new(), message: message.into() }); return; }
                     };
                     let mut torrents: HashMap<String, Arc<ManagedTorrent>> = HashMap::new();
                     let mut storage_roots: HashMap<String,crate::storage::sandbox::Directory> = HashMap::new();
@@ -323,18 +368,56 @@ impl SessionRuntime {
                     let mut repairs = HashMap::<String, RepairBudget>::new();
                     let mut manual_repairs = std::collections::HashSet::<String>::new();
                     let mut seeding_clocks = HashMap::<String, crate::transfer_settings::SeedingClock>::new();
+                    let mut copy_jobs = HashMap::<String, crate::storage::relocation::CopyJob>::new();
+                    let mut pending_storage = HashMap::<String,(crate::storage::sandbox::Directory,String)>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    if ready.send(Ok(())).is_err(){session.stop().await;return;}
 
                     loop {
                         tokio::select! {
                             _ = ticker.tick() => {
+                                let mut finished=Vec::new();
+                                for (id,job) in &copy_jobs {
+                                    let _=event_tx.send(SessionEvent::Storage{id:id.clone(),status:crate::storage::relocation::StorageStatus::Copying{bytes:job.bytes.load(std::sync::atomic::Ordering::Relaxed),destination:job.destination.clone()}});
+                                    if let Some(result)=job.finished(){finished.push((id.clone(),result));}
+                                }
+                                for (id,result) in finished {
+                                    let job=copy_jobs.remove(&id).expect("known copy");
+                                    match result {
+                                        Ok(())=>{pending_storage.insert(id,(job.root.clone(),job.destination.clone()));}
+                                        Err(message)=>{let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message:format!("{message}; originals retained; destination: {}",job.destination)}});}
+                                    }
+                                }
+                                for (id,(root,directory)) in std::mem::take(&mut pending_storage) {
+                                    let Some(handle)=torrents.get(&id).cloned() else {continue;};
+                                    let Some(mut next)=added_commands.get(&id).cloned() else {continue;};
+                                    let previous=next.clone();
+                                    let previous_root=storage_roots.get(&id).cloned();
+                                    let previous_bytes=handle.with_metadata(|metadata|metadata.torrent_bytes.to_vec()).ok();
+                                    if let SessionCommand::AddTorrent{output_folder,..}=&mut next{*output_folder=directory.clone();}
+                                    match restart_for_check(&session,&handle,&next,session_peer_id.0,&counters,Some(&root)).await {
+                                        Ok(checked)=>{
+                                            torrents.insert(id.clone(),checked);storage_roots.insert(id.clone(),root);added_commands.insert(id.clone(),next);
+                                            checks.insert(id.clone(),CheckRun{resume:true,require_complete:false}); checked_after_download.remove(&id);check_failed.remove(&id);
+                                            let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Checking{destination:directory}});
+                                        }
+                                        Err(message)=>{
+                                            let mut recovered=false;
+                                            if let (Some(bytes),Some(previous_root))=(previous_bytes,previous_root)
+                                                && let Ok(restored)=verification::add_for_check(&session,bytes,&previous,previous_root).await {
+                                                torrents.insert(id.clone(),restored);checks.insert(id.clone(),CheckRun{resume:false,require_complete:false});recovered=true;
+                                            }
+                                            let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message:format!("{message}; originals and destination retained; new directory not acknowledged; original handle restored paused: {recovered}")}});
+                                        }
+                                    }
+                                }
                                 let torrent_ids: Vec<_> = torrents.keys().cloned().collect();
                                 for id in torrent_ids {
                                     let Some(handle) = torrents.get(&id).cloned() else { continue; };
                                     if check_failed.contains(&id) && !pending_modes.contains_key(&id) { continue; }
                                     let transfer_snapshot = transfers(handle.info_hash().0);
-                                    let _ = event_tx.send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded });
+                                    let _ = event_tx.send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded, seeded_seconds: seeding_clocks.get_mut(&id).map(|clock| clock.sample(std::time::Instant::now(), false).as_secs()).unwrap_or(0) });
                                     let mut stats = handle.stats();
                                     if let Some(message) = stats.error.clone() {
                                         if checks.remove(&id).is_some() {
@@ -444,6 +527,12 @@ impl SessionRuntime {
                                             )
                                         })
                                         .unwrap_or_default();
+                                    let mut peer_details = handle.live().map(|live| live.per_peer_stats_snapshot(Default::default()).peers.into_iter().map(|(address, peer)| crate::diagnostics::PeerSnapshot {
+                                        address, state: peer.state.into(), client: peer.client_name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(80).collect(),
+                                        downloaded: peer.counters.fetched_bytes, uploaded: peer.counters.uploaded_bytes, errors: peer.counters.errors,
+                                    }).collect::<Vec<_>>()).unwrap_or_default();
+                                    peer_details.sort_by(|a,b| a.address.cmp(&b.address)); peer_details.truncate(128);
+                                    let _ = event_tx.send(SessionEvent::Peers { id: id.clone(), peers: peer_details });
                                     let _ = event_tx.send(SessionEvent::Stats {
                                         id: id.clone(),
                                         downloaded_bytes: stats.progress_bytes,
@@ -463,6 +552,10 @@ impl SessionRuntime {
                                     SessionCommand::PreparedAdd{command,prepared} if matches!(*command,SessionCommand::AddTorrent{..})=>(*command,Some(prepared)),
                                     other=>(other,None),
                                 };
+                                if let Some(id)=command.target_id().filter(|id|copy_jobs.contains_key(*id)||pending_storage.contains_key(*id))
+                                    && !matches!(command,SessionCommand::CancelStorage{..}) {
+                                    let _=event_tx.send(SessionEvent::Storage{id:id.to_owned(),status:crate::storage::relocation::StorageStatus::Failed{message:"Copy is active; cancel it before changing this torrent. Originals retained.".into()}});continue;
+                                }
                                 let recheck = match &command {
                                     SessionCommand::Recheck { id } => Some((id, false)),
                                     SessionCommand::RecheckAndRepair { id } => Some((id, true)),
@@ -496,6 +589,25 @@ impl SessionRuntime {
                                 let mut saved_command = command.clone();
                                 if let SessionCommand::AddTorrent { repair_policy, verify_after_download, .. } = &mut saved_command { *verify_after_download |= repair_policy.enabled; }
                                 match command {
+                                    SessionCommand::CancelStorage{id}=>{if let Some(job)=copy_jobs.get(&id){job.cancel();}}
+                                    SessionCommand::SelectStorage{id,directory,copy}=>{
+                                        let result=(||->Result<(),String>{
+                                            let handle=torrents.get(&id).ok_or("Torrent unavailable")?;
+                                            if checks.contains_key(&id) || !matches!(handle.stats().state,TorrentStatsState::Paused) {return Err("Pause the torrent and wait for the current check before selecting storage".into());}
+                                            let path=std::path::Path::new(&directory);if !path.is_absolute(){return Err("Destination must be absolute".into());}
+                                            if copy {
+                                                let source=storage_roots.get(&id).ok_or("Pinned source directory unavailable")?.clone();
+                                                let files=handle.with_metadata(|metadata|metadata.file_infos.iter().filter(|file|!file.attrs.padding).map(|file|(file.relative_filename.clone(),file.len)).collect()).map_err(|_|"Torrent metadata unavailable")?;
+                                                let job=crate::storage::relocation::CopyJob::start(source,path,files).map_err(|error|error.to_string())?;
+                                                copy_jobs.insert(id.clone(),job);
+                                            }else{
+                                                let root=crate::storage::sandbox::Directory::open(path).map_err(|error|error.to_string())?;
+                                                pending_storage.insert(id.clone(),(root,directory));
+                                            }
+                                            Ok(())
+                                        })();
+                                        if let Err(message)=result{let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message}});}
+                                    }
                                     SessionCommand::ConfigureQueue { max_active_downloads } => { session.max_active_downloads.store(max_active_downloads, std::sync::atomic::Ordering::Relaxed); }
                                     SessionCommand::SetTransferSettings { id, settings } => {
                                         if let Err(message) = settings.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
@@ -538,6 +650,7 @@ impl SessionRuntime {
                                         }
                                     }
                                     SessionCommand::AddTorrent {
+                                        resume,
                                         transfer,
                                         repair_policy,
                                         verify_after_download: _,
@@ -559,6 +672,10 @@ impl SessionRuntime {
                                         }
                                         if let Err(message) = repair_policy.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
                                         if let Err(message) = transfer.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
+                                        if let Some(hash) = id.split(';').find_map(|part|part.strip_prefix("v1: ")).and_then(|hash| crate::tracker::parse_info_hash_hex(hash).ok()) {
+                                            counters.lock().unwrap_or_else(|e| e.into_inner()).entry(hash).or_insert_with(|| TransferCounter { base: (resume.downloaded,resume.uploaded), total: (resume.downloaded,resume.uploaded), ..Default::default() });
+                                        }
+                                        seeding_clocks.entry(id.clone()).or_insert_with(|| crate::transfer_settings::SeedingClock::restored(resume.seeded_seconds));
                                         let root=match prepared.as_ref().map(|p|Ok(p.directory.clone())).unwrap_or_else(||crate::storage::sandbox::Directory::create_root(std::path::Path::new(&output_folder))) {
                                             Ok(root)=>root,
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
@@ -700,10 +817,16 @@ impl SessionRuntime {
                                         let _=event_tx.send(SessionEvent::Error{id:String::new(),message:"Invalid prepared add command".into()});
                                     }
                                     SessionCommand::Shutdown => {
+                                        copy_jobs.clear();
                                         let final_samples: Vec<_> = torrents.values().map(|h| final_transfer_sampler(h, &counters)).collect();
                                         librqbit_tracker_comms::stop_session_announces(session_peer_id.0).await;
                                         session.stop().await;
                                         for sample in final_samples { sample(); }
+                                        for (id,handle) in &torrents {
+                                            let totals=counters.lock().unwrap_or_else(|error|error.into_inner()).get(&handle.info_hash().0).map(|counter|counter.total).unwrap_or_default();
+                                            let seeded_seconds=seeding_clocks.get_mut(id).map(|clock|clock.sample(std::time::Instant::now(),false).as_secs()).unwrap_or_default();
+                                            let _=event_tx.send(SessionEvent::NetworkTotals{id:id.clone(),downloaded:totals.0,uploaded:totals.1,seeded_seconds});
+                                        }
                                         reporting_policies.clear();
                                         let _ = event_tx.send(SessionEvent::Stopped);
                                         break;
@@ -740,14 +863,20 @@ impl SessionRuntime {
                 });
             })
             .map_err(|error| error.to_string())?;
-        Ok(Self {
+        let runtime = Self {
             journal,
             commands,
             events,
             thread: Some(thread),
             #[cfg(test)]
             test_engine,
-        })
+        };
+        initialized
+            .recv_timeout(Duration::from_secs(6))
+            .map_err(|_| {
+                "Transfer engine initialization worker stopped or timed out".to_owned()
+            })??;
+        Ok(runtime)
     }
 
     #[cfg(test)]
@@ -1218,6 +1347,7 @@ mod tests {
         .unwrap();
         runtime
             .try_send(SessionCommand::AddTorrent {
+                resume: Default::default(),
                 repair_policy: Default::default(),
                 verify_after_download: false,
                 id: format!("v1: {info_hash}"),
@@ -1513,6 +1643,7 @@ mod tests {
         let id = format!("v1: {hash}");
         runtime
             .try_send(SessionCommand::AddTorrent {
+                resume: Default::default(),
                 repair_policy: Default::default(),
                 verify_after_download: false,
                 id: id.clone(),
@@ -1728,6 +1859,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    resume: Default::default(),
                     repair_policy: Default::default(),
                     verify_after_download: false,
                     id: format!("v1: {hash}"),
@@ -1870,6 +2002,7 @@ mod tests {
             .unwrap();
             runtime
                 .try_send(SessionCommand::AddTorrent {
+                    resume: Default::default(),
                     repair_policy: Default::default(),
                     verify_after_download: false,
                     id: format!("v1: {hash}"),

@@ -47,6 +47,7 @@ impl CheckedFixture {
         .unwrap();
         runtime
             .try_send(SessionCommand::AddTorrent {
+                resume: Default::default(),
                 repair_policy: Default::default(),
                 verify_after_download: false,
                 download_mode: DownloadMode::Normal,

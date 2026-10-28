@@ -94,6 +94,10 @@ def smoke(root, platform, version, flavor="desktop"):
                             capture_output=True, text=True, check=True, timeout=15, env=environment)
     if result.stdout.strip() != f"peerlume-tui {version}":
         raise ValueError("Packaged TUI reported an unexpected version")
+    result = subprocess.run([str(folder / ("peerlume-daemon" + suffix)), "--version"],
+                            capture_output=True, text=True, check=True, timeout=15, env=environment)
+    if result.stdout.strip() != f"peerlume-daemon {version}":
+        raise ValueError("Packaged daemon reported an unexpected version")
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-11-25", "capabilities": {},
         "clientInfo": {"name": "package-smoke", "version": "1"}}}

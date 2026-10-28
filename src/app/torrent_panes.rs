@@ -4,8 +4,9 @@ use eframe::egui;
 const MIN_TABLE_HEIGHT: f32 = 96.0;
 const MIN_DETAILS_HEIGHT: f32 = 180.0;
 
-pub(super) fn table<R>(
+pub(super) fn table_with_percent<R>(
     ui: &mut egui::Ui,
+    percent: u16,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let available = ui.available_height().max(0.0);
@@ -17,7 +18,15 @@ pub(super) fn table<R>(
             ..Default::default()
         }))
         .resizable(true)
-        .default_height(available * 0.45)
+        .default_height(
+            available
+                * (if percent == 0 {
+                    45
+                } else {
+                    percent.clamp(10, 80)
+                }) as f32
+                / 100.0,
+        )
         .height_range(minimum..=maximum)
         .show_inside(ui, add_contents)
 }

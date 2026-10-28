@@ -350,6 +350,14 @@ pub struct AutomationSettings {
 #[serde(default)]
 pub struct UiSettings {
     pub last_preferences_tab: usize,
+    pub torrent_pane_percent: u16,
+    pub name_gap_pixels: u32,
+    pub search: String,
+    pub sort: crate::torrent_view::Sort,
+    pub descending: bool,
+    pub category_filter: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub categories: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -395,6 +403,15 @@ pub struct ValidationIssue {
 impl ClientSettings {
     pub fn from_toml(contents: &str) -> Result<Self, toml::de::Error> {
         let value: toml::Value = toml::from_str(contents)?;
+        if value
+            .get("version")
+            .and_then(toml::Value::as_integer)
+            .is_some_and(|version| version > i64::from(CONFIG_VERSION))
+        {
+            return Err(<toml::de::Error as serde::de::Error>::custom(
+                "Configuration was created by a newer PeerLume version",
+            ));
+        }
         if value.get("download").is_some() || value.get("version").is_some() {
             let mut settings: Self = toml::from_str(contents)?;
             settings.version = CONFIG_VERSION;
@@ -409,10 +426,28 @@ impl ClientSettings {
         Self::load_from(&settings_path()).unwrap_or_default()
     }
 
+    pub fn load_checked() -> io::Result<Self> {
+        match Self::load_from(&settings_path()) {
+            Ok(settings) => Ok(settings),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn load_from(path: &Path) -> io::Result<Self> {
         let contents = fs::read_to_string(path)?;
-        Self::from_toml(&contents)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        Self::from_toml(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid or unsupported settings format{}; original file retained",
+                    error
+                        .span()
+                        .map(|span| format!(" near byte {}", span.start))
+                        .unwrap_or_default()
+                ),
+            )
+        })
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -420,19 +455,51 @@ impl ClientSettings {
     }
 
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
         let mut current = self.clone();
         current.version = CONFIG_VERSION;
         let contents = toml::to_string_pretty(&current)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        let temporary = path.with_extension("tmp");
-        fs::write(&temporary, contents)?;
-        if path.exists() {
-            fs::remove_file(path)?;
+        let previous = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(previous) = previous {
+            let version = std::str::from_utf8(&previous)
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+                .and_then(|value| value.get("version").and_then(toml::Value::as_integer));
+            if version.is_some_and(|version| version > i64::from(CONFIG_VERSION)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Refusing to overwrite a newer configuration",
+                ));
+            }
+            if version != Some(i64::from(CONFIG_VERSION)) {
+                let mut backup = tempfile::Builder::new()
+                    .prefix("settings.before-migration-")
+                    .suffix(".toml")
+                    .tempfile_in(parent)?;
+                backup.write_all(&previous)?;
+                backup.as_file().sync_all()?;
+                backup.keep().map_err(|error| error.error)?;
+            }
         }
-        fs::rename(temporary, path)
+        // Same-directory, unique, owner-only temporary file. Never unlink the
+        // previous configuration: persist atomically replaces it on both OSes.
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(contents.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Vec<ValidationIssue> {
@@ -476,12 +543,25 @@ impl ClientSettings {
         if self.connection.max_connections_global == 0 {
             push("connection.max_connections_global", "must be at least 1");
         }
+        if self.speed.download_limit_kib > u64::from(u32::MAX / 1024) {
+            push(
+                "speed.download_limit_kib",
+                "must be 0..4194303 KiB/s (runtime byte-rate limit)",
+            );
+        }
+        if self.speed.upload_limit_kib > u64::from(u32::MAX / 1024) {
+            push(
+                "speed.upload_limit_kib",
+                "must be 0..4194303 KiB/s (runtime byte-rate limit)",
+            );
+        }
         if self.connection.max_connections_per_torrent == 0
+            || self.connection.max_connections_per_torrent > 4096
             || self.connection.max_connections_per_torrent > self.connection.max_connections_global
         {
             push(
                 "connection.max_connections_per_torrent",
-                "must be between 1 and the global limit",
+                "must be 1..4096 and not exceed the global limit",
             );
         }
         if !self.connection.tcp_enabled && !self.connection.utp_enabled {
@@ -524,9 +604,22 @@ impl ClientSettings {
             );
         }
         if self.seeding.ratio_limit_enabled
-            && (!self.seeding.ratio_limit.is_finite() || self.seeding.ratio_limit <= 0.0)
+            && (!self.seeding.ratio_limit.is_finite()
+                || !(0.001..=1000.0).contains(&self.seeding.ratio_limit))
         {
-            push("seeding.ratio_limit", "must be greater than zero");
+            push(
+                "seeding.ratio_limit",
+                "must be 0.001..1000 when enabled (runtime precision is 0.001)",
+            );
+        }
+        if self.seeding.time_limit_enabled
+            && (self.seeding.time_limit_minutes == 0
+                || self.seeding.time_limit_minutes > u64::from(u32::MAX))
+        {
+            push(
+                "seeding.time_limit_minutes",
+                "must be 1..4294967295 minutes when enabled",
+            );
         }
         if self.seeding.upload_slots_per_torrent == 0 {
             push("seeding.upload_slots_per_torrent", "must be at least 1");
@@ -693,6 +786,79 @@ fn settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inherited_transfer_defaults_cannot_silently_exceed_runtime_caps() {
+        let mut settings = ClientSettings::default();
+        settings.speed.download_limit_kib = u64::from(u32::MAX / 1024);
+        settings.speed.upload_limit_kib = settings.speed.download_limit_kib;
+        settings.connection.max_connections_global = 5000;
+        settings.connection.max_connections_per_torrent = 4096;
+        assert!(settings.validate().is_empty());
+        settings.speed.download_limit_kib += 1;
+        settings.speed.upload_limit_kib += 1;
+        settings.connection.max_connections_per_torrent += 1;
+        let fields: Vec<_> = settings
+            .validate()
+            .into_iter()
+            .map(|issue| issue.field)
+            .collect();
+        for field in [
+            "speed.download_limit_kib",
+            "speed.upload_limit_kib",
+            "connection.max_connections_per_torrent",
+        ] {
+            assert!(fields.contains(&field), "{field}");
+        }
+    }
+
+    #[test]
+    fn atomic_replacement_preserves_prior_file_on_failure_and_never_uses_a_shared_tmp_name() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.toml");
+        let settings = ClientSettings::default();
+        settings.save_to(&path).unwrap();
+        fs::write(root.path().join("settings.tmp"), b"not ours").unwrap();
+        let mut updated = settings.clone();
+        updated.queue.max_active_downloads = 9;
+        updated.save_to(&path).unwrap();
+        assert_eq!(ClientSettings::load_from(&path).unwrap(), updated);
+        assert_eq!(
+            fs::read(root.path().join("settings.tmp")).unwrap(),
+            b"not ours"
+        );
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("sentinel"), b"untouched").unwrap();
+        assert!(updated.save_to(&directory).is_err());
+        assert_eq!(fs::read(directory.join("sentinel")).unwrap(), b"untouched");
+    }
+    #[test]
+    fn migration_preserves_original_configuration_and_future_versions_are_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.toml");
+        let legacy = b"download_directory = \"legacy\"\n";
+        fs::write(&path, legacy).unwrap();
+        ClientSettings::load_from(&path)
+            .unwrap()
+            .save_to(&path)
+            .unwrap();
+        let backups: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.before-migration-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path()).unwrap(), legacy);
+        fs::write(&path, "version = 9999\n").unwrap();
+        assert!(ClientSettings::load_from(&path).is_err());
+        assert!(ClientSettings::default().save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version = 9999\n");
+    }
 
     #[test]
     fn desktop_open_arguments_are_bounded_absolute_and_preview_only() {

@@ -3,7 +3,7 @@
 Build without a desktop stack:
 
 ```sh
-cargo build --release --locked --no-default-features --features tui --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp
+cargo build --release --locked --no-default-features --features tui --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp --bin peerlume-daemon
 ./target/release/peerlume-tui --profile /absolute/path/to/profile
 ```
 
@@ -13,6 +13,9 @@ lock rejects a second owner. CLI/MCP adapters attach to the existing owner only
 after explicit authorization; F8 access controls and credential protections are unchanged.
 
 ## Navigation and commands
+
+Search also matches saved categories and labels. Additional view/storage commands
+are described in [runtime controls](runtime-controls.md).
 
 - Tab, Shift+Tab or F6 switches focus between torrents and details. Up/down acts
   on the focused pane; left/right switches detail tabs. Narrow terminals stack
@@ -45,6 +48,33 @@ its application scope. The shared GUI model has fields not implemented by the
 engine; those are explicitly labeled **stored only**, not promised to work after
 a restart. Queue admission and inherited transfer defaults take effect at next
 startup/new torrent registration. Existing per-torrent overrides win.
+
+## Running without a terminal
+
+`peerlume-daemon` owns the same controller and engine without ratatui, egui or a
+display server. Configure an **absolute** `download.download_directory` and
+absolute per-torrent overrides first: relative paths depend on a service's working
+directory. `--check-config` validates without creating a profile, engine or IPC
+endpoint. `--help` and `--version` are also offline. Start with:
+
+```sh
+peerlume-daemon --profile /absolute/profile --enable-control
+```
+
+Do not keep GUI/TUI running against that profile; the one-owner lock applies.
+Control is opt-in and only accepts existing tokens granted in the trusted GUI/TUI.
+Grant/copy a token there first, then close that frontend before starting the daemon.
+The daemon does not grant permissions, print tokens, auto-approve destructive
+operations or start a second engine for adapters. Without `--enable-control`, no
+agent access is enabled. Ctrl+C and Unix SIGTERM trigger final counter checkpoint
+and clean session shutdown. Linux private credentials still need an unlocked
+Secret Service in the service user's session; unavailable credentials fail startup.
+
+The Debian package includes `peerlume.service` under `/usr/lib/systemd/user`.
+It is never enabled automatically. After configuring and authorizing the profile,
+`systemctl --user start peerlume` is an explicit opt-in start; check the user
+journal for failures. Stop it before opening GUI/TUI. No system-wide root daemon
+or Windows service registration is provided.
 
 ## Torrent controls
 

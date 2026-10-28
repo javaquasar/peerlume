@@ -102,7 +102,7 @@ impl TransferSettings {
             },
             ratio_milli: effective
                 .ratio_limit
-                .map(|ratio| (ratio * 1000.0).clamp(0.0, 1_000_000.0) as u32)
+                .map(|ratio| (ratio * 1000.0).round().clamp(0.0, 1_000_000.0) as u32)
                 .unwrap_or(0),
             seed_minutes: effective
                 .seeding_time_limit_minutes
@@ -133,6 +133,12 @@ pub(crate) struct SeedingClock {
     previous: Option<std::time::Instant>,
 }
 impl SeedingClock {
+    pub(crate) fn restored(seconds: u64) -> Self {
+        Self {
+            elapsed: std::time::Duration::from_secs(seconds),
+            previous: None,
+        }
+    }
     pub(crate) fn sample(&mut self, now: std::time::Instant, active: bool) -> std::time::Duration {
         if let Some(previous) = self.previous.take() {
             self.elapsed += now.saturating_duration_since(previous);
@@ -147,6 +153,22 @@ impl SeedingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_point_ratios_survive_round_trip_through_the_gui_override_draft() {
+        let mut item = crate::client::tests::torrent();
+        for ratio_milli in [0, 1, 999, 1001, 2001, 123_457, 1_000_000] {
+            let settings = TransferSettings {
+                ratio_milli,
+                ..Default::default()
+            };
+            settings.apply(&mut item);
+            item.overrides.transfer_settings = None;
+            assert_eq!(
+                TransferSettings::from_item(&item, &crate::settings::ClientSettings::default()),
+                settings
+            );
+        }
+    }
     #[test]
     fn validation_prevents_overflow_and_zero_peer_deadlock() {
         let mut settings = TransferSettings::default();

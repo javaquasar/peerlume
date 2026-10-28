@@ -185,6 +185,7 @@ fn per_torrent_tokens_ignore_telemetry_and_unrelated_commands_but_not_re_registr
         .submit_via("v1: xyz", TorrentCommand::Pause, None, |_, _| Ok(()))
         .unwrap();
     control.apply(SessionEvent::NetworkTotals {
+        seeded_seconds: 0,
         id: "v1: abc".into(),
         uploaded: 1,
         downloaded: 2,

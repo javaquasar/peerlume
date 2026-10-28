@@ -1,6 +1,6 @@
 # Running a downloaded PeerLume build
 
-These archives contain native **x64** binaries, not an installer. Windows uses
+The workflow produces portable archives and separate native installers for **x64**. Windows uses
 MSVC executables; Linux uses GNU/glibc executables built on Ubuntu 24.04.
 They are unsigned development/release-profile builds, not a declaration that
 every release gate has passed. No torrent data, credentials or user profile is included.
@@ -10,7 +10,7 @@ every release gate has passed. No torrent data, credentials or user profile is i
 Use Windows 10 or newer on x64. Extract the ZIP into a writable folder and run `peerlume.exe` for the GUI,
 or `peerlume-tui.exe` from a terminal for the TUI. Keep the extracted files together.
 Windows may warn about unsigned applications. Check the commit and checksum;
-this package does not contain a code-signing certificate or an installer.
+the builds and installers are not code-signed.
 The build uses the default MSVC C-runtime linkage; if Windows reports a missing
 Visual C++ runtime DLL, install Microsoft's current x64 Visual C++ Redistributable.
 The archive does not install or bundle a redistributable automatically.
@@ -18,7 +18,7 @@ The archive does not install or bundle a redistributable automatically.
 ## Linux
 
 Use a GNU/glibc x64 desktop compatible with Ubuntu 24.04 (glibc 2.39). This is
-**not** an Alpine/musl, ARM, AppImage, Flatpak, DEB or RPM package. Compatibility
+**not** an Alpine/musl, ARM, AppImage, Flatpak or RPM package. Compatibility
 with older distributions is not guaranteed. An X11 session (or XWayland), OpenGL,
 EGL and XKB/X11 runtime libraries are needed for the GUI. Private tracker credentials
 use the desktop Secret Service (for example GNOME Keyring); DBus and a running,
@@ -76,3 +76,25 @@ sha256sum -c peerlume-*.tar.gz.sha256
 
 On Windows, compare `(Get-FileHash ./peerlume-....zip -Algorithm SHA256).Hash`
 with the first field of the matching `.zip.sha256` file.
+
+## Native installers
+
+The `peerlume-native-*` artifacts contain a Windows `*-setup.exe` or a Linux
+`.deb`, plus its SHA-256 sidecar. Both are built from the verified archive.
+Desktop archives contain GUI, TUI, CLI, MCP and daemon; headless archives omit GUI.
+
+Windows Setup uses Inno Setup 6 in per-user mode (no administrator prompt).
+Desktop and headless flavors use separate installation directories. A desktop
+shortcut is optional. Setup does not launch the app, force-close an existing
+client, install a service or enable autostart. Close the old client before an
+upgrade. Uninstall removes program files, never the profile or downloaded data.
+
+The amd64 Debian package targets Ubuntu 24.04 or compatible newer GNU/glibc
+systems. Install with `sudo apt install ./peerlume-....deb` so dependencies are
+resolved. Desktop and headless packages conflict intentionally because their
+shared executables occupy the same `/usr/bin` paths. The package installs a
+**user** systemd unit, but has no installation scripts and does not enable or
+start it automatically. Test with `peerlume-daemon --check-config` before use.
+No Windows signing, native installation/uninstallation round-trip, Linux service
+login/keyring environment or other distribution compatibility is implied by a
+successful archive/installer compilation.

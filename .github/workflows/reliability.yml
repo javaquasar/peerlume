@@ -236,6 +236,8 @@ jobs:
         run: |
           if [ ! -x .tools/fuzz/bin/cargo-fuzz ]; then cargo +nightly-2026-10-01 install cargo-fuzz --locked --version 0.13.2 --root .tools/fuzz; fi
           echo "$GITHUB_WORKSPACE/.tools/fuzz/bin" >> "$GITHUB_PATH"
+      - name: Verify local engine patches before fuzzing
+        run: python3 scripts/check_fuzz_patches.py
       - name: Exercise parsers with bounded input and memory
         env:
           REQUESTED_SECONDS: ${{ inputs.fuzz_seconds }}

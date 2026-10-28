@@ -120,8 +120,14 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn load() -> Self {
-        let settings = ClientSettings::load();
-        let backend = ClientBackend::start(&settings);
+        let loaded = ClientSettings::load_checked();
+        let settings = loaded.as_ref().cloned().unwrap_or_default();
+        let backend = match loaded {
+            Ok(_) => ClientBackend::start(&settings),
+            Err(error) => {
+                ClientBackend::blocked(format!("Cannot read settings; engine not started: {error}"))
+            }
+        };
         let (records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = records
             .iter()
@@ -141,7 +147,7 @@ impl TuiApp {
         }
         let mut app = Self::from_parts(settings, backend, torrents, tracker_audits);
         if let Some(status) = restore_status {
-            app.status = status.into();
+            app.status = status;
         }
         app
     }
@@ -155,8 +161,12 @@ impl TuiApp {
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
         Self {
             focus: Focus::Torrents,
-            split_percent: 43,
-            search: String::new(),
+            split_percent: if settings.ui.torrent_pane_percent == 0 {
+                43
+            } else {
+                settings.ui.torrent_pane_percent.clamp(20, 80)
+            },
+            search: settings.ui.search.clone(),
             marked: Default::default(),
             help: false,
             confirmation: None,
@@ -629,28 +639,19 @@ impl TuiApp {
     }
 
     fn selected(&self) -> Option<&TorrentItem> {
+        let visible = self.visible_indices().contains(&self.selected_torrent);
         self.control
             .torrents
             .get(self.selected_torrent)
-            .filter(|torrent| {
-                self.status_filter.matches(torrent)
-                    && (self.search.is_empty()
-                        || torrent
-                            .name
-                            .to_lowercase()
-                            .contains(&self.search.to_lowercase()))
-            })
+            .filter(|_| visible)
     }
 
     fn selected_mut(&mut self) -> Option<&mut TorrentItem> {
-        let search = self.search.to_lowercase();
+        let visible = self.visible_indices().contains(&self.selected_torrent);
         self.control
             .torrents
             .get_mut(self.selected_torrent)
-            .filter(|torrent| {
-                self.status_filter.matches(torrent)
-                    && (search.is_empty() || torrent.name.to_lowercase().contains(&search))
-            })
+            .filter(|_| visible)
     }
 
     fn submit_selected(&mut self, command: TorrentCommand) -> Result<String, String> {
@@ -1481,18 +1482,12 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
+        let visible = self.visible_indices().contains(&self.selected_torrent);
         let Some(torrent) = self
             .control
             .torrents
             .get(self.selected_torrent)
-            .filter(|torrent| {
-                self.status_filter.matches(torrent)
-                    && (self.search.is_empty()
-                        || torrent
-                            .name
-                            .to_lowercase()
-                            .contains(&self.search.to_lowercase()))
-            })
+            .filter(|_| visible)
         else {
             frame.render_widget(
                 Paragraph::new(if self.control.torrents.is_empty() {
@@ -1669,10 +1664,24 @@ impl TuiApp {
                 );
             }
             TorrentDetailsTab::Peers => frame.render_widget(
-                Paragraph::new(format!(
-                    "Connected peers: {}\nKnown seeds: {}",
-                    torrent.peers, torrent.seeds
-                ))
+                Paragraph::new(
+                    std::iter::once(Line::from(format!(
+                        "Connected: {} · showing at most 128 live peers",
+                        torrent.peers
+                    )))
+                    .chain(torrent.runtime.diagnostics.peers.iter().map(|peer| {
+                        Line::from(format!(
+                            "{} {} {} down={} up={} errors={}",
+                            peer.address,
+                            peer.state,
+                            peer.client,
+                            peer.downloaded,
+                            peer.uploaded,
+                            peer.errors
+                        ))
+                    }))
+                    .collect::<Vec<_>>(),
+                )
                 .block(Block::default().title(" Peers ").borders(Borders::ALL))
                 .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0)),
                 areas[1],
@@ -1878,6 +1887,9 @@ impl Drop for TuiApp {
     fn drop(&mut self) {
         if let Some(cancel) = &self.audit_cancel {
             cancel.store(true, Ordering::Relaxed);
+        }
+        if let Err(error) = self.control.shutdown() {
+            eprintln!("PeerLume shutdown: {error}");
         }
     }
 }

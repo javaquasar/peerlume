@@ -36,6 +36,34 @@ impl Directory {
         std::fs::create_dir_all(path)?;
         Self::open(path)
     }
+    pub(crate) fn new_child(&self, name: &str) -> io::Result<Self> {
+        let parts = Self::components(Path::new(name))?;
+        if parts.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected one new directory name",
+            ));
+        }
+        self.0.create_dir(name)?;
+        self.descendant(name)
+    }
+    pub(crate) fn read_payload(&self, relative: &Path) -> io::Result<File> {
+        let parts = Self::components(relative)?;
+        let (name, parents) = parts
+            .split_last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Empty payload path"))?;
+        let dir = self.walk(parents, false)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = dir.open_with(name, &options)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Not a regular payload file",
+            ));
+        }
+        Ok(file.into_std())
+    }
     fn components(relative: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
         let text = relative
             .to_str()
@@ -71,7 +99,7 @@ impl Directory {
         let parts = Self::components(Path::new(relative))?;
         self.walk(&parts, false).map(|dir| Self(Arc::new(dir)))
     }
-    fn open_payload(&self, relative: &Path, overwrite: bool) -> io::Result<File> {
+    pub(crate) fn open_payload(&self, relative: &Path, overwrite: bool) -> io::Result<File> {
         let parts = Self::components(relative)?;
         let (name, parents) = parts
             .split_last()

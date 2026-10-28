@@ -13,7 +13,7 @@ import tomllib
 import zipfile
 
 
-BINARIES = ("peerlume", "peerlume-tui", "peerlume-control", "peerlume-mcp")
+BINARIES = ("peerlume", "peerlume-tui", "peerlume-control", "peerlume-mcp", "peerlume-daemon")
 FLAVORS = {"desktop": BINARIES, "tui": BINARIES[1:]}
 
 

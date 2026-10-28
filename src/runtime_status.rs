@@ -138,6 +138,9 @@ pub enum RepairStatus {
 }
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
+    pub storage: crate::storage::relocation::StorageStatus,
+    pub diagnostics: crate::diagnostics::Diagnostics,
+    pub seeded_seconds: u64,
     pub mode: ModeApplication,
     pub mode_draft: Option<ModeConfig>,
     pub repair: RepairStatus,
@@ -182,6 +185,18 @@ impl RepairBudget {
 
 pub fn status_card(torrent: &TorrentItem, last: Option<&JournalEntry>) -> Vec<(String, String)> {
     let mut rows = vec![
+        (
+            "Observed activity".into(),
+            crate::diagnostics::activity(torrent).into(),
+        ),
+        (
+            "Storage operation".into(),
+            format!("{:?}", torrent.runtime.storage),
+        ),
+        (
+            "Seeding time (persisted)".into(),
+            format!("{} s", torrent.runtime.seeded_seconds),
+        ),
         ("Saved mode".into(), torrent.mode_config().label()),
         ("Policy status".into(), torrent.runtime.mode.label().into()),
         (

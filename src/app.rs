@@ -442,6 +442,13 @@ impl HostedGui {
 }
 
 impl eframe::App for HostedGui {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Ok(mut app) = self.owner.lock()
+            && let Err(error) = app.control.shutdown()
+        {
+            eprintln!("PeerLume shutdown: {error}");
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let owner = Arc::clone(&self.owner);
         let mut app = owner.lock().unwrap_or_else(|e| e.into_inner());
@@ -455,7 +462,8 @@ impl eframe::App for HostedGui {
 
 impl Default for PeerLumeApp {
     fn default() -> Self {
-        let settings = ClientSettings::load();
+        let loaded = ClientSettings::load_checked();
+        let settings = loaded.as_ref().cloned().unwrap_or_default();
         let saved_settings = settings.clone();
         let settings_draft = settings.clone();
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
@@ -473,7 +481,12 @@ impl Default for PeerLumeApp {
         let auto_update =
             settings.privacy.blocklist_enabled && settings.privacy.blocklist_auto_update;
         let update_url = settings.privacy.blocklist_url.clone();
-        let backend = ClientBackend::start(&settings);
+        let backend = match loaded {
+            Ok(_) => ClientBackend::start(&settings),
+            Err(error) => {
+                ClientBackend::blocked(format!("Cannot read settings; engine not started: {error}"))
+            }
+        };
         let (restored_records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = restored_records
             .iter()
@@ -508,7 +521,7 @@ impl Default for PeerLumeApp {
             preferences_tab,
             selected_torrent: 0,
             status_filter: Default::default(),
-            name_column: Default::default(),
+            name_column: name_column::NameColumn::from_gap(settings.ui.name_gap_pixels),
             settings,
             saved_settings,
             settings_draft,
@@ -523,7 +536,7 @@ impl Default for PeerLumeApp {
             add_dialog: None,
             last_download_directory: None,
             pending_torrent_paths: VecDeque::new(),
-            add_status: restore_status.unwrap_or_default().into(),
+            add_status: restore_status.unwrap_or_default(),
             file_navigation: file_location::Navigator::default(),
             magnet_input: String::new(),
             control: Controller::new(backend, torrents),
@@ -813,9 +826,16 @@ impl PeerLumeApp {
     }
 
     fn show_torrents(&mut self, ctx: &egui::Context) {
-        let visible_selection = self
-            .status_filter
-            .selected_index(&self.control.torrents, self.selected_torrent);
+        let visible = crate::torrent_view::indices(
+            &self.control.torrents,
+            self.status_filter,
+            &self.settings.ui,
+        );
+        let visible_selection = visible
+            .iter()
+            .copied()
+            .find(|index| *index == self.selected_torrent)
+            .or_else(|| visible.first().copied());
         if let Some(index) = visible_selection {
             self.selected_torrent = index;
         }
@@ -867,6 +887,39 @@ impl PeerLumeApp {
                 }
             });
             ui.add_space(6.0);
+            ui.scope(|ui| {
+            ui.set_max_width(content_rect.width());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.settings.ui.search).hint_text("Search name, category or labels").desired_width(220.0));
+                egui::ComboBox::from_id_salt("torrent_sort").selected_text(self.settings.ui.sort.label()).show_ui(ui, |ui| {
+                    for sort in crate::torrent_view::Sort::ALL { ui.selectable_value(&mut self.settings.ui.sort,sort,sort.label()); }
+                });
+                ui.checkbox(&mut self.settings.ui.descending,"Descending");
+                let paused=visible_selection.is_some_and(|index|self.control.torrents[index].state==TorrentState::Paused);
+                for (label,copy) in [("Use existing data...",false),("Copy data to...",true)] {
+                    if ui.add_enabled(paused,egui::Button::new(label)).on_hover_text("Pause first. Checks the selected directory, then resumes missing pieces. Copy creates a new subdirectory and NEVER deletes originals.").clicked()
+                        && let Some(directory)=rfd::FileDialog::new().set_title(if copy {"Choose copy destination parent; originals will be retained"} else {"Choose existing payload root; hash-check and resume"}).pick_folder()
+                        && let Some(index)=visible_selection {
+                        let id=self.control.torrents[index].info_hashes.join(";");
+                        self.add_status=self.control.select_storage(&id,directory.to_string_lossy().into_owned(),copy).map(|()|COMMAND_ACCEPTED.to_owned()).unwrap_or_else(|error|error);
+                    }
+                }
+                if let Some(index)=visible_selection
+                    && matches!(self.control.torrents[index].runtime.storage,crate::storage::relocation::StorageStatus::Copying{..})
+                    && ui.button("Cancel copy").clicked() {
+                    let id=self.control.torrents[index].info_hashes.join(";");
+                    self.add_status=self.control.cancel_storage(&id).map(|()|"Copy cancellation queued; originals retained".into()).unwrap_or_else(|error|error);
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.settings.ui.category_filter).hint_text("Category (empty = all)").desired_width(130.0));
+                if ui.button("Save view").on_hover_text("Save search, categories, labels, split and Name width without saving preference drafts").clicked() {
+                    let path = crate::settings::data_directory().join("settings.toml");
+                    let current = match ClientSettings::load_from(&path) {
+                        Ok(settings)=>Ok(settings), Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(ClientSettings::default()), Err(error)=>Err(error),
+                    };
+                    self.add_status = match current.and_then(|mut settings| {settings.ui=self.settings.ui.clone();settings.save_to(&path)}) { Ok(())=>"View saved".into(),Err(error)=>format!("Could not save view: {error}") };
+                }
+            });
+            });
             // A long toolbar may expand the parent's virtual rectangle. Create
             // both panes within the original visible content bounds instead.
             let panes_rect = egui::Rect::from_min_max(
@@ -883,7 +936,7 @@ impl PeerLumeApp {
                 let mut recheck_action = None;
                 let other_columns_width =
                     name_column::reserved_width(ui, &self.control.torrents, self.status_filter);
-                torrent_panes::table(ui, |ui| {
+                let pane = torrent_panes::table_with_percent(ui, self.settings.ui.torrent_pane_percent, |ui| {
                     ui.scope(|ui| {
                         ui.style_mut().spacing.scroll.floating = false;
                         name_column::scroll_area(name_column::viewport_width(ui))
@@ -902,19 +955,15 @@ impl PeerLumeApp {
                                     .min_col_width(72.0)
                                     .show(ui, |ui| {
                                         name_column::headers(ui, name_layout.width);
-                                        for (index, torrent) in
-                                            self.control.torrents.iter().enumerate()
-                                        {
-                                            if !self.status_filter.matches(torrent) {
-                                                continue;
-                                            }
-                                            let response = Self::show_torrent_name(
+                                        for index in crate::torrent_view::indices(&self.control.torrents,self.status_filter,&self.settings.ui) {
+                                            let torrent = &self.control.torrents[index];
+                                            let response = ui.push_id(&torrent.info_hashes, |ui| Self::show_torrent_name(
                                                 ui,
                                                 &torrent.name,
                                                 torrent.is_private,
                                                 self.selected_torrent == index,
                                                 name_layout.width,
-                                            );
+                                            )).inner;
                                             response.context_menu(|ui| {
                                                 if let Some(action) =
                                                     Self::show_recheck_menu(ui, torrent)
@@ -1015,6 +1064,8 @@ impl PeerLumeApp {
                             });
                     });
                 });
+                self.settings.ui.torrent_pane_percent = (pane.response.rect.height()/panes_rect.height().max(1.0)*100.0).round().clamp(10.0,80.0) as u16;
+                self.settings.ui.name_gap_pixels = self.name_column.saved_gap();
                 if let Some(path) = directory_to_open {
                     match open_directory(&path) {
                         Ok(opened) => {
@@ -1494,9 +1545,16 @@ impl PeerLumeApp {
             ui.label("No torrents");
             return;
         }
-        let Some(index) = self
-            .status_filter
-            .selected_index(&self.control.torrents, self.selected_torrent)
+        let visible = crate::torrent_view::indices(
+            &self.control.torrents,
+            self.status_filter,
+            &self.settings.ui,
+        );
+        let Some(index) = visible
+            .iter()
+            .copied()
+            .find(|index| *index == self.selected_torrent)
+            .or_else(|| visible.first().copied())
         else {
             ui.label("No torrents match this status. Choose All to show every torrent.");
             return;
@@ -1529,7 +1587,28 @@ impl PeerLumeApp {
                     self.add_status = self.file_navigation.reveal(torrent, &self.settings, index);
                 }
             }
-            DetailsTab::Info => Self::show_torrent_info(ui, torrent, &self.settings),
+            DetailsTab::Info => {
+                ui.horizontal(|ui| {
+                    ui.label("Category");
+                    ui.text_edit_singleline(
+                        self.settings
+                            .ui
+                            .categories
+                            .entry(torrent_id.clone())
+                            .or_default(),
+                    );
+                    ui.label("Labels");
+                    ui.text_edit_singleline(
+                        self.settings
+                            .ui
+                            .labels
+                            .entry(torrent_id.clone())
+                            .or_default(),
+                    );
+                });
+                ui.small("Presentation only. Use Save view to persist categories and labels; payload paths do not change.");
+                Self::show_torrent_info(ui, torrent, &self.settings);
+            }
             DetailsTab::Settings => {
                 let mut draft = torrent
                     .runtime
@@ -1585,13 +1664,51 @@ impl PeerLumeApp {
                 if repair_changed {
                     commands.push(TorrentCommand::SetRepairPolicy(repair));
                 }
-                let before = torrent.overrides.verify_after_download;
+                // The editor is a draft, never the acknowledged live model.
+                let confirmed = torrent.overrides.clone();
+                let draft_id =
+                    ui.make_persistent_id(("transfer_draft", torrent.info_hashes.join(";")));
+                torrent.overrides = ui
+                    .ctx()
+                    .data_mut(|data| data.get_temp(draft_id))
+                    .unwrap_or_else(|| confirmed.clone());
+                torrent.overrides.transfer_settings = None;
+                torrent.overrides.download_directory = confirmed.download_directory.clone();
+                torrent.overrides.repair_policy = confirmed.repair_policy;
+                if confirmed.repair_policy.enabled {
+                    torrent.overrides.verify_after_download = true;
+                }
                 Self::show_torrent_settings(ui, torrent, &self.settings);
-                if before != torrent.overrides.verify_after_download {
-                    commands.push(TorrentCommand::SetVerifyAfterDownload(
-                        torrent.overrides.verify_after_download,
-                    ));
-                    torrent.overrides.verify_after_download = before;
+                let transfer =
+                    crate::transfer_settings::TransferSettings::from_item(torrent, &self.settings);
+                let verify = torrent.overrides.verify_after_download;
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(draft_id, torrent.overrides.clone()));
+                torrent.overrides = confirmed;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            transfer.validate().is_ok(),
+                            egui::Button::new("Apply transfer settings"),
+                        )
+                        .clicked()
+                    {
+                        if verify != torrent.overrides.verify_after_download {
+                            commands.push(TorrentCommand::SetVerifyAfterDownload(verify));
+                        }
+                        commands.push(TorrentCommand::SetTransferSettings(transfer));
+                    }
+                    if ui.button("Discard draft").clicked() {
+                        ui.ctx()
+                            .data_mut(|data| data.remove::<TorrentOverrides>(draft_id));
+                    }
+                });
+                if let Some(saved) = torrent.overrides.transfer_settings {
+                    ui.small(format!("Saved limits: down {} KiB/s, up {} KiB/s, peers {}. Values above are an editable draft.",saved.download_kib,saved.upload_kib,saved.max_peers));
+                }
+                ui.small("Queued changes are saved only after engine confirmation. Peer-limit changes recheck this torrent in the same engine.");
+                if let Err(error) = transfer.validate() {
+                    ui.colored_label(egui::Color32::RED, error);
                 }
             }
             DetailsTab::Peers => {
@@ -1599,6 +1716,28 @@ impl PeerLumeApp {
                     "Connected peers: {}; known seeds: {}",
                     torrent.peers, torrent.seeds
                 ));
+                ui.small("Latest live peer snapshot, capped at 128 rows; engine per-endpoint counters can reset when peers are replaced.");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("live_peer_details")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for title in
+                                ["Endpoint", "State", "Client", "Received", "Sent", "Errors"]
+                            {
+                                ui.strong(title);
+                            }
+                            ui.end_row();
+                            for peer in &torrent.runtime.diagnostics.peers {
+                                ui.monospace(&peer.address);
+                                ui.label(&peer.state);
+                                ui.label(&peer.client);
+                                ui.label(format_size(peer.downloaded));
+                                ui.label(format_size(peer.uploaded));
+                                ui.label(peer.errors.to_string());
+                                ui.end_row();
+                            }
+                        });
+                });
             }
             DetailsTab::Trackers => {
                 let id = torrent.info_hashes.join(";");
@@ -1874,7 +2013,33 @@ impl PeerLumeApp {
                 format_size(torrent.files.selected_downloaded())
             ));
         });
-        let rows = torrent.files.rows();
+        let view_id = ui.make_persistent_id(("file_view", torrent.info_hashes.join(";")));
+        let (mut query, mut sort): (String, u8) = ui
+            .ctx()
+            .data_mut(|data| data.get_temp(view_id))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search files / folders")
+                    .desired_width(220.0),
+            );
+            egui::ComboBox::from_id_salt("file_sort")
+                .selected_text(match sort {
+                    1 => "Name",
+                    2 => "Largest first",
+                    _ => "Tree",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut sort, 0, "Tree");
+                    ui.selectable_value(&mut sort, 1, "Name");
+                    ui.selectable_value(&mut sort, 2, "Largest first");
+                });
+        });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(view_id, (query.clone(), sort)));
+        let viewed = torrent.files.view_rows(&query, sort);
+        let rows = viewed.as_slice();
         // A single root group's count belongs to the fixed header, not the
         // virtualized rows. With multiple roots, keep their folder headings in
         // the list and show a fixed total above them instead.
@@ -2079,12 +2244,15 @@ impl PeerLumeApp {
         ui.label(
             "Overrides apply only to this torrent. Unchecked values inherit global preferences.",
         );
-        option_string(
-            ui,
-            "Download directory",
-            &mut overrides.download_directory,
-            &global.download.download_directory,
-        );
+        ui.small("Rate 0 means unlimited; ratio/time 0 disables that stop condition. Peer limit: 1..4096. Priority controls queue admission, not bandwidth.");
+        ui.label(format!(
+            "Data directory: {}",
+            overrides
+                .download_directory
+                .as_deref()
+                .unwrap_or(&global.download.download_directory)
+        ));
+        ui.small("Changing this text cannot move files; use the explicit storage operation.");
         ui.horizontal(|ui| {
             ui.label("Sequential download");
             egui::ComboBox::from_id_salt("torrent_sequential")
@@ -2114,12 +2282,14 @@ impl PeerLumeApp {
             "Download limit KiB/s",
             &mut overrides.download_limit_kib,
             global.speed.download_limit_kib,
+            u64::from(u32::MAX / 1024),
         );
         option_u64(
             ui,
             "Upload limit KiB/s",
             &mut overrides.upload_limit_kib,
             global.speed.upload_limit_kib,
+            u64::from(u32::MAX / 1024),
         );
         option_usize(
             ui,
@@ -2138,11 +2308,12 @@ impl PeerLumeApp {
             "Seeding time minutes",
             &mut overrides.seeding_time_limit_minutes,
             global.seeding.time_limit_minutes,
+            u64::from(u32::MAX),
         );
         ui.separator();
         let effective = EffectiveTorrentSettings::resolve(global, overrides, torrent.is_private);
         ui.label(format!(
-            "Effective: directory {}, down {} KiB/s, up {} KiB/s, peers {}, strategy {:?}, tracker {}",
+            "Draft preview: directory {}, down {} KiB/s, up {} KiB/s, peers {}, strategy {:?}, tracker {}",
             effective.download_directory,
             effective.download_limit_kib,
             effective.upload_limit_kib,
@@ -3371,25 +3542,13 @@ fn torrent_record(
     torrent_to_record(torrent, tracker_audit.map(TorrentTrackerAudit::to_stored))
 }
 
-fn option_string(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, default: &str) {
-    let mut enabled = value.is_some();
-    let mut edited = value.clone().unwrap_or_else(|| default.to_owned());
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut enabled, label);
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.text_edit_singleline(&mut edited);
-        });
-    });
-    *value = enabled.then_some(edited);
-}
-
-fn option_u64(ui: &mut egui::Ui, label: &str, value: &mut Option<u64>, default: u64) {
+fn option_u64(ui: &mut egui::Ui, label: &str, value: &mut Option<u64>, default: u64, maximum: u64) {
     let mut enabled = value.is_some();
     let mut edited = value.unwrap_or(default);
     ui.horizontal(|ui| {
         ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(egui::DragValue::new(&mut edited).range(0..=10_000_000));
+            ui.add(egui::DragValue::new(&mut edited).range(0..=maximum));
         });
     });
     *value = enabled.then_some(edited);
@@ -3401,7 +3560,7 @@ fn option_usize(ui: &mut egui::Ui, label: &str, value: &mut Option<usize>, defau
     ui.horizontal(|ui| {
         ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(egui::DragValue::new(&mut edited).range(1..=100_000));
+            ui.add(egui::DragValue::new(&mut edited).range(1..=4096));
         });
     });
     *value = enabled.then_some(edited);
@@ -3415,7 +3574,8 @@ fn option_f64(ui: &mut egui::Ui, label: &str, value: &mut Option<f64>, default: 
         ui.add_enabled_ui(enabled, |ui| {
             ui.add(
                 egui::DragValue::new(&mut edited)
-                    .range(0.01..=1000.0)
+                    .range(0.0..=1000.0)
+                    .max_decimals(3)
                     .speed(0.1),
             );
         });
@@ -3463,6 +3623,48 @@ fn show_runtime_status(
     last: Option<&crate::announce_journal::JournalEntry>,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
+        let samples = &torrent.runtime.diagnostics.history;
+        if samples.len() > 1 {
+            ui.label(
+                "Measured rates: blue download, green upload; up to 120 live samples (~1 s), gaps not plotted to scale",
+            );
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(1.0), 65.0),
+                egui::Sense::hover(),
+            );
+            let peak = samples
+                .iter()
+                .map(|sample| sample.down.max(sample.up))
+                .max()
+                .unwrap_or(1)
+                .max(1) as f32;
+            for upload in [false, true] {
+                let points = samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sample)| {
+                        egui::pos2(
+                            rect.left() + rect.width() * i as f32 / (samples.len() - 1) as f32,
+                            rect.bottom()
+                                - rect.height()
+                                    * (if upload { sample.up } else { sample.down }) as f32
+                                    / peak,
+                        )
+                    })
+                    .collect();
+                ui.painter().add(egui::Shape::line(
+                    points,
+                    egui::Stroke::new(
+                        1.5,
+                        if upload {
+                            egui::Color32::DARK_GREEN
+                        } else {
+                            egui::Color32::BLUE
+                        },
+                    ),
+                ));
+            }
+        }
         egui::Grid::new("shared_runtime_status")
             .striped(true)
             .show(ui, |ui| {

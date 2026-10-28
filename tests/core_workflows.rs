@@ -62,6 +62,7 @@ fn sqlite_file_round_trip_restores_resume_state_and_protects_tracker_secrets() {
     let mut store =
         StateStore::open_with_secrets(&database, secrets.clone()).expect("open SQLite state");
     let record = TorrentRecord {
+        resume: Default::default(),
         transfer_settings: None,
         repair_policy: Default::default(),
         verify_after_download: false,

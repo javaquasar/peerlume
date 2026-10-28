@@ -253,6 +253,7 @@ fn transfer_totals_are_actual_and_separate_from_payload_progress() {
     emit(
         &mut control,
         SessionEvent::NetworkTotals {
+            seeded_seconds: 0,
             id: "v1: abc".into(),
             uploaded: 150,
             downloaded: 200,
@@ -380,6 +381,7 @@ fn slow_readers_have_independent_cursors_and_resynchronize_to_latest() {
         emit(
             &mut control,
             SessionEvent::NetworkTotals {
+                seeded_seconds: 0,
                 id: "v1: abc".into(),
                 uploaded: 0,
                 downloaded,
@@ -420,6 +422,7 @@ fn concurrent_observers_do_not_block_publication_or_each_other() {
         emit(
             &mut control,
             SessionEvent::NetworkTotals {
+                seeded_seconds: 0,
                 id: "v1: abc".into(),
                 uploaded: 0,
                 downloaded,

@@ -12,6 +12,16 @@ on:
       - 'scripts/package_build.py'
       - 'scripts/test_package_build.py'
       - 'scripts/verify_build.py'
+      - 'scripts/package_native.py'
+      - 'scripts/test_package_native.py'
+      - 'scripts/test-build-arguments.ps1'
+      - 'scripts/check_fuzz_patches.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'vendor/**'
+      - 'assets/**'
       - 'docs/distribution.md'
 
 permissions:
@@ -83,7 +93,11 @@ jobs:
             target
           key: ${{ runner.os }}-packages-${{ matrix.target }}-${{ matrix.flavor }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/builds.yml') }}
       - name: Test the archive contract and safety checks
-        run: python -m unittest discover -s scripts -p test_package_build.py -v
+        run: |
+          ./scripts/test-build-arguments.ps1
+          python scripts/check_fuzz_patches.py
+          python -m unittest discover -s scripts -p test_package_build.py -v
+          python -m unittest discover -s scripts -p test_package_native.py -v
       - name: Reject GUI dependencies in the headless package
         if: matrix.flavor == 'tui'
         run: python scripts/check_headless_dependencies.py
@@ -92,7 +106,7 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
-          $features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features') }
+          [string[]]$features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features') }
           cargo +stable test --locked @features --target $env:BUILD_TARGET --lib -p peerlume -p librqbit-tracker-comms
           if ($LASTEXITCODE -ne 0) { throw 'Library tests failed' }
           cargo +stable test --locked @features --target $env:BUILD_TARGET --test core_workflows
@@ -102,8 +116,8 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
-          $features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features', '--bin', 'peerlume') }
-          cargo +stable build --release --locked @features --target $env:BUILD_TARGET --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp
+          [string[]]$features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features', '--bin', 'peerlume') }
+          cargo +stable build --release --locked @features --target $env:BUILD_TARGET --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp --bin peerlume-daemon
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
       - name: Verify the embedded Windows application icon
         if: runner.os == 'Windows' && matrix.flavor == 'desktop'
@@ -127,11 +141,29 @@ jobs:
           python scripts/verify_build.py --flavor $env:BUILD_FLAVOR --platform $env:BUILD_PLATFORM --commit $env:BUILD_SHA
           if ($LASTEXITCODE -ne 0) { throw 'Packaged build verification failed' }
       - name: Upload the verified package and checksum
+        # Native packages are built from the same verified allowlisted archive.
         id: artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: peerlume-${{ matrix.flavor }}-${{ matrix.platform }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: dist/builds/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Build native installer without installing or starting the client
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          python scripts/package_native.py --platform $env:BUILD_PLATFORM --flavor $env:BUILD_FLAVOR --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Native package build failed' }
+      - name: Upload native installer and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: peerlume-native-${{ matrix.flavor }}-${{ matrix.platform }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: |
+            dist/builds/*-setup.exe*
+            dist/builds/*.deb*
           if-no-files-found: error
           compression-level: 0
           retention-days: 30

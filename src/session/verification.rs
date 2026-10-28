@@ -16,15 +16,7 @@ pub(super) async fn restart_for_check(
     let root = root
         .ok_or_else(|| "Pinned payload directory is unavailable".to_owned())?
         .clone();
-    let SessionCommand::AddTorrent {
-        transfer,
-        output_folder,
-        only_files,
-        peer_limit,
-        trackers,
-        ..
-    } = saved
-    else {
+    let SessionCommand::AddTorrent { .. } = saved else {
         return Err("Missing saved torrent settings".into());
     };
     // Reuse resolved metadata, including for magnets and removed source .torrent files.
@@ -37,6 +29,26 @@ pub(super) async fn restart_for_check(
     let deleted = session.delete(handle.id().into(), false).await;
     final_sample();
     deleted.map_err(|_| "Could not stop the torrent for verification".to_owned())?;
+    add_for_check(session, bytes.to_vec(), saved, root).await
+}
+
+pub(super) async fn add_for_check(
+    session: &Arc<Session>,
+    bytes: Vec<u8>,
+    saved: &SessionCommand,
+    root: crate::storage::sandbox::Directory,
+) -> Result<Arc<ManagedTorrent>, String> {
+    let SessionCommand::AddTorrent {
+        transfer,
+        output_folder,
+        only_files,
+        peer_limit,
+        trackers,
+        ..
+    } = saved
+    else {
+        return Err("Missing saved torrent settings".into());
+    };
     let checked = session
         .add_torrent(
             AddTorrent::from_bytes(bytes),

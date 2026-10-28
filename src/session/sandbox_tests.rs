@@ -26,8 +26,32 @@ fn runtime(root: &Path) -> SessionRuntime {
     )
     .unwrap()
 }
+
+#[test]
+fn startup_acknowledges_a_real_engine_and_returns_initialization_failures_synchronously() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path());
+    assert!(runtime.test_engine().is_some());
+    runtime.shutdown().unwrap();
+    let error = SessionRuntime::start_with_options(
+        8,
+        root.path().into(),
+        SessionOptions {
+            dht: None,
+            listen: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            bind_device_name: Some("invalid\0device".into()),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("invalid device must reject initialization before returning an engine");
+    assert!(error.contains("bind device"), "{error}");
+}
 fn add(id: &str, source: &Path, output: &Path) -> SessionCommand {
     SessionCommand::AddTorrent {
+        resume: Default::default(),
         repair_policy: Default::default(),
         verify_after_download: false,
         download_mode: DownloadMode::Normal,
@@ -88,6 +112,141 @@ fn prepared_add_uses_the_validated_bytes_without_reopening_a_missing_source() {
         )
     });
     assert!(!source.exists());
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn copy_selects_verified_payload_in_the_same_engine_without_deleting_originals_or_source_metadata()
+{
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("payload.bin"), b"verified").unwrap();
+    let (bytes, id) = metadata();
+    let runtime = runtime(source.path());
+    runtime
+        .try_send(SessionCommand::PreparedAdd {
+            command: Box::new(add(
+                &id,
+                &source.path().join("absent.torrent"),
+                source.path(),
+            )),
+            prepared: PreparedTorrent {
+                bytes: bytes.into(),
+                directory: crate::storage::sandbox::Directory::open(source.path()).unwrap(),
+            },
+        })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::Stats {
+                paused: true,
+                finished: true,
+                ..
+            }
+        )
+    });
+    let engine = runtime.test_engine().unwrap();
+    runtime
+        .try_send(SessionCommand::SelectStorage {
+            id: id.clone(),
+            directory: destination.path().display().to_string(),
+            copy: true,
+        })
+        .unwrap();
+    let mut selected = None;
+    wait(&runtime, |event| {
+        if let SessionEvent::Storage {
+            status: crate::storage::relocation::StorageStatus::Checking { destination },
+            ..
+        } = event
+        {
+            selected = Some(destination.clone());
+            true
+        } else {
+            if let SessionEvent::Storage {
+                status: crate::storage::relocation::StorageStatus::Failed { message },
+                ..
+            } = event
+            {
+                panic!("storage failed: {message}");
+            }
+            false
+        }
+    });
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::Stats {
+                finished: true,
+                paused: false,
+                ..
+            }
+        )
+    });
+    assert!(Arc::ptr_eq(&engine, &runtime.test_engine().unwrap()));
+    assert_eq!(
+        std::fs::read(source.path().join("payload.bin")).unwrap(),
+        b"verified"
+    );
+    assert_eq!(
+        std::fs::read(std::path::Path::new(&selected.unwrap()).join("payload.bin")).unwrap(),
+        b"verified"
+    );
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn resumed_network_totals_and_seeding_budget_are_not_reset_to_disk_progress() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("payload.bin"), b"verified").unwrap();
+    let (bytes, id) = metadata();
+    let runtime = runtime(root.path());
+    let mut command = add(&id, &root.path().join("absent.torrent"), root.path());
+    if let SessionCommand::AddTorrent {
+        resume,
+        paused,
+        transfer,
+        ..
+    } = &mut command
+    {
+        *resume = crate::resume::ResumeCounters {
+            downloaded: 37,
+            uploaded: 23,
+            seeded_seconds: 60,
+        };
+        *paused = false;
+        transfer.seed_minutes = 1;
+    }
+    runtime
+        .try_send(SessionCommand::PreparedAdd {
+            command: Box::new(command),
+            prepared: PreparedTorrent {
+                bytes: bytes.into(),
+                directory: crate::storage::sandbox::Directory::open(root.path()).unwrap(),
+            },
+        })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::NetworkTotals {
+                downloaded: 37,
+                uploaded: 23,
+                seeded_seconds: 60,
+                ..
+            }
+        )
+    });
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::StateChanged {
+                state: "paused",
+                ..
+            }
+        )
+    });
     runtime.shutdown().unwrap();
 }
 #[cfg(unix)]

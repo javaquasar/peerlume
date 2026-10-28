@@ -32,6 +32,7 @@ pub struct StoredTrackerAuditProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TorrentRecord {
+    pub resume: crate::resume::ResumeCounters,
     pub transfer_settings: Option<crate::transfer_settings::TransferSettings>,
     pub repair_policy: crate::runtime_status::RepairPolicy,
     pub verify_after_download: bool,
@@ -67,6 +68,37 @@ impl StateStore {
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
         let connection = Connection::open(path)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if (1..11).contains(&version) {
+            // Online Backup includes committed WAL pages; copying the .sqlite3
+            // file alone can silently omit them. A unique backup is never replaced.
+            let parent = path.parent().unwrap_or(Path::new("."));
+            let reserved = tempfile::Builder::new()
+                .prefix(&format!("state.before-v{version}-"))
+                .suffix(".sqlite3")
+                .tempfile_in(parent)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let mut destination = Connection::open(reserved.path())?;
+            {
+                let backup = rusqlite::backup::Backup::new(&connection, &mut destination)?;
+                backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
+            }
+            // The snapshot must be a self-contained file, not another WAL-mode
+            // database which needs auxiliary files when opened read-only.
+            destination.pragma_update(None, "journal_mode", "DELETE")?;
+            drop(destination);
+            reserved
+                .as_file()
+                .sync_all()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            reserved
+                .keep()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         let mut store = Self::from_connection(connection)?;
         store.secrets = std::sync::Arc::new(crate::secrets::PlatformSecrets);
@@ -238,7 +270,7 @@ impl StateStore {
                  PRAGMA user_version = 4;",
             )?;
             transaction.commit()?;
-        } else if !matches!(version, 4..=10) {
+        } else if !matches!(version, 4..=11) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         if version < 5 {
@@ -267,6 +299,9 @@ impl StateStore {
         }
         if version < 10 {
             self.connection.execute_batch("CREATE TABLE IF NOT EXISTS torrent_transfer_settings (torrent_id TEXT PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE, settings TEXT NOT NULL); PRAGMA user_version = 10;")?;
+        }
+        if version < 11 {
+            self.connection.execute_batch("CREATE TABLE IF NOT EXISTS torrent_resume (torrent_id TEXT PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE, snapshot TEXT NOT NULL); PRAGMA user_version = 11;")?;
         }
         Ok(())
     }
@@ -391,7 +426,24 @@ impl StateStore {
         if let Some(audit) = &torrent.tracker_audit {
             insert_tracker_audit(&transaction, &torrent.id, audit)?;
         }
+        transaction.execute("INSERT INTO torrent_resume(torrent_id,snapshot) VALUES(?1,?2) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot", params![torrent.id, serde_json::to_string(&torrent.resume).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
         transaction.commit()
+    }
+
+    /// Small periodic transaction: never rewrites tracker secrets or the file tree.
+    pub fn checkpoint_resumes(
+        &mut self,
+        rows: impl IntoIterator<Item = (String, crate::resume::ResumeCounters, u64)>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.connection.transaction()?;
+        for (id, resume, uploaded) in rows {
+            tx.execute("INSERT INTO torrent_resume(torrent_id,snapshot) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM torrents WHERE id=?1) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot", params![id, serde_json::to_string(&resume).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
+            tx.execute(
+                "UPDATE torrents SET uploaded_bytes=?2 WHERE id=?1",
+                params![id, to_sql_u64(uploaded)?],
+            )?;
+        }
+        tx.commit()
     }
 
     pub fn save_tracker_audit(
@@ -462,6 +514,7 @@ impl StateStore {
                 [id],
                 |row| {
                     Ok(TorrentRecord {
+                        resume: Default::default(),
                         transfer_settings: None,
                         upload_ratio: crate::download_mode::UploadRatioRange { min_milli: row.get(15)?, max_milli: row.get(16)? },
                         verify_after_download: row.get(12)?,
@@ -491,6 +544,21 @@ impl StateStore {
         let Some(torrent) = torrent.as_mut() else {
             return Ok(None);
         };
+        let resume: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT snapshot FROM torrent_resume WHERE torrent_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        torrent.resume = resume
+            .map(|text| serde_json::from_str(&text).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?
+            .unwrap_or(crate::resume::ResumeCounters {
+                uploaded: torrent.uploaded_bytes,
+                ..Default::default()
+            });
         let json: Option<String> = self
             .connection
             .query_row(
@@ -796,6 +864,91 @@ fn from_sql_u64(value: i64) -> rusqlite::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_backup_includes_live_wal_and_is_unique_and_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let mut original = StateStore::open(&path).unwrap();
+        let record = record();
+        original.save_torrent(&record).unwrap();
+        original
+            .connection
+            .pragma_update(None, "user_version", 10)
+            .unwrap();
+        let migrated = StateStore::open(&path).unwrap();
+        assert_eq!(migrated.load_torrent(&record.id).unwrap().unwrap(), record);
+        let backups: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.before-v10-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open_with_flags(
+            backups[0].path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            backup
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            backup
+                .query_row(
+                    "SELECT name FROM torrents WHERE id=?1",
+                    [&record.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            record.name
+        );
+        drop(migrated);
+        StateStore::open(&path).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.before-v10-"))
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn lightweight_resume_checkpoint_preserves_files_trackers_and_survives_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let mut store = StateStore::open(&path).unwrap();
+        let record = record();
+        store.save_torrent(&record).unwrap();
+        let resume = crate::resume::ResumeCounters {
+            downloaded: 987,
+            uploaded: 654,
+            seeded_seconds: 321,
+        };
+        store
+            .checkpoint_resumes([(record.id.clone(), resume, 654)])
+            .unwrap();
+        drop(store);
+        let restored = StateStore::open(&path)
+            .unwrap()
+            .load_torrent(&record.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.resume, resume);
+        assert_eq!(restored.uploaded_bytes, 654);
+        assert_eq!(restored.files, record.files);
+        assert_eq!(restored.trackers, record.trackers);
+    }
 
     #[test]
     fn multiplier_range_survives_reopen_and_v8_migration_preserves_the_torrent() {
@@ -831,6 +984,7 @@ mod tests {
 
     fn record() -> TorrentRecord {
         TorrentRecord {
+            resume: Default::default(),
             transfer_settings: None,
             repair_policy: Default::default(),
             verify_after_download: false,
@@ -1222,7 +1376,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(column_count, 1);
     }
 
@@ -1252,7 +1406,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(store.child_row_count("tracker_audit_profiles").unwrap(), 0);
         assert_eq!(store.child_row_count("tracker_audit_steps").unwrap(), 0);
     }
@@ -1285,7 +1439,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(new_column_count, 2);
     }
 }

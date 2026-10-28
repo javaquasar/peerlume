@@ -447,6 +447,7 @@ fn download_torrents_with_verification(
     for torrent in &torrents {
         runtime
             .try_send(SessionCommand::AddTorrent {
+                resume: Default::default(),
                 repair_policy: Default::default(),
                 verify_after_download,
                 download_mode: torrent.mode,

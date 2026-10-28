@@ -4,6 +4,60 @@ These controls belong to each torrent. Both egui and ratatui use the same comman
 event reducer, persisted configuration and status-card model. They do not change
 the standalone tracker-audit scenario editor.
 
+## Confirmed transfer settings and durable state
+
+GUI **Torrent settings** now edits a draft. **Apply transfer settings** uses the
+same validated command and engine acknowledgement as TUI F7; editing alone does
+not change the canonical model. Global Preferences show the shared per-field
+engine-support declaration. Stored-only settings do not become implemented merely
+because they can be serialized or because the app restarts.
+
+Settings replace atomically through unique same-directory temporary files. Legacy
+configuration gets a unique backup before replacement. SQLite migrations make an
+Online Backup snapshot (including committed WAL) before upgrading an existing
+schema. Network received/sent totals and measured seeding seconds checkpoint in
+one small transaction every five seconds, without rewriting tracker credentials
+or file trees. Graceful shutdown drains final engine counters before saving.
+A crash can lose activity since the last checkpoint. Invalid settings, state or
+credential restoration block engine startup with a visible error, not an empty
+successful session. Resume still hashes on-disk data: no unverified fast-resume
+shortcut is claimed.
+
+## Copying or adopting existing payload
+
+Pause the torrent and wait for its current check to finish. GUI **Use existing
+data...** selects a payload root; **Copy data to...** selects a destination parent.
+TUI provides `:use-data ABSOLUTE_DIRECTORY`, `:copy-data ABSOLUTE_PARENT`, and
+`:cancel-copy`. These trusted local actions are deliberately absent from IPC/MCP.
+
+Copy creates a unique `PeerLume-copy-*` subdirectory, preserves relative file
+layout, refuses overwrite and links, uses pinned capability-relative source paths,
+and verifies copied bytes by SHA-256 read-back. It then selects the destination
+inside the same engine, hashes torrent pieces and resumes normal missing-piece
+downloads. A failed destination registration attempts to restore the original
+handle paused in the same engine. Original payload is **never deleted**, even on
+success. Cancel interrupts copying between bounded chunks; the partial destination
+is retained and identified for inspection. Hash checking and repair have their
+usual progress and pause controls. Source and destination may be on different
+volumes; neither a same-volume rename optimization nor automatic source cleanup
+is implemented.
+
+## Views and measured diagnostics
+
+GUI search matches names, categories and labels; sort supports name, progress,
+rates and size without reordering authoritative IDs. Category/labels are edited
+in Info. **Save view** persists the view, pane proportion and Name-column gap
+without saving unrelated preference drafts. TUI equivalents are `:sort NAME`,
+`:descending true|false`, `:category TEXT`, `:label TEXT`, `:categorize TEXT` and
+`:save-view`. File search and Tree/Name/Largest-first views are cached independently
+of progress updates. Select all/none still applies to all files, including hidden
+matches; file priorities have not been added by these view controls.
+
+Status reports observed activity, not guessed network diagnoses. GUI graphs keep
+at most 120 sampled rate points; missing time is not reconstructed. Peers displays
+up to 128 live endpoint/client/state/counter/error snapshots in both frontends.
+These local peer addresses are not added to the redacted public observation API.
+
 ## Showing a file in its folder
 
 In egui, right-click a file in **Files** and choose **Show in folder**, or

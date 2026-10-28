@@ -8,6 +8,8 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum Kind {
+    Storage,
+    Peers,
     Stats,
     Network,
     Checking,
@@ -43,6 +45,11 @@ impl Sender {
     /// Telemetry replaces old snapshots; controls apply bounded backpressure.
     pub fn send(&self, event: SessionEvent) -> Result<(), String> {
         let key = match &event {
+            SessionEvent::Storage {
+                id,
+                status: crate::storage::relocation::StorageStatus::Copying { .. },
+            } => Some((id.clone(), Kind::Storage)),
+            SessionEvent::Peers { id, .. } => Some((id.clone(), Kind::Peers)),
             SessionEvent::Stats { id, .. } => Some((id.clone(), Kind::Stats)),
             SessionEvent::NetworkTotals { id, .. } => Some((id.clone(), Kind::Network)),
             SessionEvent::Verification {
@@ -81,7 +88,11 @@ impl Sender {
             }
         }
         if event == SessionEvent::Stopped {
-            pending.telemetry.clear();
+            // Final real counters are a shutdown checkpoint barrier. Other stale
+            // telemetry is disposable, but these must precede Stopped.
+            pending
+                .telemetry
+                .retain(|(_, kind), _| matches!(kind, Kind::Network));
         }
         pending.sequence += 1;
         let stamped = Stamped {
@@ -180,6 +191,29 @@ impl Drop for Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_network_totals_are_delivered_before_shutdown_acknowledgement() {
+        let (sender, receiver) = channel(8);
+        sender
+            .send(SessionEvent::NetworkTotals {
+                id: "a".into(),
+                uploaded: 31,
+                downloaded: 47,
+                seeded_seconds: 59,
+            })
+            .unwrap();
+        sender.send(SessionEvent::Stopped).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            SessionEvent::NetworkTotals {
+                uploaded: 31,
+                downloaded: 47,
+                seeded_seconds: 59,
+                ..
+            }
+        ));
+        assert_eq!(receiver.try_recv().unwrap(), SessionEvent::Stopped);
+    }
     fn stats(id: &str, value: u64, files: usize) -> SessionEvent {
         SessionEvent::Stats {
             id: id.into(),
@@ -201,6 +235,7 @@ mod tests {
             sender.send(stats("b", tick, 100_000)).unwrap();
             sender
                 .send(SessionEvent::NetworkTotals {
+                    seeded_seconds: 0,
                     id: "a".into(),
                     uploaded: 0,
                     downloaded: tick,

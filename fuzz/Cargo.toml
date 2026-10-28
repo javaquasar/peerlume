@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 peerlume = { path = "..", default-features = false }
 
 [patch.crates-io]
+librqbit = { path = "../vendor/librqbit" }
 librqbit-tracker-comms = { path = "../vendor/librqbit-tracker-comms" }
 
 [[bin]]

@@ -108,6 +108,86 @@ fn text_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
         .unwrap_or_else(|| panic!("Missing visible text: {label}"))
 }
 
+#[test]
+fn view_controls_wrap_inside_the_actual_window_even_with_an_overflowing_status_message() {
+    for width in [360.0, 600.0, 1080.0] {
+        let ctx = egui::Context::default();
+        let mut app = fixture(2, 3);
+        app.add_status = "Long status ".repeat(80);
+        let output = settle(&ctx, &mut app, egui::vec2(width, 1000.0));
+        let save = text_rect(&output, "Save view");
+        assert!(
+            save.left() >= 0.0 && save.right() <= width,
+            "view control outside window: {save:?} / {width}"
+        );
+        assert!(save.bottom() < pane(&ctx).top());
+    }
+}
+
+#[test]
+fn transfer_editor_is_a_retained_draft_even_when_the_engine_rejects_submission() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(1, 1);
+    app.details_tab = DetailsTab::Settings;
+    crate::transfer_settings::TransferSettings {
+        download_kib: 11,
+        ..Default::default()
+    }
+    .apply(&mut app.control.torrents[0]);
+    let confirmed = app.control.torrents[0].overrides.clone();
+    let mut draft = confirmed.clone();
+    draft.download_limit_kib = Some(17);
+    let mut draft_id = None;
+    let render = |app: &mut PeerLumeApp,
+                  events: Vec<egui::Event>,
+                  initial: Option<TorrentOverrides>,
+                  draft_id: &mut Option<egui::Id>| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 1400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.make_persistent_id((
+                        "transfer_draft",
+                        app.control.torrents[0].info_hashes.join(";"),
+                    ));
+                    *draft_id = Some(id);
+                    if let Some(initial) = initial.clone() {
+                        ctx.data_mut(|data| data.insert_temp(id, initial));
+                    }
+                    app.show_selected_torrent(ui);
+                });
+            },
+        )
+    };
+    let output = render(&mut app, vec![], Some(draft), &mut draft_id);
+    assert_eq!(app.control.torrents[0].overrides, confirmed);
+    let position = text_rect(&output, "Apply transfer settings").center();
+    render(&mut app, pointer(position, true), None, &mut draft_id);
+    render(&mut app, pointer(position, false), None, &mut draft_id);
+    assert!(app.add_status.contains("unavailable"), "{}", app.add_status);
+    assert_eq!(app.control.torrents[0].overrides, confirmed);
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<TorrentOverrides>(draft_id.unwrap()))
+            .unwrap()
+            .download_limit_kib,
+        Some(17)
+    );
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<TorrentOverrides>(draft_id.unwrap()))
+            .unwrap()
+            .ratio_limit,
+        Some(0.0),
+        "Opening the editor must not silently enable a seed ratio limit"
+    );
+}
+
 fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
     vec![
         egui::Event::PointerMoved(pos),
@@ -118,6 +198,35 @@ fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
             modifiers: egui::Modifiers::NONE,
         },
     ]
+}
+
+#[test]
+fn a_live_sort_change_during_mouse_press_cannot_select_a_different_torrent() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(3, 1);
+    app.selected_torrent = 2;
+    app.settings.ui.sort = crate::torrent_view::Sort::Download;
+    app.settings.ui.descending = true;
+    for (torrent, rate) in app.control.torrents.iter_mut().zip([100, 90, 1]) {
+        torrent.download_rate = rate;
+    }
+    let size = egui::vec2(1080.0, 1000.0);
+    let output = settle(&ctx, &mut app, size);
+    let first = &app.control.torrents[0];
+    let label = if first.is_private {
+        format!("[Private] {}", first.name)
+    } else {
+        first.name.clone()
+    };
+    let position = text_rect(&output, &label).center();
+    frame(&ctx, &mut app, size, pointer(position, true));
+    app.control.torrents[0].download_rate = 80;
+    app.control.torrents[1].download_rate = 110;
+    frame(&ctx, &mut app, size, pointer(position, false));
+    assert_eq!(
+        app.selected_torrent, 2,
+        "A moving row must cancel the old click, never retarget it to another torrent"
+    );
 }
 
 fn drag(

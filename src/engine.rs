@@ -11,9 +11,9 @@ pub enum ApplyMode {
 impl ApplyMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Live => "applied live",
+            Self::Live => "stored defaults; existing transfers unchanged",
             Self::NewTorrentsOnly => "used by new torrents",
-            Self::ReconnectPeers => "peer reconnect required",
+            Self::ReconnectPeers => "restart required where supported",
             Self::RestartApplication => "application restart required",
         }
     }

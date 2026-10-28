@@ -29,6 +29,34 @@ pub fn show_tab(
     privacy_runtime: &mut PrivacyRuntime<'_>,
 ) -> PreferencesActions {
     let mut actions = PreferencesActions::default();
+    ui.label("Global preferences are defaults, not acknowledgements from active torrents. Use Torrent settings for live changes.");
+    ui.collapsing(
+        "Engine support and application scope (shared with TUI)",
+        |ui| {
+            let section = match tab {
+                PreferencesTab::Downloads => "download",
+                PreferencesTab::Queue => "queue",
+                PreferencesTab::Speed => "speed",
+                PreferencesTab::Connection => "connection",
+                PreferencesTab::BitTorrent => "bittorrent",
+                PreferencesTab::Seeding => "seeding",
+                PreferencesTab::Privacy => "privacy",
+                PreferencesTab::Storage => "storage",
+                PreferencesTab::Automation => "automation",
+            };
+            if let Some(fields) = serde_json::to_value(&*settings)
+                .ok()
+                .and_then(|value| value[section].as_object().cloned())
+            {
+                for field in fields.keys() {
+                    ui.label(format!(
+                        "{field}: {}",
+                        crate::settings_support::application(tab, field)
+                    ));
+                }
+            }
+        },
+    );
     egui::ScrollArea::vertical()
         .id_salt("preferences_tab_scroll")
         .show(ui, |ui| match tab {

@@ -17,6 +17,7 @@ use crate::{
 pub struct ClientBackend {
     state_store: Option<StateStore>,
     session_runtime: Option<SessionRuntime>,
+    startup_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,33 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::Storage { id, status } => {
+            let mut notice = SessionNotice::None;
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                if let crate::storage::relocation::StorageStatus::Checking { destination } = &status
+                {
+                    torrent.overrides.download_directory = Some(destination.clone());
+                    torrent.state = TorrentState::Checking;
+                    torrent.completion = crate::completion::CompletionStatus::Pending;
+                    notice = SessionNotice::SettingsApplied { id: id.clone() };
+                } else if let crate::storage::relocation::StorageStatus::Failed { message } =
+                    &status
+                {
+                    notice = SessionNotice::Error {
+                        id: id.clone(),
+                        message: message.clone(),
+                    };
+                }
+                torrent.runtime.storage = status;
+            }
+            notice
+        }
+        SessionEvent::Peers { id, peers } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.diagnostics.peers = peers;
+            }
+            SessionNotice::None
+        }
         SessionEvent::TransferSettingsApplied { id, settings } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 settings.apply(torrent);
@@ -96,10 +124,13 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             id,
             uploaded,
             downloaded,
+            seeded_seconds,
         } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 torrent.runtime.network_uploaded = uploaded;
+                torrent.uploaded_bytes = uploaded;
                 torrent.runtime.network_downloaded = downloaded;
+                torrent.runtime.seeded_seconds = seeded_seconds;
             }
             SessionNotice::None
         }
@@ -177,6 +208,18 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                 torrent.uploaded_bytes = uploaded_bytes;
                 torrent.download_rate = download_rate;
                 torrent.upload_rate = upload_rate;
+                if let crate::storage::relocation::StorageStatus::Checking { destination } =
+                    &torrent.runtime.storage
+                {
+                    torrent.runtime.storage = crate::storage::relocation::StorageStatus::Active {
+                        destination: destination.clone(),
+                    };
+                }
+                torrent.runtime.diagnostics.sample(
+                    std::time::Instant::now(),
+                    download_rate,
+                    upload_rate,
+                );
                 torrent.peers = peers;
                 if finished && torrent.selected_size() > 0 {
                     torrent.completion = crate::completion::CompletionStatus::Verified;
@@ -238,6 +281,11 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         .collect();
     let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
     SessionCommand::AddTorrent {
+        resume: crate::resume::ResumeCounters {
+            downloaded: torrent.runtime.network_downloaded,
+            uploaded: torrent.runtime.network_uploaded,
+            seeded_seconds: torrent.runtime.seeded_seconds,
+        },
         transfer: crate::transfer_settings::TransferSettings::from_item(torrent, settings),
         upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
@@ -279,6 +327,11 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
+        resume: crate::resume::ResumeCounters {
+            downloaded: torrent.runtime.network_downloaded,
+            uploaded: torrent.runtime.network_uploaded,
+            seeded_seconds: torrent.runtime.seeded_seconds,
+        },
         transfer_settings: torrent.overrides.transfer_settings,
         upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
@@ -368,7 +421,12 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
     }
     let transfer_settings = record.transfer_settings;
     let mut item = TorrentItem {
-        runtime: Default::default(),
+        runtime: crate::runtime_status::RuntimeStatus {
+            network_downloaded: record.resume.downloaded,
+            network_uploaded: record.resume.uploaded,
+            seeded_seconds: record.resume.seeded_seconds,
+            ..Default::default()
+        },
         completion: crate::completion::CompletionStatus::Pending,
         name: record.name,
         source: record.source,
@@ -425,6 +483,7 @@ impl ClientBackend {
         Self {
             state_store: Some(state_store),
             session_runtime: None,
+            startup_error: None,
         }
     }
 
@@ -433,6 +492,7 @@ impl ClientBackend {
         Self {
             state_store: None,
             session_runtime: Some(session_runtime),
+            startup_error: None,
         }
     }
 
@@ -443,27 +503,62 @@ impl ClientBackend {
         Self {
             state_store: None,
             session_runtime: None,
+            startup_error: None,
+        }
+    }
+
+    pub fn blocked(message: String) -> Self {
+        Self {
+            startup_error: Some(message),
+            ..Self::offline()
         }
     }
 
     pub fn start(settings: &ClientSettings) -> Self {
+        Self::try_start(settings).unwrap_or_else(|error| Self {
+            startup_error: Some(error),
+            ..Self::offline()
+        })
+    }
+
+    /// Fail closed before creating a network session if state cannot be restored.
+    pub fn try_start(settings: &ClientSettings) -> Result<Self, String> {
+        let issues = settings.validate();
+        if !issues.is_empty() {
+            return Err(format!(
+                "Invalid settings; engine not started: {}",
+                issues
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.field, issue.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        let state_store = StateStore::open(&data_directory().join("state.sqlite3"))
+            .map_err(|e| format!("Cannot open persistent state; engine not started: {e}"))?;
+        state_store
+            .load_all_torrents()
+            .map_err(|e| format!("Cannot restore persistent state; engine not started: {e}"))?;
         let backend = Self {
-            state_store: StateStore::open(&data_directory().join("state.sqlite3")).ok(),
-            session_runtime: SessionRuntime::start(
-                256,
-                PathBuf::from(&settings.download.download_directory),
-                settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
-            )
-            .ok(),
+            state_store: Some(state_store),
+            session_runtime: Some(
+                SessionRuntime::start(
+                    256,
+                    PathBuf::from(&settings.download.download_directory),
+                    settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
+                )
+                .map_err(|e| format!("Cannot start transfer engine: {e}"))?,
+            ),
+            startup_error: None,
         };
-        let _ = backend.send(SessionCommand::ConfigureQueue {
+        backend.send(SessionCommand::ConfigureQueue {
             max_active_downloads: if settings.queue.enabled {
                 settings.queue.max_active_downloads
             } else {
                 0
             },
-        });
-        backend
+        })?;
+        Ok(backend)
     }
 
     pub fn load_torrents(&self) -> Result<Vec<TorrentRecord>, String> {
@@ -474,13 +569,16 @@ impl ClientBackend {
     }
 
     /// Shared startup presentation: a restore failure must not look like an empty profile.
-    pub fn restore_for_frontend(&self) -> (Vec<TorrentRecord>, Option<&'static str>) {
+    pub fn restore_for_frontend(&self) -> (Vec<TorrentRecord>, Option<String>) {
+        if let Some(error) = &self.startup_error {
+            return (Vec::new(), Some(error.clone()));
+        }
         match self.load_torrents() {
             Ok(records) => (records, None),
             Err(_) => (
                 Vec::new(),
                 Some(
-                    "Could not restore downloads. Unlock the OS credential store and restart; legacy missing tracker credentials require the original URL. The saved database has not been cleared.",
+                    "Could not restore downloads. Unlock the OS credential store and restart; legacy missing tracker credentials require the original URL. The saved database has not been cleared.".into(),
                 ),
             ),
         }
@@ -495,6 +593,25 @@ impl ClientBackend {
                     .map_err(|error| error.to_string())
             },
         )
+    }
+
+    pub(crate) fn checkpoint_resumes(&mut self, torrents: &[TorrentItem]) -> Result<(), String> {
+        let Some(store) = &mut self.state_store else {
+            return Ok(());
+        };
+        store
+            .checkpoint_resumes(torrents.iter().map(|torrent| {
+                (
+                    torrent.info_hashes.join(";"),
+                    crate::resume::ResumeCounters {
+                        uploaded: torrent.runtime.network_uploaded,
+                        downloaded: torrent.runtime.network_downloaded,
+                        seeded_seconds: torrent.runtime.seeded_seconds,
+                    },
+                    torrent.uploaded_bytes,
+                )
+            }))
+            .map_err(|e| e.to_string())
     }
 
     pub fn remove_torrent(&self, id: &str) -> Result<(), String> {
@@ -530,6 +647,10 @@ impl ClientBackend {
         self.session_runtime
             .as_ref()
             .and_then(SessionRuntime::try_recv)
+    }
+
+    pub(crate) fn finish_shutdown(&mut self) {
+        drop(self.session_runtime.take());
     }
 
     pub fn session_available(&self) -> bool {
@@ -683,6 +804,7 @@ pub(crate) mod tests {
     fn unavailable_optional_services_have_frontend_friendly_semantics() {
         let mut backend = ClientBackend::offline();
         let record = TorrentRecord {
+            resume: Default::default(),
             transfer_settings: None,
             repair_policy: Default::default(),
             verify_after_download: false,

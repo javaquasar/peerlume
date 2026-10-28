@@ -55,18 +55,7 @@ pub(super) fn display(field: &str, value: &Value) -> String {
 }
 
 pub(super) fn application(tab: PreferencesTab, field: &str) -> &'static str {
-    // A field in the shared GUI schema does not imply engine support.
-    match (tab, field) {
-        (
-            PreferencesTab::Downloads,
-            "download_directory" | "start_when_added" | "select_all_files" | "sequential_download",
-        )
-        | (PreferencesTab::Queue, "enabled" | "max_active_downloads")
-        | (PreferencesTab::Speed, "download_limit_kib" | "upload_limit_kib")
-        | (PreferencesTab::Connection, "max_connections_per_torrent")
-        | (PreferencesTab::Privacy, "tracker_reporting") => "next start / new torrents",
-        _ => "stored only; engine support not guaranteed",
-    }
+    crate::settings_support::application(tab, field)
 }
 
 /// Parse against the existing serialized type, then round-trip through the shared

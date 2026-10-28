@@ -18,12 +18,20 @@ pub enum FileTreeRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileSelectionModel {
+    view_cache: std::sync::Arc<std::sync::Mutex<Option<FileViewCache>>>,
     files: Vec<TorrentFile>,
     rows: Vec<FileTreeRow>,
     selected_count: usize,
     selected_size: u64,
     selected_downloaded: u64,
     download_cursor: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FileViewCache {
+    query: String,
+    sort: u8,
+    rows: std::sync::Arc<Vec<FileTreeRow>>,
 }
 
 impl FileSelectionModel {
@@ -74,6 +82,47 @@ impl FileSelectionModel {
 
     pub fn rows(&self) -> &[FileTreeRow] {
         &self.rows
+    }
+
+    /// Rebuild only when the view changes, not on each progress tick or frame.
+    pub fn view_rows(&self, query: &str, sort: u8) -> std::sync::Arc<Vec<FileTreeRow>> {
+        let query = query.to_lowercase();
+        let mut cache = self.view_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(view) = cache
+            .as_ref()
+            .filter(|view| view.query == query && view.sort == sort)
+        {
+            return view.rows.clone();
+        }
+        let rows = if query.is_empty() && sort == 0 {
+            self.rows.clone()
+        } else {
+            let mut indices: Vec<_> = self
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(i, file)| file.path.to_lowercase().contains(&query).then_some(i))
+                .collect();
+            if sort == 2 {
+                indices.sort_by_key(|i| (std::cmp::Reverse(self.files[*i].size_bytes), *i));
+            } else {
+                indices.sort_by(|a, b| self.files[*a].path.cmp(&self.files[*b].path));
+            }
+            indices
+                .into_iter()
+                .map(|index| FileTreeRow::File {
+                    index,
+                    display_start: 0,
+                })
+                .collect()
+        };
+        let rows = std::sync::Arc::new(rows);
+        *cache = Some(FileViewCache {
+            query,
+            sort,
+            rows: rows.clone(),
+        });
+        rows
     }
 
     /// Build a command only when the UI edited a selection. Never change the
@@ -256,6 +305,33 @@ fn build_tree_rows(files: &[TorrentFile]) -> Vec<FileTreeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_search_and_sort_cache_survive_progress_without_rebuilding_or_mutating_selection() {
+        let mut files = FileSelectionModel::from_files([
+            ("folder/z.bin".into(), 1),
+            ("folder/a.bin".into(), 8),
+            ("other.bin".into(), 2),
+        ]);
+        let view = files.view_rows("folder", 2);
+        assert_eq!(
+            view.as_ref(),
+            &[
+                FileTreeRow::File {
+                    index: 1,
+                    display_start: 0
+                },
+                FileTreeRow::File {
+                    index: 0,
+                    display_start: 0
+                }
+            ]
+        );
+        files.set_file_downloaded(0, 1);
+        assert!(std::sync::Arc::ptr_eq(&view, &files.view_rows("folder", 2)));
+        assert_eq!(files.selected_count(), 3);
+        assert!(files.view_rows("missing", 0).is_empty());
+        assert_eq!(files.selected_count(), 3);
+    }
 
     #[test]
     fn selection_edits_build_commands_without_mutating_or_rebuilding_file_models() {

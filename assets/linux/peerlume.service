@@ -1,0 +1,16 @@
+[Unit]
+Description=PeerLume headless torrent owner (user session)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/peerlume-daemon --enable-control
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGTERM
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
