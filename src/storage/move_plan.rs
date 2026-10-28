@@ -14,7 +14,9 @@ pub(crate) struct Plan {
     pub files: Vec<(PathBuf, u64)>,
 }
 pub(crate) fn root_key(path: &Path) -> String {
-    let text = path.to_string_lossy();
+    // Resolve real aliases (including Windows 8.3 names) while the path exists.
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy();
     if cfg!(windows) {
         text.replace('\\', "/")
             .trim_start_matches("//?/")
@@ -36,6 +38,9 @@ pub(crate) fn prepare(
             "Move roots must be absolute, non-root directories",
         ));
     }
+    // Preserve the DB spelling too: after a crash the empty old directory may
+    // already have been removed, so canonicalization alone cannot recover it.
+    let source_spelling = source.to_path_buf();
     let source = source.canonicalize()?;
     let parent = parent.canonicalize()?;
     if parent.starts_with(&source) || !root.matches_path(&source)? || !root.only_payload(&files)? {
@@ -54,7 +59,7 @@ pub(crate) fn prepare(
     }
     let plan = Plan {
         id: id.into(),
-        source: source.clone(),
+        source: source_spelling,
         destination: destination.clone(),
         files,
     };

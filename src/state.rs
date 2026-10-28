@@ -1247,6 +1247,12 @@ mod tests {
             vec![("file.bin".into(), 100)],
         )
         .unwrap();
+        assert_eq!(
+            crate::storage::move_plan::root_key(&source),
+            crate::storage::move_plan::root_key(&source.canonicalize().unwrap())
+        );
+        drop(root);
+        std::fs::remove_dir(&source).unwrap(); // Only this now-empty synthetic root.
         store
             .recover_storage_moves(profile.path(), "unused")
             .unwrap();

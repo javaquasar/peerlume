@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -25,6 +26,10 @@ def verify(binary, parent):
             encoding='utf-8')
         sentinel=payload / 'keep.bin'
         sentinel.write_bytes(b'crash must preserve this payload')
+        checked=subprocess.run([str(binary),'--profile',str(profile),'--check-config'],
+                               capture_output=True,text=True,timeout=10)
+        if checked.returncode:
+            raise RuntimeError('Synthetic daemon configuration rejected: '+checked.stderr[-4096:])
         for attempt in range(2):
             flags=0
             startup=None
@@ -35,7 +40,16 @@ def verify(binary, parent):
                 startup=subprocess.STARTUPINFO()
                 startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startup.wShowWindow=0
-            with (profile / f'stderr-{attempt}.txt').open('w',encoding='utf-8') as errors:
+            error_path=profile / f'stderr-{attempt}.txt'
+            with error_path.open('w',encoding='utf-8') as errors:
+                def failure(reason):
+                    errors.flush()
+                    with error_path.open('rb') as diagnostics:
+                        diagnostics.seek(0,2)
+                        diagnostics.seek(max(0,diagnostics.tell()-4096))
+                        detail=diagnostics.read(4096).decode('utf-8',errors='replace')
+                    detail=re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]','',detail)
+                    return RuntimeError(f'{reason}; attempt {attempt+1}; stderr: '+detail.replace(str(profile),'<synthetic-profile>'))
                 process=subprocess.Popen([str(binary),'--profile',str(profile)],stdout=subprocess.PIPE,
                                          stderr=errors,text=True,creationflags=flags,startupinfo=startup)
                 lines=queue.Queue(maxsize=16)
@@ -52,16 +66,16 @@ def verify(binary, parent):
                     ready=False
                     while time.monotonic()<deadline and not ready:
                         if process.poll() is not None:
-                            raise RuntimeError(f'Daemon exited before ready: {process.returncode}')
+                            raise failure(f'Daemon exited before ready: {process.returncode}')
                         try:
                             ready=lines.get(timeout=0.1)=='PeerLume daemon ready'
                         except queue.Empty:
                             pass
                     if not ready:
-                        raise RuntimeError('Daemon readiness timeout')
+                        raise failure('Daemon readiness timeout')
                     time.sleep(0.2)
                     if process.poll() is not None:
-                        raise RuntimeError('Daemon exited immediately after readiness')
+                        raise failure('Daemon exited immediately after readiness')
                     database=profile / 'state.sqlite3'
                     if not database.is_file():
                         raise RuntimeError('Ready daemon has no state database')
