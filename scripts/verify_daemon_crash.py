@@ -1,5 +1,6 @@
 """Abrupt process death/restart on a fresh synthetic profile; disposable CI only."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,20 @@ import subprocess
 import tempfile
 import threading
 import time
+
+
+def verify_database(database, first_start):
+    # sqlite3.Connection.__exit__ commits/rolls back but DOES NOT close the
+    # handle. Explicitly close it before restarting or deleting the fixture.
+    with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+        if first_start:
+            connection.execute('CREATE TABLE installer_crash_probe(value TEXT PRIMARY KEY)')
+            connection.execute("INSERT INTO installer_crash_probe VALUES ('durable synthetic sentinel')")
+        else:
+            if connection.execute('PRAGMA quick_check').fetchone()!=('ok',):
+                raise RuntimeError('Database failed integrity check after abrupt death')
+            if connection.execute('SELECT value FROM installer_crash_probe').fetchall()!=[('durable synthetic sentinel',)]:
+                raise RuntimeError('Committed state lost after abrupt death')
 
 
 def verify(binary, parent):
@@ -79,15 +94,7 @@ def verify(binary, parent):
                     database=profile / 'state.sqlite3'
                     if not database.is_file():
                         raise RuntimeError('Ready daemon has no state database')
-                    with sqlite3.connect(database) as connection:
-                        if attempt==0:
-                            connection.execute('CREATE TABLE installer_crash_probe(value TEXT PRIMARY KEY)')
-                            connection.execute("INSERT INTO installer_crash_probe VALUES ('durable synthetic sentinel')")
-                        else:
-                            if connection.execute('PRAGMA quick_check').fetchone()!=('ok',):
-                                raise RuntimeError('Database failed integrity check after abrupt death')
-                            if connection.execute('SELECT value FROM installer_crash_probe').fetchall()!=[('durable synthetic sentinel',)]:
-                                raise RuntimeError('Committed state lost after abrupt death')
+                    verify_database(database, first_start=attempt==0)
                 finally:
                     # Kill ONLY the exact process created above, never by name.
                     if process.poll() is None:

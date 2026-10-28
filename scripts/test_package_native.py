@@ -8,6 +8,16 @@ from package_native import windows_script, debian_tree
 
 
 class NativeTests(unittest.TestCase):
+    def test_crash_probe_commits_checks_and_closes_its_database_handles(self):
+        from verify_daemon_crash import verify_database
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / 'synthetic.sqlite3'
+            verify_database(database, first_start=True)
+            verify_database(database, first_start=False)
+            # On Windows an unclosed SQLite handle would fail with WinError 32.
+            database.unlink()
+            self.assertFalse(database.exists())
+
     def test_native_gui_fixture_uses_only_isolated_network_settings(self):
         import runpy
         fixture = runpy.run_path(str(Path(__file__).with_name('native-ui-e2e.py')))
