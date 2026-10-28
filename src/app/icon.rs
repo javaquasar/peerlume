@@ -17,19 +17,17 @@ mod tests {
         for (x, y) in [(0, 0), (255, 0), (0, 255), (255, 255)] {
             assert_eq!(icon.rgba[(y * 256 + x) * 4 + 3], 0);
         }
-        let opaque = icon
-            .rgba
-            .chunks_exact(4)
-            .filter(|pixel| pixel[3] > 240)
-            .count();
+        let (pixels, remainder) = icon.rgba.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let opaque = pixels.iter().filter(|pixel| pixel[3] > 240).count();
         assert!(opaque > 256 * 256 / 4, "The icon must not be empty");
         assert!(
             opaque < 256 * 256 * 3 / 4,
             "Keep transparent negative space"
         );
         assert!(
-            icon.rgba
-                .chunks_exact(4)
+            pixels
+                .iter()
                 .any(|pixel| pixel[3] > 240 && pixel[2] > 200 && pixel[0] < 80)
         );
     }

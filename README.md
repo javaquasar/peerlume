@@ -264,6 +264,10 @@ regressions; test counts are not a claim of exhaustive state-space coverage.
 
 ## GitHub Actions
 
+Native x64 release-profile archives for Windows (ZIP) and Linux (TAR.GZ) are built
+by **Build packages** on GitHub Actions. See [build and download instructions](docs/builds.md)
+for manual runs, artifact downloads, checksums and platform requirements.
+
 The [Tests workflow](https://github.com/javaquasar/peerlume/actions/workflows/ci.yml)
 runs on pushes to `main` or `master`, including merge commits, and on pull requests
 targeting either branch. The current default branch is `main`.
