@@ -40,6 +40,7 @@ fn add(id: &str, source: &Path, output: &Path) -> SessionCommand {
         only_files: None,
         trackers: vec![],
         paused: true,
+        transfer: Default::default(),
         peer_limit: None,
     }
 }

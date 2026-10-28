@@ -17,6 +17,7 @@ pub(super) async fn restart_for_check(
         .ok_or_else(|| "Pinned payload directory is unavailable".to_owned())?
         .clone();
     let SessionCommand::AddTorrent {
+        transfer,
         output_folder,
         only_files,
         peer_limit,
@@ -36,7 +37,7 @@ pub(super) async fn restart_for_check(
     let deleted = session.delete(handle.id().into(), false).await;
     final_sample();
     deleted.map_err(|_| "Could not stop the torrent for verification".to_owned())?;
-    session
+    let checked = session
         .add_torrent(
             AddTorrent::from_bytes(bytes),
             Some(AddTorrentOptions {
@@ -46,6 +47,7 @@ pub(super) async fn restart_for_check(
                 overwrite: true,
                 output_folder: Some(output_folder.clone()),
                 peer_limit: *peer_limit,
+                ratelimits: transfer.engine().limits,
                 trackers: (!trackers.is_empty()).then(|| trackers.clone()),
                 ..Default::default()
             }),
@@ -53,5 +55,7 @@ pub(super) async fn restart_for_check(
         .await
         .map_err(|_| "Could not start the on-disk integrity check".to_owned())?
         .into_handle()
-        .ok_or_else(|| "Verification returned no torrent handle".to_owned())
+        .ok_or_else(|| "Verification returned no torrent handle".to_owned())?;
+    checked.set_transfer_settings(transfer.engine());
+    Ok(checked)
 }

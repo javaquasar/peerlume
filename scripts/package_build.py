@@ -14,11 +14,17 @@ import zipfile
 
 
 BINARIES = ("peerlume", "peerlume-tui", "peerlume-control", "peerlume-mcp")
+FLAVORS = {"desktop": BINARIES, "tui": BINARIES[1:]}
+
+
+def package_name(version, platform, commit, flavor="desktop"):
+    return f"peerlume-{'tui-' if flavor == 'tui' else ''}{version}-{platform}-{commit[:12]}"
 TARGETS = {
     "windows-x64": "x86_64-pc-windows-msvc",
     "linux-x64": "x86_64-unknown-linux-gnu",
 }
 DOCUMENTS = {
+    "docs/tui.md": "docs/tui.md",
     "docs/distribution.md": "README.md",
     "docs/agent-control.md": "docs/agent-control.md",
     "docs/runtime-controls.md": "docs/runtime-controls.md",
@@ -59,9 +65,9 @@ def inside_repository(root, value):
     return path
 
 
-def package(root, binary_directory, output_directory, platform, commit, rust_version):
+def package(root, binary_directory, output_directory, platform, commit, rust_version, flavor="desktop"):
     root = Path(root).resolve()
-    if platform not in TARGETS or not re.fullmatch(r"[0-9a-f]{40}", commit):
+    if flavor not in FLAVORS or platform not in TARGETS or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Expected a supported platform and full lowercase Git commit SHA")
     version = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?", version):
@@ -69,19 +75,19 @@ def package(root, binary_directory, output_directory, platform, commit, rust_ver
     binaries = inside_repository(root, binary_directory)
     output = inside_repository(root, output_directory)
     windows = platform == "windows-x64"
-    name = f"peerlume-{version}-{platform}-{commit[:12]}"
+    name = package_name(version, platform, commit, flavor)
     archive = output / (name + (".zip" if windows else ".tar.gz"))
     sidecar = Path(str(archive) + ".sha256")
     if archive.exists() or sidecar.exists():
         raise ValueError("Package already exists; choose a new output directory")
     files = []
-    for binary in BINARIES:
+    for binary in FLAVORS[flavor]:
         filename = binary + (".exe" if windows else "")
         source = binaries / filename
         check_binary(source, platform)
         files.append((source, filename if windows else f"bin/{filename}", True))
     documents = dict(DOCUMENTS)
-    if not windows:
+    if not windows and flavor == "desktop":
         documents.update({
             "assets/linux/peerlume.desktop": "share/applications/peerlume.desktop",
             "assets/icons/peerlume-256.png": "share/icons/hicolor/256x256/apps/peerlume.png",
@@ -102,9 +108,9 @@ def package(root, binary_directory, output_directory, platform, commit, rust_ver
         manifest = {
             "application": "PeerLume", "version": version, "commit": commit,
             "platform": platform, "target": TARGETS[platform], "profile": "release",
-            "features": ["gui", "tui"], "rustc": rust_version,
+            "features": ["gui", "tui"] if flavor == "desktop" else ["tui"], "rustc": rust_version,
             "built_at_utc": datetime.now(timezone.utc).isoformat(),
-            "linux_baseline": None if windows else "Ubuntu 24.04 / glibc 2.39; X11 desktop",
+            "linux_baseline": None if windows else ("Ubuntu 24.04 / glibc 2.39; X11 desktop" if flavor == "desktop" else "Ubuntu 24.04 / glibc 2.39; terminal; no X11/Wayland"),
             "signed": False,
         }
         (stage / "build-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -136,6 +142,7 @@ def package(root, binary_directory, output_directory, platform, commit, rust_ver
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=TARGETS, required=True)
+    parser.add_argument("--flavor", choices=FLAVORS, default="desktop")
     parser.add_argument("--binary-directory", required=True)
     parser.add_argument("--output-directory", default="dist/builds")
     parser.add_argument("--commit", required=True)
@@ -143,7 +150,7 @@ def main():
     args = parser.parse_args()
     try:
         print(package(Path(__file__).resolve().parent.parent, args.binary_directory,
-                      args.output_directory, args.platform, args.commit, args.rust_version))
+                      args.output_directory, args.platform, args.commit, args.rust_version, args.flavor))
     except (ValueError, OSError, KeyError) as error:
         parser.error(str(error))
 

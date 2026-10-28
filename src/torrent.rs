@@ -41,6 +41,7 @@ pub enum TorrentPriority {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TorrentOverrides {
+    pub transfer_settings: Option<crate::transfer_settings::TransferSettings>,
     pub repair_policy: crate::runtime_status::RepairPolicy,
     pub verify_after_download: bool,
     pub download_mode: crate::download_mode::DownloadMode,

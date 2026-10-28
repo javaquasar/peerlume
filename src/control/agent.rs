@@ -731,6 +731,13 @@ impl AgentService {
                 }
                 (
                     Method::Mutate {
+                        command: TorrentCommand::SetTransferSettings(expected),
+                        ..
+                    },
+                    SessionEvent::TransferSettingsApplied { id, settings },
+                ) => id == target && settings == expected,
+                (
+                    Method::Mutate {
                         command: TorrentCommand::SetVerifyAfterDownload(enabled),
                         ..
                     },
@@ -887,6 +894,7 @@ fn command_name(command: &TorrentCommand) -> &'static str {
         TorrentCommand::SetRepairPolicy(_) => "set_repair_policy",
         TorrentCommand::SetVerifyAfterDownload(_) => "set_verify_after_download",
         TorrentCommand::SetFiles(_) => "set_files",
+        TorrentCommand::SetTransferSettings(_) => "set_transfer_settings",
         TorrentCommand::Remove => "remove",
     }
 }

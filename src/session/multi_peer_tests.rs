@@ -459,6 +459,7 @@ fn download_torrents_with_verification(
                 only_files: None,
                 trackers: vec![torrent.tracker_url.clone()],
                 paused: false,
+                transfer: Default::default(),
                 peer_limit: Some(torrent.peer_count),
             })
             .unwrap();

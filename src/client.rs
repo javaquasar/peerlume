@@ -32,6 +32,12 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::TransferSettingsApplied { id, settings } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                settings.apply(torrent);
+            }
+            SessionNotice::SettingsApplied { id }
+        }
         SessionEvent::VerifyAfterDownload { id, enabled } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 torrent.overrides.verify_after_download = enabled;
@@ -232,6 +238,7 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         .collect();
     let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
     SessionCommand::AddTorrent {
+        transfer: crate::transfer_settings::TransferSettings::from_item(torrent, settings),
         upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
         verify_after_download: torrent.overrides.verify_after_download
@@ -272,6 +279,7 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
+        transfer_settings: torrent.overrides.transfer_settings,
         upload_ratio: torrent.overrides.upload_ratio,
         repair_policy: torrent.overrides.repair_policy,
         verify_after_download: torrent.overrides.verify_after_download
@@ -358,7 +366,8 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
     if let Some(hash) = record.info_hash_v2 {
         info_hashes.push(format!("v2: {hash}"));
     }
-    TorrentItem {
+    let transfer_settings = record.transfer_settings;
+    let mut item = TorrentItem {
         runtime: Default::default(),
         completion: crate::completion::CompletionStatus::Pending,
         name: record.name,
@@ -391,7 +400,11 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
             download_directory: record.download_directory,
             ..Default::default()
         },
+    };
+    if let Some(settings) = transfer_settings {
+        settings.apply(&mut item);
     }
+    item
 }
 
 impl ClientBackend {
@@ -434,7 +447,7 @@ impl ClientBackend {
     }
 
     pub fn start(settings: &ClientSettings) -> Self {
-        Self {
+        let backend = Self {
             state_store: StateStore::open(&data_directory().join("state.sqlite3")).ok(),
             session_runtime: SessionRuntime::start(
                 256,
@@ -442,7 +455,15 @@ impl ClientBackend {
                 settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
             )
             .ok(),
-        }
+        };
+        let _ = backend.send(SessionCommand::ConfigureQueue {
+            max_active_downloads: if settings.queue.enabled {
+                settings.queue.max_active_downloads
+            } else {
+                0
+            },
+        });
+        backend
     }
 
     pub fn load_torrents(&self) -> Result<Vec<TorrentRecord>, String> {
@@ -662,6 +683,7 @@ pub(crate) mod tests {
     fn unavailable_optional_services_have_frontend_friendly_semantics() {
         let mut backend = ClientBackend::offline();
         let record = TorrentRecord {
+            transfer_settings: None,
             repair_policy: Default::default(),
             verify_after_download: false,
             download_mode: Default::default(),

@@ -46,6 +46,12 @@ directories. No system files or file associations are changed automatically.
 
 ## Configuration and adapters
 
+The same workflow also produces separate `tui` artifacts for both operating
+systems, built with `--no-default-features --features tui`. They omit GUI binaries
+and desktop assets. Linux headless packages need no display server; Secret
+Service requirements for persistent private credentials still apply. See
+[terminal controls and server setup](tui.md).
+
 Both frontends use the normal per-user application profile. "Archive build"
 does not mean profile data is saved next to the executable. Before changing an
 existing installation, close the old client; do not run two engines on one profile.

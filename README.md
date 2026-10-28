@@ -83,7 +83,8 @@ cargo run --no-default-features --features tui --bin peerlume-tui
 ```
 
 The shared component contract, parity rules, and TUI key map are documented in
-`docs/frontends.md`.
+`docs/frontends.md`. See [terminal controls and headless packages](docs/tui.md)
+for the complete settings editor, focused navigation, batch actions and server setup.
 
 The sample settings are in `config/peerlume.example.toml`.
 

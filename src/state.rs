@@ -32,6 +32,7 @@ pub struct StoredTrackerAuditProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TorrentRecord {
+    pub transfer_settings: Option<crate::transfer_settings::TransferSettings>,
     pub repair_policy: crate::runtime_status::RepairPolicy,
     pub verify_after_download: bool,
     pub download_mode: crate::download_mode::DownloadMode,
@@ -237,7 +238,7 @@ impl StateStore {
                  PRAGMA user_version = 4;",
             )?;
             transaction.commit()?;
-        } else if !matches!(version, 4..=9) {
+        } else if !matches!(version, 4..=10) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         if version < 5 {
@@ -264,10 +265,18 @@ impl StateStore {
             transaction.execute_batch("ALTER TABLE torrents ADD COLUMN upload_ratio_min_milli INTEGER NOT NULL DEFAULT 1500; ALTER TABLE torrents ADD COLUMN upload_ratio_max_milli INTEGER NOT NULL DEFAULT 2500; PRAGMA user_version = 9;")?;
             transaction.commit()?;
         }
+        if version < 10 {
+            self.connection.execute_batch("CREATE TABLE IF NOT EXISTS torrent_transfer_settings (torrent_id TEXT PRIMARY KEY REFERENCES torrents(id) ON DELETE CASCADE, settings TEXT NOT NULL); PRAGMA user_version = 10;")?;
+        }
         Ok(())
     }
 
     pub fn save_torrent(&mut self, torrent: &TorrentRecord) -> rusqlite::Result<()> {
+        if let Some(settings) = torrent.transfer_settings {
+            settings
+                .validate()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        }
         torrent
             .upload_ratio
             .validate()
@@ -315,6 +324,18 @@ impl StateStore {
                 torrent.upload_ratio.max_milli,
             ],
         )?;
+        transaction.execute(
+            "DELETE FROM torrent_transfer_settings WHERE torrent_id=?1",
+            [&torrent.id],
+        )?;
+        if let Some(settings) = torrent.transfer_settings {
+            let json =
+                serde_json::to_string(&settings).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            transaction.execute(
+                "INSERT INTO torrent_transfer_settings(torrent_id, settings) VALUES (?1, ?2)",
+                params![torrent.id, json],
+            )?;
+        }
         transaction.execute("DELETE FROM trackers WHERE torrent_id=?1", [&torrent.id])?;
         transaction.execute("DELETE FROM files WHERE torrent_id=?1", [&torrent.id])?;
         transaction.execute(
@@ -441,6 +462,7 @@ impl StateStore {
                 [id],
                 |row| {
                     Ok(TorrentRecord {
+                        transfer_settings: None,
                         upload_ratio: crate::download_mode::UploadRatioRange { min_milli: row.get(15)?, max_milli: row.get(16)? },
                         verify_after_download: row.get(12)?,
                         repair_policy: crate::runtime_status::RepairPolicy { enabled: row.get(13)?, max_attempts: row.get(14)? },
@@ -469,6 +491,24 @@ impl StateStore {
         let Some(torrent) = torrent.as_mut() else {
             return Ok(None);
         };
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT settings FROM torrent_transfer_settings WHERE torrent_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        torrent.transfer_settings = json
+            .map(|text| {
+                let settings: crate::transfer_settings::TransferSettings =
+                    serde_json::from_str(&text).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                settings
+                    .validate()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok::<_, rusqlite::Error>(settings)
+            })
+            .transpose()?;
         torrent
             .upload_ratio
             .validate()
@@ -791,6 +831,7 @@ mod tests {
 
     fn record() -> TorrentRecord {
         TorrentRecord {
+            transfer_settings: None,
             repair_policy: Default::default(),
             verify_after_download: false,
             download_mode: Default::default(),
@@ -831,6 +872,32 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    fn confirmed_transfer_settings_round_trip_and_invalid_updates_roll_back() {
+        let mut store = StateStore::in_memory().unwrap();
+        let mut record = record();
+        record.transfer_settings = Some(crate::transfer_settings::TransferSettings {
+            download_kib: 1,
+            sequential: true,
+            ..Default::default()
+        });
+        store.save_torrent(&record).unwrap();
+        assert_eq!(store.load_torrent(&record.id).unwrap().unwrap(), record);
+        record.transfer_settings.as_mut().unwrap().max_peers = 0;
+        assert!(store.save_torrent(&record).is_err());
+        assert_eq!(
+            store
+                .load_torrent(&record.id)
+                .unwrap()
+                .unwrap()
+                .transfer_settings
+                .unwrap()
+                .max_peers,
+            128
+        );
+        assert!(store.remove_torrent(&record.id).is_ok());
     }
 
     #[test]
@@ -1155,7 +1222,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(column_count, 1);
     }
 
@@ -1185,7 +1252,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(store.child_row_count("tracker_audit_profiles").unwrap(), 0);
         assert_eq!(store.child_row_count("tracker_audit_steps").unwrap(), 0);
     }
@@ -1218,7 +1285,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(new_column_count, 2);
     }
 }

@@ -11,12 +11,14 @@ import tempfile
 import tomllib
 import zipfile
 
-from package_build import BINARIES, DOCUMENTS, TARGETS, check_binary, inside_repository, sha256
+from package_build import FLAVORS, DOCUMENTS, TARGETS, check_binary, inside_repository, sha256, package_name
 
 
-def extract_and_verify(archive, platform, commit, version, destination):
+def extract_and_verify(archive, platform, commit, version, destination, flavor="desktop"):
+    if flavor not in FLAVORS:
+        raise ValueError("Unknown package flavor")
     extension = ".zip" if platform == "windows-x64" else ".tar.gz"
-    name = f"peerlume-{version}-{platform}-{commit[:12]}"
+    name = package_name(version, platform, commit, flavor)
     if archive.name != name + extension:
         raise ValueError("Archive name does not match the expected version, platform and commit")
     expected_outer = f"{sha256(archive)}  {archive.name}\n"
@@ -24,8 +26,8 @@ def extract_and_verify(archive, platform, commit, version, destination):
         raise ValueError("Archive SHA-256 mismatch")
     windows = platform == "windows-x64"
     expected_files = set(DOCUMENTS.values()) | {"build-info.json", "SHA256SUMS"}
-    expected_files.update(binary + ".exe" if windows else "bin/" + binary for binary in BINARIES)
-    if not windows:
+    expected_files.update(binary + ".exe" if windows else "bin/" + binary for binary in FLAVORS[flavor])
+    if not windows and flavor == "desktop":
         expected_files.update({"share/applications/peerlume.desktop", "share/icons/hicolor/256x256/apps/peerlume.png"})
     expected_members = {name + "/" + file for file in expected_files}
     root = destination / name
@@ -69,15 +71,15 @@ def extract_and_verify(archive, platform, commit, version, destination):
         raise ValueError("Incomplete SHA256SUMS")
     info = json.loads((root / "build-info.json").read_text(encoding="utf-8"))
     for key, value in {"commit": commit, "version": version, "platform": platform,
-                       "target": TARGETS[platform], "profile": "release", "features": ["gui", "tui"]}.items():
+                       "target": TARGETS[platform], "profile": "release", "features": ["gui", "tui"] if flavor == "desktop" else ["tui"]}.items():
         if info.get(key) != value:
             raise ValueError(f"Build manifest mismatch: {key}")
-    for binary in BINARIES:
+    for binary in FLAVORS[flavor]:
         check_binary(root / (binary + ".exe" if windows else "bin/" + binary), platform)
     return root
 
 
-def smoke(root, platform, version):
+def smoke(root, platform, version, flavor="desktop"):
     windows = platform == "windows-x64"
     folder = root if windows else root / "bin"
     suffix = ".exe" if windows else ""
@@ -88,6 +90,10 @@ def smoke(root, platform, version):
                             capture_output=True, text=True, check=True, timeout=15, env=environment)
     if not result.stdout.startswith(f"peerlume-control {version} protocol "):
         raise ValueError("Packaged CLI reported an unexpected version")
+    result = subprocess.run([str(folder / ("peerlume-tui" + suffix)), "--version"],
+                            capture_output=True, text=True, check=True, timeout=15, env=environment)
+    if result.stdout.strip() != f"peerlume-tui {version}":
+        raise ValueError("Packaged TUI reported an unexpected version")
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-11-25", "capabilities": {},
         "clientInfo": {"name": "package-smoke", "version": "1"}}}
@@ -100,7 +106,7 @@ def smoke(root, platform, version):
             != {"name": "peerlume", "version": version}):
         raise ValueError("Packaged MCP adapter did not initialize")
     if not windows:
-        for binary in BINARIES:
+        for binary in FLAVORS[flavor]:
             result = subprocess.run(["ldd", str(folder / binary)], capture_output=True,
                                     text=True, check=True, timeout=15)
             if "not found" in result.stdout + result.stderr:
@@ -110,6 +116,7 @@ def smoke(root, platform, version):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=TARGETS, required=True)
+    parser.add_argument("--flavor", choices=FLAVORS, default="desktop")
     parser.add_argument("--commit", required=True)
     parser.add_argument("--directory", default="dist/builds")
     args = parser.parse_args()
@@ -119,10 +126,10 @@ def main():
     version = tomllib.loads((repository / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     directory = inside_repository(repository, args.directory)
     extension = ".zip" if args.platform == "windows-x64" else ".tar.gz"
-    archive = directory / f"peerlume-{version}-{args.platform}-{args.commit[:12]}{extension}"
+    archive = directory / (package_name(version, args.platform, args.commit, args.flavor) + extension)
     with tempfile.TemporaryDirectory(prefix="peerlume-build-verify-") as temporary:
-        root = extract_and_verify(archive, args.platform, args.commit, version, Path(temporary))
-        smoke(root, args.platform, version)
+        root = extract_and_verify(archive, args.platform, args.commit, version, Path(temporary), args.flavor)
+        smoke(root, args.platform, version, args.flavor)
     print(f"Verified archive, every SHA-256, executable architecture, CLI and MCP: {archive.name}")
 
 

@@ -105,6 +105,25 @@ class PackageTests(unittest.TestCase):
             self.build()
         self.assertFalse((self.root / "dist").exists())
 
+    def test_headless_packages_need_no_gui_binary_or_desktop_assets(self):
+        for platform in packaging.TARGETS:
+            with self.subTest(platform=platform):
+                self.fixtures(platform)
+                (self.binaries / ("peerlume.exe" if platform == "windows-x64" else "peerlume")).unlink()
+                archive = self.build(platform, flavor="tui", output_directory="dist/" + platform)
+                destination = self.root / ("extracted-" + platform)
+                extracted = verifier.extract_and_verify(archive, platform, "a" * 40, "0.1.0", destination, "tui")
+                manifest = json.loads((extracted / "build-info.json").read_text())
+                self.assertEqual(manifest["features"], ["tui"])
+                names = [path.relative_to(extracted).as_posix() for path in extracted.rglob("*") if path.is_file()]
+                self.assertFalse(any(name.startswith("share/") or name in ("peerlume.exe", "bin/peerlume") for name in names))
+                with self.assertRaises(ValueError):
+                    verifier.extract_and_verify(archive, platform, "a" * 40, "0.1.0", self.root / "wrong-flavor")
+
+    def test_unknown_flavor_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(flavor="typo")
+
     def test_existing_package_is_never_overwritten(self):
         archive = self.verify("windows-x64")
         original = archive.read_bytes()

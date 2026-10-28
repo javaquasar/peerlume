@@ -39,19 +39,24 @@ cargo run --no-default-features --features tui --bin peerlume-tui
 TUI keys:
 
 - `1` / `2`: Torrents / Preferences;
-- arrows: select torrent, file, or preference section;
-- `Tab` / `Shift+Tab`: torrent detail tabs;
+- `Tab` / `Shift+Tab` / `F6`: switch torrent/details focus; up/down moves in that pane;
+- left/right in Details changes tabs; in Preferences it changes sections;
+- `Alt`+arrows resizes panes; `/` searches names; `F1` opens help; `:` opens the command palette;
 - `a`, `m`: add a `.torrent` path or magnet URI;
 - after a `.torrent` path, select a download mode before confirming addition;
-- `p`, `r`, `P`, `R`: pause/resume one or all torrents;
-- `d`: remove the selected torrent while keeping downloaded data;
+- `p`, `r`: pause/resume marked torrents or the current row; `P`, `R`: all torrents;
+- `d`: confirm removal of marked/current torrents while keeping all files;
+- `c`: confirm a full integrity check and bounded download/repair;
+- `F7`: edit transfer rate limits, peers, sequential order, queue priority and seeding stops;
 - `v`: recheck the selected torrent's files, keeping data and session transfer totals;
 - `V`: toggle the selected torrent's persistent Verify after download setting;
 - `F3`: toggle Verify after download while reviewing a pending torrent's mode;
 - `e` / `E` in Log: export selected-torrent / entire-session JSONL to a new file;
 - up/down in Log: scroll real announces and returned peer addresses;
-- `Space`: toggle the selected file or the primary option on a preference page;
-- `o`: edit a per-torrent download directory in Torrent settings;
+- `Space`: mark a torrent, toggle a focused file, or toggle the selected preference boolean;
+- `*` marks all visible torrents; Esc clears marks or cancels a draft/confirmation;
+- preferences: up/down selects any field; Enter edits; strings support cursor editing;
+- existing payload relocation is unsupported; Downloads preferences set new-torrent defaults;
 - `u`, `A`: edit Tracker URL or run the saved audit scenario in Trackers;
 - `F2`: show/hide URL-derived tracker account fields in Info, Trackers, or the
   add-torrent mode prompt (these fields are not the client's Peer ID);
@@ -59,6 +64,11 @@ TUI keys:
   the running tracker scenario;
 - `s`, `D`: validate/save preferences or load defaults;
 - `q` / `Ctrl+C`: exit.
+
+See [the terminal guide](tui.md) for command names, units, supported engine
+settings and safe server setup. Global preferences are validated drafts: saving
+does not reconfigure a running engine. Fields without proven engine wiring are
+explicitly labeled stored-only rather than claiming full runtime parity.
 
 ## Parity contract
 

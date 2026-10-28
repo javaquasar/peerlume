@@ -211,6 +211,17 @@ fn command_schema() -> Value {
     for (kind, value) in [
         ("set_verify_after_download", json!({"type":"boolean"})),
         (
+            "set_transfer_settings",
+            json!({"type":"object","properties":{
+            "download_kib":{"type":"integer","minimum":0,"maximum":4194303},
+            "upload_kib":{"type":"integer","minimum":0,"maximum":4194303},
+            "max_peers":{"type":"integer","minimum":1,"maximum":4096},
+            "sequential":{"type":"boolean"},"priority":{"enum":["low","normal","high"]},
+            "ratio_milli":{"type":"integer","minimum":0,"maximum":1000000},
+            "seed_minutes":{"type":"integer","minimum":0,"maximum":4294967295_u64}
+        },"required":["download_kib","upload_kib","max_peers","sequential","priority","ratio_milli","seed_minutes"],"additionalProperties":false}),
+        ),
+        (
             "set_files",
             json!({"type":"array","maxItems":4096,"uniqueItems":true,"items":{"type":"integer","minimum":0}}),
         ),

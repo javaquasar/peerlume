@@ -34,6 +34,7 @@ fn every_existing_command_uses_canonical_identity_and_does_not_claim_completion(
         TorrentCommand::SetRepairPolicy(RepairPolicy::default()),
         TorrentCommand::SetVerifyAfterDownload(true),
         TorrentCommand::SetFiles(vec![0]),
+        TorrentCommand::SetTransferSettings(Default::default()),
     ];
     for command in commands {
         let mut control = controller();

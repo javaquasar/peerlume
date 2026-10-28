@@ -35,6 +35,7 @@ pub mod torrent_filter;
 pub mod tracker;
 pub mod tracker_behavior;
 pub mod transfer;
+pub mod transfer_settings;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod ui_schema;

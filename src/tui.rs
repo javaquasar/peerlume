@@ -48,9 +48,19 @@ use crate::{
 };
 
 pub const SUPPORTED_COMPONENT_COUNT: usize = COMPONENTS.len();
+mod interaction;
+#[cfg(test)]
+mod parity_tests;
+mod preferences_editor;
+mod prompt;
+use interaction::{Focus, PendingBatch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
+    Transfer,
+    Preference,
+    Search,
+    Command,
     ExistingMode,
     RepairLimit,
     TorrentPath,
@@ -70,9 +80,19 @@ struct InputPrompt {
     kind: PromptKind,
     title: &'static str,
     value: String,
+    cursor: usize,
 }
 
 pub struct TuiApp {
+    focus: Focus,
+    split_percent: u16,
+    search: String,
+    marked: std::collections::BTreeSet<String>,
+    help: bool,
+    confirmation: Option<PendingBatch>,
+    preferences_draft: Option<ClientSettings>,
+    selected_preference: usize,
+    editing_preference: Option<(PreferencesTab, String)>,
     journal_page: usize,
     settings: ClientSettings,
     control: Controller,
@@ -134,6 +154,15 @@ impl TuiApp {
     ) -> Self {
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
         Self {
+            focus: Focus::Torrents,
+            split_percent: 43,
+            search: String::new(),
+            marked: Default::default(),
+            help: false,
+            confirmation: None,
+            preferences_draft: None,
+            selected_preference: 0,
+            editing_preference: None,
             settings,
             control: Controller::new(backend, torrents),
             tracker_audits,
@@ -209,19 +238,36 @@ impl TuiApp {
     }
 
     fn clamp_selection(&mut self) {
-        self.selected_torrent = self
-            .status_filter
-            .selected_index(&self.control.torrents, self.selected_torrent)
-            .unwrap_or(0);
+        let visible = self.visible_indices();
+        if !visible.contains(&self.selected_torrent) {
+            self.selected_torrent = visible.first().copied().unwrap_or(0);
+            self.selected_file = 0;
+            self.show_tracker_identity = false;
+        }
+        self.marked.retain(|id| {
+            self.control
+                .torrents
+                .iter()
+                .any(|torrent| torrent.info_hashes.join(";") == *id)
+        });
         let file_count = self
             .control
             .torrents
             .get(self.selected_torrent)
             .map_or(0, |torrent| torrent.files.files().len());
-        self.selected_file = self.selected_file.min(file_count.saturating_sub(1));
+        if self.details_tab == TorrentDetailsTab::Files {
+            self.selected_file = self.selected_file.min(file_count.saturating_sub(1));
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+        {
+            self.handle_interaction(key);
+            return;
+        }
         if key.kind == KeyEventKind::Press && self.agent_panel.key(&mut self.control, key.code) {
             return;
         }
@@ -236,6 +282,9 @@ impl TuiApp {
             return;
         }
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.handle_interaction(key) {
             return;
         }
         if key.code == KeyCode::F(3) && self.pending_add.is_some() {
@@ -278,6 +327,7 @@ impl TuiApp {
             KeyCode::Char('f') if self.page == MainPage::Torrents => {
                 self.status_filter = self.status_filter.next();
                 self.clamp_selection();
+                self.retain_visible_marks();
                 self.selected_file = 0;
                 self.show_tracker_identity = false;
             }
@@ -307,7 +357,9 @@ impl TuiApp {
             KeyCode::Char('r') if self.page == MainPage::Torrents => self.resume_selected(),
             KeyCode::Char('P') if self.page == MainPage::Torrents => self.pause_all(),
             KeyCode::Char('R') if self.page == MainPage::Torrents => self.resume_all(),
-            KeyCode::Char('d') if self.page == MainPage::Torrents => self.remove_selected(),
+            KeyCode::Char('d') if self.page == MainPage::Torrents => {
+                self.request_batch(interaction::BatchAction::Remove)
+            }
             KeyCode::Char('v') if self.page == MainPage::Torrents => {
                 self.status = self
                     .submit_selected(TorrentCommand::Recheck)
@@ -393,31 +445,32 @@ impl TuiApp {
             }
             KeyCode::Char(' ')
                 if self.page == MainPage::Torrents
+                    && self.focus == Focus::Details
                     && self.details_tab == TorrentDetailsTab::Files =>
             {
                 self.toggle_selected_file()
             }
             KeyCode::Char(' ') if self.page == MainPage::Preferences => {
-                self.toggle_primary_preference();
+                self.toggle_preference();
             }
             KeyCode::Char('s') if self.page == MainPage::Preferences => self.save_preferences(),
             KeyCode::Char('D') if self.page == MainPage::Preferences => {
-                self.settings = ClientSettings::default();
+                self.preferences_draft = Some(ClientSettings::default());
                 self.status = "Defaults loaded; press s to save".into();
             }
             KeyCode::Tab if self.page == MainPage::Torrents => {
-                self.details_tab = self.details_tab.next();
-                self.selected_file = 0;
+                self.focus = self.focus.next();
             }
             KeyCode::BackTab if self.page == MainPage::Torrents => {
-                self.details_tab = self.details_tab.previous();
-                self.selected_file = 0;
+                self.focus = self.focus.next();
             }
             KeyCode::Right if self.page == MainPage::Preferences => {
                 self.preferences_tab = self.preferences_tab.next();
+                self.selected_preference = 0;
             }
             KeyCode::Left if self.page == MainPage::Preferences => {
                 self.preferences_tab = self.preferences_tab.previous();
+                self.selected_preference = 0;
             }
             KeyCode::Down => self.move_selection(1),
             KeyCode::PageDown if self.details_tab == TorrentDetailsTab::Log => {
@@ -435,7 +488,13 @@ impl TuiApp {
 
     fn open_prompt(&mut self, kind: PromptKind, title: &'static str, value: String) {
         self.show_tracker_identity = false;
-        self.input = Some(InputPrompt { kind, title, value });
+        let cursor = value.len();
+        self.input = Some(InputPrompt {
+            kind,
+            title,
+            value,
+            cursor,
+        });
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -448,23 +507,24 @@ impl TuiApp {
                 let prompt = self.input.take().expect("prompt exists");
                 self.submit_prompt(prompt);
             }
-            KeyCode::Backspace => {
-                self.input.as_mut().expect("prompt exists").value.pop();
+            _ => {
+                self.input.as_mut().expect("prompt exists").edit(key);
             }
-            KeyCode::Char(character) => {
-                let prompt = self.input.as_mut().expect("prompt exists");
-                if prompt.kind == PromptKind::DownloadMode {
-                    prompt.value.clear();
-                }
-                prompt.value.push(character);
-            }
-            _ => {}
         }
     }
 
     fn submit_prompt(&mut self, prompt: InputPrompt) {
         let retry = prompt.clone();
         let result = match prompt.kind {
+            PromptKind::Transfer => self.change_transfer(&prompt.value),
+            PromptKind::Preference => self.commit_preference(&prompt.value),
+            PromptKind::Search => {
+                self.search = prompt.value;
+                self.clamp_selection();
+                self.retain_visible_marks();
+                Ok(format!("Search: {}", self.search))
+            }
+            PromptKind::Command => self.run_command(&prompt.value),
             PromptKind::ExistingMode => self.change_existing_mode(&prompt.value),
             PromptKind::RepairLimit => (|| {
                 let torrent = self
@@ -514,7 +574,17 @@ impl TuiApp {
     }
 
     fn move_selection(&mut self, direction: isize) {
+        if self.page == MainPage::Preferences {
+            let count = preferences_editor::fields(
+                self.preferences_draft.as_ref().unwrap_or(&self.settings),
+                self.preferences_tab,
+            )
+            .len();
+            self.selected_preference = move_index(self.selected_preference, count, direction);
+            return;
+        }
         if self.page == MainPage::Torrents
+            && self.focus == Focus::Details
             && matches!(
                 self.details_tab,
                 TorrentDetailsTab::Log | TorrentDetailsTab::Status
@@ -530,6 +600,7 @@ impl TuiApp {
             return;
         }
         if self.page == MainPage::Torrents
+            && self.focus == Focus::Details
             && self.details_tab == TorrentDetailsTab::Files
             && let Some(torrent) = self.selected()
         {
@@ -537,7 +608,14 @@ impl TuiApp {
                 move_index(self.selected_file, torrent.files.files().len(), direction);
             return;
         }
-        let visible: Vec<_> = self.status_filter.indices(&self.control.torrents).collect();
+        if self.page == MainPage::Torrents && self.focus == Focus::Details {
+            self.selected_file = self
+                .selected_file
+                .saturating_add_signed(direction)
+                .min(u16::MAX as usize);
+            return;
+        }
+        let visible = self.visible_indices();
         let position = visible
             .iter()
             .position(|index| *index == self.selected_torrent)
@@ -554,14 +632,25 @@ impl TuiApp {
         self.control
             .torrents
             .get(self.selected_torrent)
-            .filter(|torrent| self.status_filter.matches(torrent))
+            .filter(|torrent| {
+                self.status_filter.matches(torrent)
+                    && (self.search.is_empty()
+                        || torrent
+                            .name
+                            .to_lowercase()
+                            .contains(&self.search.to_lowercase()))
+            })
     }
 
     fn selected_mut(&mut self) -> Option<&mut TorrentItem> {
+        let search = self.search.to_lowercase();
         self.control
             .torrents
             .get_mut(self.selected_torrent)
-            .filter(|torrent| self.status_filter.matches(torrent))
+            .filter(|torrent| {
+                self.status_filter.matches(torrent)
+                    && (search.is_empty() || torrent.name.to_lowercase().contains(&search))
+            })
     }
 
     fn submit_selected(&mut self, command: TorrentCommand) -> Result<String, String> {
@@ -577,15 +666,11 @@ impl TuiApp {
     }
 
     fn pause_selected(&mut self) {
-        self.status = self
-            .submit_selected(TorrentCommand::Pause)
-            .unwrap_or_else(|error| error);
+        self.execute_batch(interaction::BatchAction::Pause, None);
     }
 
     fn resume_selected(&mut self) {
-        self.status = self
-            .submit_selected(TorrentCommand::Resume)
-            .unwrap_or_else(|error| error);
+        self.execute_batch(interaction::BatchAction::Resume, None);
     }
 
     fn pause_all(&mut self) {
@@ -596,6 +681,7 @@ impl TuiApp {
         self.status = self.control.submit_batch(true);
     }
 
+    #[cfg(test)]
     fn remove_selected(&mut self) {
         let Some(torrent) = self.selected() else {
             return;
@@ -958,14 +1044,7 @@ impl TuiApp {
         if Path::new(directory.trim()).is_file() {
             return Err("Download directory points to a file".into());
         }
-        let directory = directory.trim().to_owned();
-        let Some(torrent) = self.selected_mut() else {
-            return Err("No torrent selected".into());
-        };
-        torrent.overrides.download_directory = Some(directory.clone());
-        self.last_download_directory = Some(directory.clone());
-        self.persist_selected();
-        Ok(format!("Download directory set to {directory}"))
+        Err("Moving existing payload is not supported. Change Downloads preferences for new torrents; no data or settings changed.".into())
     }
 
     fn set_tracker_url(&mut self, tracker_url: String) -> Result<String, String> {
@@ -1151,56 +1230,8 @@ impl TuiApp {
         ))
     }
 
-    fn toggle_primary_preference(&mut self) {
-        match self.preferences_tab {
-            PreferencesTab::Downloads => {
-                self.settings.download.start_when_added = !self.settings.download.start_when_added
-            }
-            PreferencesTab::Queue => self.settings.queue.enabled = !self.settings.queue.enabled,
-            PreferencesTab::Speed => {
-                self.settings.speed.alternate_enabled = !self.settings.speed.alternate_enabled
-            }
-            PreferencesTab::Connection => {
-                self.settings.connection.port_forwarding = !self.settings.connection.port_forwarding
-            }
-            PreferencesTab::BitTorrent => {
-                self.settings.bittorrent.dht = !self.settings.bittorrent.dht
-            }
-            PreferencesTab::Seeding => {
-                self.settings.seeding.ratio_limit_enabled =
-                    !self.settings.seeding.ratio_limit_enabled
-            }
-            PreferencesTab::Privacy => {
-                self.settings.privacy.blocklist_enabled = !self.settings.privacy.blocklist_enabled
-            }
-            PreferencesTab::Storage => {
-                self.settings.storage.check_free_space = !self.settings.storage.check_free_space
-            }
-            PreferencesTab::Automation => {
-                self.settings.automation.watch_directory_enabled =
-                    !self.settings.automation.watch_directory_enabled
-            }
-        }
-        self.status = "Preference changed; press s to validate and save".into();
-        let _ = self.control.set_agent_settings(&self.settings);
-    }
-
     fn save_preferences(&mut self) {
-        let issues = self.settings.validate();
-        if issues.is_empty() {
-            let _ = self.control.set_agent_settings(&self.settings);
-            self.settings.ui.last_preferences_tab = self.preferences_tab.index();
-            self.status = match self.settings.save() {
-                Ok(()) => "Preferences saved; restart may be required".into(),
-                Err(error) => format!("Could not save preferences: {error}"),
-            };
-        } else {
-            self.status = issues
-                .iter()
-                .map(|issue| format!("{}: {}", issue.field, issue.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-        }
+        self.save_preferences_draft();
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -1243,14 +1274,23 @@ impl TuiApp {
             areas[2],
         );
         let help = if self.page == MainPage::Torrents {
-            "1/2 pages · ↑↓ select · f status filter · Tab details · a add · m magnet · p/r pause/resume · P/R all · d remove · q quit"
+            "Tab focus · ←→ detail tabs · ↑↓ move · Space mark/file · / search · : commands · F1 help · q quit"
         } else {
-            "1/2 pages · ←→ section · Space toggle highlighted option · s save · D defaults · q quit"
+            "←→ section · ↑↓ field · Enter edit · Space toggle · s save · Esc discard · F1 help"
         };
         frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), areas[3]);
         if let Some(prompt) = &self.input {
             let mode_prompt = prompt.kind == PromptKind::DownloadMode;
-            let mut lines = vec![Line::from(prompt.value.as_str())];
+            let sensitive = prompt.kind == PromptKind::Preference
+                && self
+                    .editing_preference
+                    .as_ref()
+                    .is_some_and(|(_, key)| preferences_editor::secret(key));
+            let (display, cursor_column) = prompt.window(
+                sensitive,
+                (usize::from(frame.area().width) * 80 / 100).saturating_sub(3),
+            );
+            let mut lines = vec![Line::from(display)];
             if mode_prompt {
                 lines.push(Line::from(format!(
                     "Verify after download: {} · F3 toggles",
@@ -1297,19 +1337,63 @@ impl TuiApp {
                     .wrap(Wrap { trim: false }),
                 popup,
             );
-            let cursor_x = popup.x + 1 + prompt.value.chars().count() as u16;
-            frame.set_cursor_position((cursor_x.min(popup.right().saturating_sub(2)), popup.y + 1));
+            if popup.width > 2 && popup.height > 2 {
+                let cursor_x = popup
+                    .x
+                    .saturating_add(1)
+                    .saturating_add(cursor_column.min(u16::MAX as usize) as u16);
+                frame.set_cursor_position((
+                    cursor_x.min(popup.right().saturating_sub(2)),
+                    popup.y + 1,
+                ));
+            }
         }
+        self.render_interaction(frame);
     }
 
     fn render_torrents(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .direction(if area.width >= 120 {
+                Direction::Horizontal
+            } else {
+                Direction::Vertical
+            })
+            .constraints([
+                Constraint::Percentage(self.split_percent),
+                Constraint::Percentage(100 - self.split_percent),
+            ])
             .split(area);
         self.clamp_selection();
-        let visible: Vec<_> = self.status_filter.indices(&self.control.torrents).collect();
-        let rows = visible.iter().map(|index| {
+        let visible = self.visible_indices();
+        let selected = visible
+            .iter()
+            .position(|index| *index == self.selected_torrent);
+        let height = columns[0].height.saturating_sub(3).max(1) as usize;
+        let start = selected.unwrap_or(0).saturating_sub(height - 1);
+        let width = columns[0].width.saturating_sub(4);
+        let optional = [
+            ("State", 22_u16),
+            ("Down/s", 10),
+            ("Up/s", 10),
+            ("Peers", 9),
+            ("ETA", 12),
+            ("Ratio", 7),
+        ];
+        let mut headers = vec!["Name", "%"];
+        let mut widths = vec![
+            Constraint::Min(12),
+            Constraint::Length(if width < 45 { 9 } else { 20 }),
+        ];
+        let mut remaining = width.saturating_sub(if width < 45 { 23 } else { 34 });
+        for (name, size) in optional {
+            if remaining < size + 1 {
+                break;
+            }
+            headers.push(name);
+            widths.push(Constraint::Length(size));
+            remaining -= size + 1;
+        }
+        let rows = visible.iter().skip(start).take(height).map(|index| {
             let torrent = &self.control.torrents[*index];
             let progress_style = if torrent.completed_successfully() {
                 Style::default().fg(Color::Black).bg(Color::Green)
@@ -1320,43 +1404,54 @@ impl TuiApp {
             } else {
                 Style::default()
             };
-            Row::new(vec![
-                Cell::from(torrent.name.clone()),
+            let mut cells = vec![
+                Cell::from(format!(
+                    "{} {}",
+                    if self.marked.contains(&torrent.info_hashes.join(";")) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    },
+                    torrent.name
+                )),
                 Cell::from(torrent.progress_text()).style(progress_style),
                 Cell::from(torrent.status_text()),
                 Cell::from(format_size(torrent.download_rate)),
-            ])
+                Cell::from(format_size(torrent.upload_rate)),
+                Cell::from(format!("{} / {}", torrent.peers, torrent.seeds)),
+                Cell::from(
+                    torrent
+                        .eta_seconds()
+                        .map(|seconds| format!("{}m", seconds / 60))
+                        .unwrap_or_else(|| "--".into()),
+                ),
+                Cell::from(format!("{:.2}", torrent.ratio())),
+            ];
+            cells.truncate(headers.len());
+            Row::new(cells)
         });
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(48),
-                Constraint::Length(20),
-                Constraint::Length(24),
-                Constraint::Length(10),
-            ],
-        )
-        .header(
-            Row::new(["Name", "%", "State", "Down/s"]).style(Style::default().fg(Color::Yellow)),
-        )
-        .block(
-            Block::default()
-                .title(format!(
-                    " Torrents · {} ({}/{}) · f filter ",
-                    self.status_filter.label(),
-                    visible.len(),
-                    self.control.torrents.len()
-                ))
-                .borders(Borders::ALL),
-        )
-        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        let table = Table::new(rows, widths)
+            .header(Row::new(headers.clone()).style(Style::default().fg(Color::Yellow)))
+            .block(
+                Block::default()
+                    .title(format!(
+                        " Torrents · {} ({}/{}) · marked {} ",
+                        self.status_filter.label(),
+                        visible.len(),
+                        self.control.torrents.len(),
+                        self.marked.len()
+                    ))
+                    .border_style(Style::default().fg(if self.focus == Focus::Torrents {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }))
+                    .borders(Borders::ALL),
+            )
+            .row_highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
         let mut state = ratatui::widgets::TableState::default();
-        state.select(
-            visible
-                .iter()
-                .position(|index| *index == self.selected_torrent),
-        );
+        state.select(selected.map(|position| position - start));
         frame.render_stateful_widget(table, columns[0], &mut state);
         self.render_details(frame, columns[1]);
     }
@@ -1373,7 +1468,16 @@ impl TuiApp {
         frame.render_widget(
             Tabs::new(TorrentDetailsTab::ALL.map(|tab| Line::from(tab.label())))
                 .select(selected)
-                .block(Block::default().borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(" Details · Tab focuses · arrows change tab ")
+                        .border_style(Style::default().fg(if self.focus == Focus::Details {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }))
+                        .borders(Borders::ALL),
+                )
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
@@ -1381,7 +1485,14 @@ impl TuiApp {
             .control
             .torrents
             .get(self.selected_torrent)
-            .filter(|torrent| self.status_filter.matches(torrent))
+            .filter(|torrent| {
+                self.status_filter.matches(torrent)
+                    && (self.search.is_empty()
+                        || torrent
+                            .name
+                            .to_lowercase()
+                            .contains(&self.search.to_lowercase()))
+            })
         else {
             frame.render_widget(
                 Paragraph::new(if self.control.torrents.is_empty() {
@@ -1419,18 +1530,26 @@ impl TuiApp {
                 );
             }
             TorrentDetailsTab::Files => {
-                let items = torrent.files.files().iter().map(|file| {
-                    ListItem::new(format!(
-                        "[{}] {}  {} / {}",
-                        if file.selected { 'x' } else { ' ' },
-                        file.path,
-                        format_size(file.downloaded_bytes),
-                        format_size(file.size_bytes)
-                    ))
-                });
+                let height = areas[1].height.saturating_sub(2).max(1) as usize;
+                let start = self.selected_file.saturating_sub(height - 1);
+                let items = torrent
+                    .files
+                    .files()
+                    .iter()
+                    .skip(start)
+                    .take(height)
+                    .map(|file| {
+                        ListItem::new(format!(
+                            "[{}] {}  {} / {}",
+                            if file.selected { 'x' } else { ' ' },
+                            file.path,
+                            format_size(file.downloaded_bytes),
+                            format_size(file.size_bytes)
+                        ))
+                    });
                 let mut state = ListState::default();
                 if !torrent.files.files().is_empty() {
-                    state.select(Some(self.selected_file));
+                    state.select(Some(self.selected_file - start));
                 }
                 frame.render_stateful_widget(
                     List::new(items)
@@ -1489,6 +1608,7 @@ impl TuiApp {
                 frame.render_widget(
                     Paragraph::new(lines)
                         .block(Block::default().title(" Info ").borders(Borders::ALL))
+                        .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0))
                         .wrap(Wrap { trim: false }),
                     areas[1],
                 );
@@ -1515,11 +1635,15 @@ impl TuiApp {
                         )),
                         Line::from(format!("Max peers: {}", effective.max_peers)),
                         Line::from(format!("Sequential: {}", effective.sequential_download)),
+                        Line::from(format!("Priority: {:?} (download queue admission)", torrent.overrides.priority)),
+                        Line::from(format!("Seed ratio: {:?}; minutes: {:?}", effective.ratio_limit, effective.seeding_time_limit_minutes)),
+                        Line::from("F7 edits transfer controls; :set FIELD VALUE edits one field."),
+                        Line::from("Changing peer capacity rechecks only this torrent, in the same engine."),
                         Line::from(format!(
                             "Verify after download: {} · V toggles",
                             torrent.overrides.verify_after_download
                         )),
-                        Line::from("Press o to override the download directory."),
+                        Line::from("Payload relocation is not supported; Downloads preferences set new-torrent defaults."),
                         Line::from(format!(
                             "Saved mode: {} · M changes",
                             torrent.mode_config().label()
@@ -1538,7 +1662,9 @@ impl TuiApp {
                         Block::default()
                             .title(" Torrent settings ")
                             .borders(Borders::ALL),
-                    ),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0)),
                     areas[1],
                 );
             }
@@ -1547,7 +1673,8 @@ impl TuiApp {
                     "Connected peers: {}\nKnown seeds: {}",
                     torrent.peers, torrent.seeds
                 ))
-                .block(Block::default().title(" Peers ").borders(Borders::ALL)),
+                .block(Block::default().title(" Peers ").borders(Borders::ALL))
+                .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0)),
                 areas[1],
             ),
             TorrentDetailsTab::Trackers => {
@@ -1611,6 +1738,7 @@ impl TuiApp {
                                 .title(" Tracker audit ")
                                 .borders(Borders::ALL),
                         )
+                        .scroll((self.selected_file.min(u16::MAX as usize) as u16, 0))
                         .wrap(Wrap { trim: false }),
                     areas[1],
                 );
@@ -1712,26 +1840,36 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
-        let body = match self.preferences_tab {
-            PreferencesTab::Downloads => format!("{:#?}", self.settings.download),
-            PreferencesTab::Queue => format!("{:#?}", self.settings.queue),
-            PreferencesTab::Speed => format!("{:#?}", self.settings.speed),
-            PreferencesTab::Connection => format!("{:#?}", self.settings.connection),
-            PreferencesTab::BitTorrent => format!("{:#?}", self.settings.bittorrent),
-            PreferencesTab::Seeding => format!("{:#?}", self.settings.seeding),
-            PreferencesTab::Privacy => format!("{:#?}", self.settings.privacy),
-            PreferencesTab::Storage => format!("{:#?}", self.settings.storage),
-            PreferencesTab::Automation => format!("{:#?}", self.settings.automation),
-        };
-        frame.render_widget(
-            Paragraph::new(body)
+        let fields = preferences_editor::fields(
+            self.preferences_draft.as_ref().unwrap_or(&self.settings),
+            self.preferences_tab,
+        );
+        let items = fields.iter().map(|(key, value)| {
+            ListItem::new(format!(
+                "{key}: {} [{}]",
+                preferences_editor::display(key, value),
+                preferences_editor::application(self.preferences_tab, key)
+            ))
+        });
+        let mut state = ListState::default();
+        state.select(Some(
+            self.selected_preference.min(fields.len().saturating_sub(1)),
+        ));
+        frame.render_stateful_widget(
+            List::new(items)
                 .block(
                     Block::default()
-                        .title(" Settings · Space toggles primary option · s validates/saves ")
+                        .title(if self.preferences_draft.is_some() {
+                            " Preferences draft · s saves; active engine unchanged "
+                        } else {
+                            " Saved preferences · Enter edits selected field "
+                        })
                         .borders(Borders::ALL),
                 )
-                .wrap(Wrap { trim: false }),
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▶ "),
             areas[1],
+            &mut state,
         );
     }
 }
@@ -1962,7 +2100,7 @@ mod tests {
         );
     }
 
-    fn wait_for_tui(app: &mut TuiApp, predicate: impl Fn(&TuiApp) -> bool) {
+    pub(super) fn wait_for_tui(app: &mut TuiApp, predicate: impl Fn(&TuiApp) -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             app.poll();
@@ -2093,6 +2231,7 @@ mod tests {
     #[test]
     fn tui_status_renders_the_shared_model_and_scrolls_without_changing_torrent() {
         let mut app = app();
+        app.focus = Focus::Details;
         app.details_tab = TorrentDetailsTab::Status;
         let expected = crate::runtime_status::status_card(&app.control.torrents[0], None);
         let mut terminal = Terminal::new(TestBackend::new(240, 70)).unwrap();
@@ -2184,7 +2323,7 @@ mod tests {
         assert!(!app.pending_verify_after_download);
     }
 
-    fn test_torrent() -> TorrentItem {
+    pub(super) fn test_torrent() -> TorrentItem {
         TorrentItem {
             runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
@@ -2206,7 +2345,7 @@ mod tests {
         }
     }
 
-    fn app() -> TuiApp {
+    pub(super) fn app() -> TuiApp {
         TuiApp::from_parts(
             ClientSettings::default(),
             ClientBackend::offline(),
@@ -2562,6 +2701,7 @@ mod tests {
     #[test]
     fn log_export_keys_and_scrolling_are_separate_from_file_selection() {
         let mut app = app();
+        app.focus = Focus::Details;
         app.details_tab = TorrentDetailsTab::Log;
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected_file, 1);
@@ -2622,8 +2762,13 @@ mod tests {
     fn keyboard_navigation_uses_shared_schema_order() {
         let mut app = app();
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(app.details_tab, TorrentDetailsTab::Files);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.details_tab, TorrentDetailsTab::Info);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.focus, Focus::Torrents);
         assert_eq!(app.details_tab, TorrentDetailsTab::Files);
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.page, MainPage::Preferences);
@@ -2658,13 +2803,16 @@ mod tests {
     fn torrent_paths_and_tracker_urls_are_validated_and_persisted_in_model() {
         let mut app = app();
         assert!(app.set_download_directory(String::new()).is_err());
-        assert!(app.set_download_directory("downloads/other".into()).is_ok());
+        assert!(
+            app.set_download_directory("downloads/other".into())
+                .is_err()
+        );
         assert_eq!(
             app.control.torrents[0]
                 .overrides
                 .download_directory
                 .as_deref(),
-            Some("downloads/other")
+            None
         );
         assert!(app.set_tracker_url("ftp://invalid".into()).is_err());
         assert!(
@@ -2683,17 +2831,26 @@ mod tests {
         let original = app.settings.clone();
         for tab in PreferencesTab::ALL {
             app.preferences_tab = tab;
-            app.toggle_primary_preference();
+            app.selected_preference = preferences_editor::fields(
+                app.preferences_draft.as_ref().unwrap_or(&app.settings),
+                tab,
+            )
+            .iter()
+            .position(|(_, value)| value.is_boolean())
+            .unwrap();
+            app.toggle_preference();
         }
-        assert_ne!(app.settings.download, original.download);
-        assert_ne!(app.settings.queue, original.queue);
-        assert_ne!(app.settings.speed, original.speed);
-        assert_ne!(app.settings.connection, original.connection);
-        assert_ne!(app.settings.bittorrent, original.bittorrent);
-        assert_ne!(app.settings.seeding, original.seeding);
-        assert_ne!(app.settings.privacy, original.privacy);
-        assert_ne!(app.settings.storage, original.storage);
-        assert_ne!(app.settings.automation, original.automation);
+        assert_eq!(app.settings, original);
+        let draft = app.preferences_draft.as_ref().unwrap();
+        assert_ne!(draft.download, original.download);
+        assert_ne!(draft.queue, original.queue);
+        assert_ne!(draft.speed, original.speed);
+        assert_ne!(draft.connection, original.connection);
+        assert_ne!(draft.bittorrent, original.bittorrent);
+        assert_ne!(draft.seeding, original.seeding);
+        assert_ne!(draft.privacy, original.privacy);
+        assert_ne!(draft.storage, original.storage);
+        assert_ne!(draft.automation, original.automation);
     }
 
     #[test]

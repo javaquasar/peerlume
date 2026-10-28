@@ -52,6 +52,7 @@ pub enum SessionCommand {
         prepared: PreparedTorrent,
     },
     AddTorrent {
+        transfer: crate::transfer_settings::TransferSettings,
         repair_policy: RepairPolicy,
         verify_after_download: bool,
         download_mode: DownloadMode,
@@ -98,10 +99,21 @@ pub enum SessionCommand {
         policy: RepairPolicy,
     },
     Shutdown,
+    ConfigureQueue {
+        max_active_downloads: usize,
+    },
+    SetTransferSettings {
+        id: String,
+        settings: crate::transfer_settings::TransferSettings,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    TransferSettingsApplied {
+        id: String,
+        settings: crate::transfer_settings::TransferSettings,
+    },
     VerifyAfterDownload {
         id: String,
         enabled: bool,
@@ -310,6 +322,7 @@ impl SessionRuntime {
                     let mut pending_resume = std::collections::HashSet::<String>::new();
                     let mut repairs = HashMap::<String, RepairBudget>::new();
                     let mut manual_repairs = std::collections::HashSet::<String>::new();
+                    let mut seeding_clocks = HashMap::<String, crate::transfer_settings::SeedingClock>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -401,11 +414,25 @@ impl SessionRuntime {
                                         }
                                         continue;
                                     }
-                                    let paused = matches!(
+                                    let mut paused = matches!(
                                         stats.state,
                                         TorrentStatsState::Paused
                                             | TorrentStatsState::Initializing { paused: true }
                                     );
+                                    let seeded = seeding_clocks.entry(id.clone()).or_default().sample(std::time::Instant::now(), stats.finished && !paused);
+                                    if stats.finished && !paused
+                                        && let Some(SessionCommand::AddTorrent { transfer, .. }) = added_commands.get(&id)
+                                        && transfer.seed_limit_reached(transfer_snapshot.uploaded, stats.total_bytes, seeded)
+                                    {
+                                        let final_sample = final_transfer_sampler(&handle, &counters);
+                                        librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, session_peer_id.0).await;
+                                        let result = session.pause(&handle).await;
+                                        final_sample();
+                                        match result {
+                                            Ok(()) => { paused = true; seeding_clocks.get_mut(&id).unwrap().sample(std::time::Instant::now(), false); let _ = event_tx.send(SessionEvent::StateChanged { id: id.clone(), state: "paused" }); }
+                                            Err(_) => { let _ = event_tx.send(SessionEvent::Error { id: id.clone(), message: "Seeding limit reached, but pausing failed".into() }); }
+                                        }
+                                    }
                                     let (download_rate, upload_rate, peers) = stats
                                         .live
                                         .as_ref()
@@ -469,6 +496,29 @@ impl SessionRuntime {
                                 let mut saved_command = command.clone();
                                 if let SessionCommand::AddTorrent { repair_policy, verify_after_download, .. } = &mut saved_command { *verify_after_download |= repair_policy.enabled; }
                                 match command {
+                                    SessionCommand::ConfigureQueue { max_active_downloads } => { session.max_active_downloads.store(max_active_downloads, std::sync::atomic::Ordering::Relaxed); }
+                                    SessionCommand::SetTransferSettings { id, settings } => {
+                                        if let Err(message) = settings.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
+                                        if checks.contains_key(&id) { let _ = event_tx.send(SessionEvent::Error { id, message: "Wait for the integrity check before changing transfer settings".into() }); continue; }
+                                        let Some(handle) = torrents.get(&id).cloned() else { let _ = event_tx.send(SessionEvent::Error { id, message: "Torrent is unavailable".into() }); continue; };
+                                        let Some(saved) = added_commands.get(&id) else { continue; };
+                                        let mut next = saved.clone();
+                                        let SessionCommand::AddTorrent { transfer, peer_limit, .. } = &mut next else { continue; };
+                                        let peer_changed = *peer_limit != Some(usize::from(settings.max_peers));
+                                        *transfer = settings;
+                                        *peer_limit = Some(usize::from(settings.max_peers));
+                                        // Capacity is immutable upstream. Re-add only this torrent with
+                                        // pinned storage and resolved metadata in the SAME session.
+                                        if peer_changed {
+                                            let resume = !matches!(handle.stats().state, TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true });
+                                            match restart_for_check(&session, &handle, &next, session_peer_id.0, &counters, storage_roots.get(&id)).await {
+                                                Ok(checked) => { torrents.insert(id.clone(), checked); checks.insert(id.clone(), CheckRun { resume, require_complete: false }); }
+                                                Err(message) => { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
+                                            }
+                                        } else { handle.set_transfer_settings(settings.engine()); }
+                                        added_commands.insert(id.clone(), next);
+                                        let _ = event_tx.send(SessionEvent::TransferSettingsApplied { id, settings });
+                                    }
                                     SessionCommand::SetDownloadMode { id, config } => {
                                         let active = active_modes.get(&id).copied();
                                         if !torrents.contains_key(&id) || config.validate().is_err() {
@@ -488,6 +538,7 @@ impl SessionRuntime {
                                         }
                                     }
                                     SessionCommand::AddTorrent {
+                                        transfer,
                                         repair_policy,
                                         verify_after_download: _,
                                         download_mode,
@@ -507,6 +558,7 @@ impl SessionRuntime {
                                             continue;
                                         }
                                         if let Err(message) = repair_policy.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
+                                        if let Err(message) = transfer.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
                                         let root=match prepared.as_ref().map(|p|Ok(p.directory.clone())).unwrap_or_else(||crate::storage::sandbox::Directory::create_root(std::path::Path::new(&output_folder))) {
                                             Ok(root)=>root,
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
@@ -538,6 +590,7 @@ impl SessionRuntime {
                                                         overwrite: true,
                                                         output_folder: Some(output_folder),
                                                         peer_limit,
+                                                        ratelimits: transfer.engine().limits,
                                                         trackers: (!trackers.is_empty()).then_some(trackers),
                                                         ..Default::default()
                                                     }),
@@ -552,6 +605,7 @@ impl SessionRuntime {
                                             })
                                         }) {
                                             Ok(handle) => {
+                                                handle.set_transfer_settings(transfer.engine());
                                                 storage_roots.insert(id.clone(),root);
                                                 added_commands.insert(id.clone(), saved_command);
                                                 if let Some(registration) = registration {
@@ -635,6 +689,7 @@ impl SessionRuntime {
                                                 pending_resume.remove(&id);
                                                 repairs.remove(&id);
                                                 manual_repairs.remove(&id);
+                                                seeding_clocks.remove(&id);
                                                 SessionEvent::Removed { id }
                                             },
                                             Err(message) => SessionEvent::Error { id, message },
@@ -1171,6 +1226,7 @@ mod tests {
                 only_files: None,
                 trackers: vec![tracker_url],
                 paused: false,
+                transfer: Default::default(),
                 peer_limit: Some(5),
                 download_mode: mode,
                 freeze_after_bytes: 8192,
@@ -1465,6 +1521,7 @@ mod tests {
                 only_files: Some(vec![0]),
                 trackers: vec![],
                 paused: false,
+                transfer: Default::default(),
                 peer_limit: Some(2),
                 download_mode: DownloadMode::Normal,
                 freeze_after_bytes: 1,
@@ -1679,6 +1736,7 @@ mod tests {
                     only_files: None,
                     trackers: vec![],
                     paused: false,
+                    transfer: Default::default(),
                     peer_limit: Some(1),
                     download_mode: DownloadMode::Normal,
                     freeze_after_bytes: 1,
@@ -1820,6 +1878,7 @@ mod tests {
                     only_files: None,
                     trackers: vec![],
                     paused: false,
+                    transfer: Default::default(),
                     peer_limit: Some(1),
                     download_mode: DownloadMode::Normal,
                     freeze_after_bytes: 1,

@@ -91,6 +91,9 @@ jobs:
         run: cargo +stable test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
       - name: Run documentation tests
         run: cargo +stable test --locked ${{ matrix.features }} --doc -p peerlume -p librqbit-tracker-comms
+      - name: Test the isolated runtime patch
+        if: matrix.cache == 'tui'
+        run: cargo +stable test --manifest-path vendor/librqbit/Cargo.toml --target-dir target --no-default-features --features rust-tls --lib peerlume
       - name: Build installed Windows application and adapters
         if: runner.os == 'Windows'
         run: cargo +stable build --locked --all-features --bins

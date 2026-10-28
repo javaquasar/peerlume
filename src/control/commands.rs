@@ -33,6 +33,7 @@ pub enum TorrentCommand {
     SetRepairPolicy(RepairPolicy),
     SetVerifyAfterDownload(bool),
     SetFiles(Vec<usize>),
+    SetTransferSettings(crate::transfer_settings::TransferSettings),
     Remove,
 }
 
@@ -52,6 +53,7 @@ pub enum CommandError {
     InvalidMode,
     InvalidRepairPolicy,
     InvalidFileSelection,
+    InvalidTransferSettings,
     EngineUnavailable,
     QueueFull,
     EngineClosed,
@@ -68,6 +70,9 @@ impl fmt::Display for CommandError {
             Self::InvalidMode => "Invalid download mode metadata or freeze threshold",
             Self::InvalidRepairPolicy => "Repair attempts must be between 1 and 10",
             Self::InvalidFileSelection => "File selection contains duplicate or invalid indices",
+            Self::InvalidTransferSettings => {
+                "Invalid transfer limits, peer count, priority or seed limits"
+            }
             Self::EngineUnavailable => "Transfer engine is unavailable",
             Self::QueueFull => "Transfer command queue is full; retry after refreshing",
             Self::EngineClosed => "Transfer engine command channel is closed",
@@ -92,6 +97,15 @@ impl From<SessionSendError> for CommandError {
 impl TorrentCommand {
     fn prepare(&self, torrent: &TorrentItem, id: String) -> Result<SessionCommand, CommandError> {
         Ok(match self {
+            Self::SetTransferSettings(settings) => {
+                settings
+                    .validate()
+                    .map_err(|_| CommandError::InvalidTransferSettings)?;
+                SessionCommand::SetTransferSettings {
+                    id,
+                    settings: *settings,
+                }
+            }
             Self::Pause => SessionCommand::Pause { id },
             Self::Resume => SessionCommand::Resume { id },
             Self::Recheck => SessionCommand::Recheck { id },

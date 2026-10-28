@@ -51,6 +51,7 @@ impl UpdateKind {
             SessionEvent::Stopped => Self::Stopped,
             SessionEvent::RepairPolicy { .. } | SessionEvent::Repair { .. } => Self::Other,
             SessionEvent::VerifyAfterDownload { .. } => Self::Other,
+            SessionEvent::TransferSettingsApplied { .. } => Self::Other,
             SessionEvent::FilesApplied { .. } => Self::Selection,
         }
     }

@@ -64,4 +64,5 @@ debug = 0
 debug = 0
 
 [patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 librqbit-tracker-comms = { path = "vendor/librqbit-tracker-comms" }

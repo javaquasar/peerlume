@@ -108,6 +108,7 @@ impl Controller {
             | SessionEvent::Error { id, .. }
             | SessionEvent::Removed { id } => Some(id.clone()),
             SessionEvent::VerifyAfterDownload { id, .. }
+            | SessionEvent::TransferSettingsApplied { id, .. }
             | SessionEvent::FilesApplied { id, .. } => Some(id.clone()),
             SessionEvent::Stopped => None,
         };

@@ -59,6 +59,7 @@ impl CheckedFixture {
                 only_files: None,
                 trackers: tracker.into_iter().collect(),
                 paused: true,
+                transfer: Default::default(),
                 peer_limit: Some(1),
             })
             .unwrap();
