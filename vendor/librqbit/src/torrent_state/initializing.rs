@@ -201,10 +201,11 @@ impl TorrentStateInitializing {
             }
             None
         } else {
-            bitv_factory
-                .load(id)
-                .await
-                .context("error loading have_pieces")?
+            if let Some(bits) = self.files.initial_verified_pieces() {
+                Some(BF::from_boxed_slice(bits.into_boxed_slice()).into_dyn())
+            } else {
+                bitv_factory.load(id).await.context("error loading have_pieces")?
+            }
         };
 
         let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;

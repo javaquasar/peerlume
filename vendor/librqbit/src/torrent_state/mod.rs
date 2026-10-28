@@ -178,6 +178,7 @@ impl TorrentMetadata {
 // ManagedTorrent contains the current torrent state, which in turn needs access to a bunch
 // of stuff, but it shouldn't access the state.
 pub struct ManagedTorrentShared {
+    pub(crate) high_priority_files: RwLock<Vec<usize>>,
     pub(crate) transfer: RwLock<TransferSettings>,
     pub(crate) transfer_limits: crate::limits::Limits,
     pub id: TorrentId,
@@ -300,6 +301,17 @@ impl ManagedTorrent {
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
         self.locked.read().only_files.clone()
+    }
+    pub fn verified_pieces(&self) -> anyhow::Result<Vec<u8>> {
+        self.with_chunk_tracker(|chunks| chunks.get_have_pieces().as_bytes().to_vec())
+    }
+    pub fn high_priority_files(&self) -> Vec<usize> { self.shared.high_priority_files.read().clone() }
+    pub fn set_high_priority_files(&self, files: &[usize]) -> anyhow::Result<()> {
+        let count = self.with_metadata(|metadata|metadata.file_infos.len())?;
+        anyhow::ensure!(files.len() <= count && files.iter().all(|index| *index<count), "Invalid file priority indices");
+        *self.shared.high_priority_files.write() = files.to_vec();
+        if let Some(live) = self.live() { live.update_file_priorities(files); }
+        Ok(())
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {

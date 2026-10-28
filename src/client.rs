@@ -3,13 +3,11 @@
 //! Frontends (egui today, ratatui or another UI later) own presentation state,
 //! while this type owns the infrastructure shared by every frontend.
 
-use std::path::PathBuf;
-
 use crate::{
     file_selection::FileSelectionModel,
     metainfo,
     session::{SessionCommand, SessionEvent, SessionRuntime},
-    settings::{ClientSettings, TrackerReportingMode, data_directory},
+    settings::{ClientSettings, data_directory},
     state::{StateStore, StoredFile, StoredTrackerAuditProfile, TorrentRecord},
     torrent::{EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentState},
 };
@@ -33,6 +31,12 @@ pub enum SessionNotice {
 
 pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) -> SessionNotice {
     match event {
+        SessionEvent::FilePrioritiesApplied { id, high } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.files.set_high_priority(&high);
+            }
+            SessionNotice::SettingsApplied { id }
+        }
         SessionEvent::Storage { id, status } => {
             let mut notice = SessionNotice::None;
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
@@ -54,9 +58,14 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             }
             notice
         }
-        SessionEvent::Peers { id, peers } => {
+        SessionEvent::Peers {
+            id,
+            peers,
+            queue_waiting,
+        } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 torrent.runtime.diagnostics.peers = peers;
+                torrent.runtime.diagnostics.queue_waiting = queue_waiting;
             }
             SessionNotice::None
         }
@@ -360,7 +369,11 @@ pub fn torrent_to_record(
                 size_bytes: file.size_bytes,
                 downloaded_bytes: file.downloaded_bytes,
                 selected: file.selected,
-                priority: 0,
+                priority: if torrent.files.is_high_priority(index) {
+                    1
+                } else {
+                    0
+                },
             })
             .collect(),
         verified_pieces: Vec::new(),
@@ -403,7 +416,13 @@ pub fn mode_submission_failed(
 }
 
 pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> TorrentItem {
-    let files = FileSelectionModel::from_snapshot(record.files.into_iter().map(|file| {
+    let high = record
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| (file.priority > 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut files = FileSelectionModel::from_snapshot(record.files.into_iter().map(|file| {
         (
             file.path,
             file.size_bytes,
@@ -411,6 +430,7 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
             file.selected,
         )
     }));
+    files.set_high_priority(&high);
     let downloaded_bytes = files.selected_downloaded();
     let mut info_hashes = Vec::new();
     if let Some(hash) = record.info_hash_v1 {
@@ -534,20 +554,18 @@ impl ClientBackend {
                     .join("; ")
             ));
         }
-        let state_store = StateStore::open(&data_directory().join("state.sqlite3"))
+        let mut state_store = StateStore::open(&data_directory().join("state.sqlite3"))
             .map_err(|e| format!("Cannot open persistent state; engine not started: {e}"))?;
+        state_store
+            .recover_storage_moves(&data_directory(), &settings.download.download_directory)?;
         state_store
             .load_all_torrents()
             .map_err(|e| format!("Cannot restore persistent state; engine not started: {e}"))?;
         let backend = Self {
             state_store: Some(state_store),
             session_runtime: Some(
-                SessionRuntime::start(
-                    256,
-                    PathBuf::from(&settings.download.download_directory),
-                    settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
-                )
-                .map_err(|e| format!("Cannot start transfer engine: {e}"))?,
+                SessionRuntime::start_configured(256, settings)
+                    .map_err(|e| format!("Cannot start transfer engine: {e}"))?,
             ),
             startup_error: None,
         };
@@ -590,7 +608,8 @@ impl ClientBackend {
             |store| {
                 store
                     .save_torrent(torrent)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                store.acknowledge_storage_move(torrent)
             },
         )
     }

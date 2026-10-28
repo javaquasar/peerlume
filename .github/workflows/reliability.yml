@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -45,7 +45,7 @@ jobs:
         run: |
           mkdir -p swarm-results
           export PEERLUME_SWARM_REPORT="$PWD/swarm-results/resources.jsonl"
-          cargo +stable test --locked --no-default-features --lib reliability_realistic_swarm_soak -- --ignored --test-threads=1 --nocapture
+          cargo +1.93.0 test --locked --no-default-features --lib reliability_realistic_swarm_soak -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -80,7 +80,7 @@ jobs:
         run: |
           mkdir -p continuous-results
           export PEERLUME_SOAK_REPORT="$PWD/continuous-results/resources.jsonl"
-          cargo +stable test --locked --no-default-features --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
+          cargo +1.93.0 test --locked --no-default-features --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - name: Install isolated software-rendered desktop tools
         run: sudo apt-get update && sudo apt-get install -y dbus xvfb openbox xdotool xclip imagemagick tesseract-ocr libgl1-mesa-dri libegl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libxi-dev libxrandr-dev
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -108,14 +108,14 @@ jobs:
           key: ${{ runner.os }}-native-x11-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
       - name: Test status filter, application icon and Linux file navigation
         run: |
-          cargo +stable test --locked --lib app::file_location
-          cargo +stable test --locked --lib app::icon
-          cargo +stable test --locked --lib app::status_filter
-          cargo +stable test --locked --lib app::name_column
-          cargo +stable test --locked --lib app::file_scroll_tests
-          cargo +stable test --locked --lib app::torrent_panes
-          cargo +stable test --locked --lib app::upload_ratio
-      - run: cargo +stable build --locked --features tui --bin peerlume --bin peerlume-control
+          cargo +1.93.0 test --locked --lib app::file_location
+          cargo +1.93.0 test --locked --lib app::icon
+          cargo +1.93.0 test --locked --lib app::status_filter
+          cargo +1.93.0 test --locked --lib app::name_column
+          cargo +1.93.0 test --locked --lib app::file_scroll_tests
+          cargo +1.93.0 test --locked --lib app::torrent_panes
+          cargo +1.93.0 test --locked --lib app::upload_ratio
+      - run: cargo +1.93.0 build --locked --features tui --bin peerlume --bin peerlume-control
       - name: Operate the actual installed GUI and collect screenshots
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
@@ -142,7 +142,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -150,11 +150,11 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ runner.os }}-frontends-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-      - run: cargo +stable build --locked --all-features --bin peerlume-control
+      - run: cargo +1.93.0 build --locked --all-features --bin peerlume-control
       - shell: pwsh
         run: |
           $env:PEERLUME_CONTROL_BIN=(Resolve-Path target/debug/peerlume-control.exe).Path
-          cargo +stable test --locked --all-features --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
+          cargo +1.93.0 test --locked --all-features --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
   linux-secrets:
     name: Isolated Linux Secret Service
     runs-on: ubuntu-latest
@@ -163,7 +163,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -177,7 +177,7 @@ jobs:
           dbus-run-session -- bash -euc '
             export XDG_DATA_HOME="$(mktemp -d)"
             printf "%s" "ci-disposable-keyring-password" | gnome-keyring-daemon --unlock --components=secrets
-            cargo +stable test --locked --no-default-features --test credential_storage real_linux_secret_service_round_trip -- --ignored --test-threads=1
+            cargo +1.93.0 test --locked --no-default-features --test credential_storage real_linux_secret_service_round_trip -- --ignored --test-threads=1
           '
   resources:
     name: Local transfer and IPC resource soak
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -207,7 +207,7 @@ jobs:
           mkdir -p reliability-results
           export PEERLUME_SOAK_SECONDS="$seconds"
           export PEERLUME_SOAK_REPORT="$PWD/reliability-results/resources.jsonl"
-          cargo +stable test --locked --no-default-features --lib reliability_resource_soak -- --ignored --test-threads=1 --nocapture
+          cargo +1.93.0 test --locked --no-default-features --lib reliability_resource_soak -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:

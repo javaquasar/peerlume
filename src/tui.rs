@@ -1531,12 +1531,18 @@ impl TuiApp {
                     .files
                     .files()
                     .iter()
+                    .enumerate()
                     .skip(start)
                     .take(height)
-                    .map(|file| {
+                    .map(|(index, file)| {
                         ListItem::new(format!(
-                            "[{}] {}  {} / {}",
+                            "[{}] {}{}  {} / {}",
                             if file.selected { 'x' } else { ' ' },
+                            if torrent.files.is_high_priority(index) {
+                                "[high] "
+                            } else {
+                                ""
+                            },
                             file.path,
                             format_size(file.downloaded_bytes),
                             format_size(file.size_bytes)

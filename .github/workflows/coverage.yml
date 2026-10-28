@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install stable Rust and matching LLVM tools
-        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+        run: rustup toolchain install 1.93.0 --profile minimal --component llvm-tools-preview
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -36,23 +36,23 @@ jobs:
             ~/.cargo/git/db
             .tools/coverage
             target/coverage-build
-          key: ${{ runner.os }}-coverage-0.9.1-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/coverage.yml') }}
+          key: ${{ runner.os }}-coverage-0.9.1-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/coverage.yml') }}
       - name: Install pinned coverage tool
         shell: bash
         run: |
           if [ ! -x .tools/coverage/bin/cargo-llvm-cov ]; then
-            cargo +stable install cargo-llvm-cov --locked --version 0.9.1 --root .tools/coverage
+            cargo +1.93.0 install cargo-llvm-cov --locked --version 0.9.1 --root .tools/coverage
           fi
           echo "$GITHUB_WORKSPACE/.tools/coverage/bin" >> "$GITHUB_PATH"
       - name: Run instrumented core and TUI tests
         run: |
           mkdir -p coverage
-          cargo +stable llvm-cov clean --workspace
-          cargo +stable llvm-cov --locked --no-default-features --features tui --all-targets -p peerlume -p librqbit-tracker-comms --no-report
+          cargo +1.93.0 llvm-cov clean --workspace
+          cargo +1.93.0 llvm-cov --locked --no-default-features --features tui --all-targets -p peerlume -p librqbit-tracker-comms --no-report
       - name: Include the rendered TUI and copied external adapter workflow
         run: |
           export PEERLUME_CONTROL_BIN="$PWD/target/coverage-build/llvm-cov-target/debug/peerlume-control"
-          cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
+          cargo +1.93.0 llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_installed_frontend_workflow -- --ignored --test-threads=1
       - name: Include continuous-session download, seeding and repair
         run: |
           for mode in normal no_progress; do
@@ -60,7 +60,7 @@ jobs:
             export PEERLUME_SOAK_SECONDS=60
             export PEERLUME_SOAK_MODE="$mode"
             export PEERLUME_SOAK_REPORT="$PWD/coverage/continuous-$mode/resources.jsonl"
-            cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
+            cargo +1.93.0 llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_continuous_session_soak -- --ignored --test-threads=1 --nocapture
           done
       - name: Include streamed multi-file swarm and network fault recovery
         env:
@@ -69,12 +69,12 @@ jobs:
         run: |
           mkdir -p coverage/swarm
           export PEERLUME_SWARM_REPORT="$PWD/coverage/swarm/resources.jsonl"
-          cargo +stable llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_realistic_swarm_soak -- --ignored --test-threads=1 --nocapture
+          cargo +1.93.0 llvm-cov test --locked --no-report --no-default-features --features tui --lib reliability_realistic_swarm_soak -- --ignored --test-threads=1 --nocapture
       - name: Generate LCOV and HTML reports without rerunning tests
         run: |
-          cargo +stable llvm-cov report --json --summary-only --output-path coverage/summary.json
-          cargo +stable llvm-cov report --lcov --output-path coverage/lcov.info
-          cargo +stable llvm-cov report --html --output-dir coverage/html
+          cargo +1.93.0 llvm-cov report --json --summary-only --output-path coverage/summary.json
+          cargo +1.93.0 llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo +1.93.0 llvm-cov report --html --output-dir coverage/html
           jq -r '.data[0].totals | "Linux core/TUI line coverage: \(.lines.percent)%\nFunction coverage: \(.functions.percent)%"' coverage/summary.json >> "$GITHUB_STEP_SUMMARY"
       - name: Reject coverage regression against the measured baseline
         shell: pwsh

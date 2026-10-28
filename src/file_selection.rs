@@ -18,6 +18,7 @@ pub enum FileTreeRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileSelectionModel {
+    high_priority: std::collections::BTreeSet<usize>,
     view_cache: std::sync::Arc<std::sync::Mutex<Option<FileViewCache>>>,
     files: Vec<TorrentFile>,
     rows: Vec<FileTreeRow>,
@@ -35,6 +36,19 @@ struct FileViewCache {
 }
 
 impl FileSelectionModel {
+    pub fn high_priority(&self) -> Vec<usize> {
+        self.high_priority.iter().copied().collect()
+    }
+    pub fn is_high_priority(&self, index: usize) -> bool {
+        self.high_priority.contains(&index)
+    }
+    pub fn set_high_priority(&mut self, indices: &[usize]) {
+        self.high_priority = indices
+            .iter()
+            .copied()
+            .filter(|index| *index < self.files.len())
+            .collect();
+    }
     pub fn from_files(files: impl IntoIterator<Item = (String, u64)>) -> Self {
         Self::from_torrent_files(files.into_iter().map(|(path, size_bytes)| TorrentFile {
             path,

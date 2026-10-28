@@ -55,10 +55,12 @@ Inputs are explicitly allowlisted. The packager does not collect `downloads/`,
 profiles, SQLite databases, logs, secret stores or arbitrary extra target files.
 Existing archive/checksum paths are never overwritten. Actions are SHA-pinned,
 checkout credentials are not persisted, and workflow permissions are read-only.
-No signing keys, release token or user secrets are needed. There is no auto-update,
-installer, signature, SBOM or automatic GitHub Release publication in this workflow.
-Stable Rust may advance between runs; `Cargo.lock` fixes dependencies, while the
-exact compiler is recorded. This is not a byte-for-byte reproducible-build claim.
+No signing keys, release token or user secrets are needed. Separate native
+installers and isolated installation round-trips are described in
+[distribution](distribution.md). There is no auto-update, signature, SBOM or
+automatic GitHub Release publication. Rust 1.93.0 and `Cargo.lock` pin the compiler
+and dependencies; compiler details are recorded in each archive. This is not a
+byte-for-byte reproducible-build claim.
 
 ## Local packaging
 

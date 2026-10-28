@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install stable Rust and quality tools
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt --component clippy
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -36,11 +36,13 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-quality-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-quality-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
       - name: Check formatting
-        run: cargo +stable fmt --all -- --check
+        run: cargo +1.93.0 fmt --all -- --check
       - name: Run strict Clippy checks for both frontends
-        run: cargo +stable clippy --locked --all-features --all-targets -- -D warnings
+        run: |
+          cargo +1.93.0 clippy --locked --all-features --all-targets -- -D warnings
+          cargo +1.93.0 clippy --locked --no-default-features --features tui --all-targets -- -D warnings
       - name: Test the repository language checker
         shell: pwsh
         run: ./scripts/check-english.ps1 -SelfTest
@@ -51,7 +53,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Test Windows and Linux archive packaging contracts
-        run: python -m unittest discover -s scripts -p test_package_build.py -v
+        run: python -m unittest discover -s scripts -p 'test_package*.py' -v
 
   tests:
     name: Tests (${{ matrix.name }})
@@ -78,7 +80,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -86,17 +88,27 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-tests-${{ matrix.cache }}-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-tests-${{ matrix.cache }}-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
       - name: Run application and vendored tracker unit and integration tests
-        run: cargo +stable test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
+        run: cargo +1.93.0 test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
       - name: Run documentation tests
-        run: cargo +stable test --locked ${{ matrix.features }} --doc -p peerlume -p librqbit-tracker-comms
+        # All fixtures below use isolated temporary payloads, never a user profile.
+        run: cargo +1.93.0 test --locked ${{ matrix.features }} --doc -p peerlume -p librqbit-tracker-comms
+      - name: Prove ENOSPC handling on a disposable capacity-limited filesystem
+        if: matrix.cache == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fault_root="$(mktemp -d "$RUNNER_TEMP/peerlume-full-fs-XXXXXX")"
+          trap 'sudo umount "$fault_root"' EXIT
+          sudo mount -t tmpfs -o size=2m,mode=0777 tmpfs "$fault_root"
+          PEERLUME_FULL_FS="$fault_root" cargo +1.93.0 test --locked --no-default-features --lib reliability_storage_disk_full -- --ignored --test-threads=1
       - name: Test the isolated runtime patch
         if: matrix.cache == 'tui'
-        run: cargo +stable test --manifest-path vendor/librqbit/Cargo.toml --target-dir target --no-default-features --features rust-tls --lib peerlume
+        run: cargo +1.93.0 test --manifest-path vendor/librqbit/Cargo.toml --target-dir target --no-default-features --features rust-tls --lib peerlume
       - name: Build installed Windows application and adapters
         if: runner.os == 'Windows'
-        run: cargo +stable build --locked --all-features --bins
+        run: cargo +1.93.0 build --locked --all-features --bins
       - name: Package tested Windows development build
         if: runner.os == 'Windows'
         shell: pwsh
@@ -119,7 +131,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.93.0 --profile minimal
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -127,10 +139,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-docker-stable-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-docker-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
       - name: Verify Docker is available
         run: docker info
       - name: Pull the local tracker and peer fixture image
         run: docker pull python:3.13-alpine
       - name: Run all four Docker integration tests
-        run: cargo +stable test --locked --no-default-features --test container_network -- --ignored --test-threads=1
+        run: cargo +1.93.0 test --locked --no-default-features --test container_network -- --ignored --test-threads=1

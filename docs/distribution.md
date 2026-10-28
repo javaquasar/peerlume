@@ -95,6 +95,21 @@ resolved. Desktop and headless packages conflict intentionally because their
 shared executables occupy the same `/usr/bin` paths. The package installs a
 **user** systemd unit, but has no installation scripts and does not enable or
 start it automatically. Test with `peerlume-daemon --check-config` before use.
-No Windows signing, native installation/uninstallation round-trip, Linux service
-login/keyring environment or other distribution compatibility is implied by a
-successful archive/installer compilation.
+The package workflow also installs, replaces and uninstalls the native package:
+Windows uses a unique installation directory on its disposable runner; Linux uses
+a disposable Ubuntu 24.04 container. Synthetic profile/payload sentinels must
+survive each stage, and installed console binaries must answer offline version
+requests. The tests do not launch the user GUI or enable a service.
+They also abruptly terminate the installed daemon on a new, empty synthetic
+profile, restart that same profile and check committed SQLite state, integrity,
+profile-lock recovery, absence of a false clean-resume marker and payload
+preservation. No production tracker or real swarm is used.
+
+These are same-version replacement tests, not proof of every historical schema
+upgrade. Windows signing, the real Linux service login/keyring environment and
+other distribution compatibility remain separate gates.
+
+The repository pins Rust 1.93.0 for local and CI builds. The separately instrumented
+fuzz campaign keeps its explicitly pinned nightly toolchain. The Tests workflow
+also exercises genuine ENOSPC on a disposable 2 MiB tmpfs and storage regressions
+for access denial, cancellation and interrupted move recovery.

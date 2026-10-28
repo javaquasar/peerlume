@@ -20,8 +20,28 @@ one small transaction every five seconds, without rewriting tracker credentials
 or file trees. Graceful shutdown drains final engine counters before saving.
 A crash can lose activity since the last checkpoint. Invalid settings, state or
 credential restoration block engine startup with a visible error, not an empty
-successful session. Resume still hashes on-disk data: no unverified fast-resume
-shortcut is claimed.
+successful session.
+
+A clean shutdown can save a bounded (32 MiB) piece-map cache after stopping
+transfers and syncing payload files. Startup invalidates that clean marker before
+opening the engine. A crash, missing/invalid cache, changed storage root, changed
+file identity/length/creation/modification time, move recovery or explicit recheck causes
+normal hashing. Accepted hints still get the engine's sampled piece validation.
+This is metadata-assisted fast resume, not proof against deliberate modifications
+that preserve timestamps; use **Force recheck and repair** for a full audit.
+
+Global download/upload caps now configure the session-wide limiter, in addition
+to per-torrent limits. Listener port/protocols, forwarding, connect timeout, DHT
+and LSD also configure the engine on restart. SOCKS5 without embedded credentials
+routes peer TCP and HTTP(S) trackers; direct incoming, DHT, LSD and UDP trackers
+are disabled in that mode. It is not a VPN or a UDP proxy. Enable
+`proxy_peer_connections`; other proxy schemes and proxy/interface combinations
+are rejected rather than silently bypassed. Linux interface binding is supported;
+Windows all-transport interface binding and explicit IP binding are not supported
+and nonempty values stop startup. Authentication can be provided by a local proxy
+bridge, not plaintext proxy credentials in settings. Per-field support labels
+remain authoritative; alternate scheduling and other stored-only fields are not
+implemented by this change. Existing sessions are not restarted by Apply.
 
 ## Copying or adopting existing payload
 
@@ -35,12 +55,32 @@ layout, refuses overwrite and links, uses pinned capability-relative source path
 and verifies copied bytes by SHA-256 read-back. It then selects the destination
 inside the same engine, hashes torrent pieces and resumes normal missing-piece
 downloads. A failed destination registration attempts to restore the original
-handle paused in the same engine. Original payload is **never deleted**, even on
+handle paused in the same engine. Copy itself **never deletes originals**, even on
 success. Cancel interrupts copying between bounded chunks; the partial destination
 is retained and identified for inspection. Hash checking and repair have their
 usual progress and pause controls. Source and destination may be on different
-volumes; neither a same-volume rename optimization nor automatic source cleanup
-is implemented.
+volumes.
+
+**Fast move directory...** / `:move-data ABSOLUTE_PARENT` avoids payload copying
+on one volume. It requires a paused complete torrent and an exclusive directory:
+no unrelated files, missing data or symlinks; padding-file torrents use verified
+copy instead. Each file is renamed atomically through pinned directories. This
+also preserves Windows directory-confinement locks. Empty original directories
+are retained. A durable move intent precedes the first rename. Startup can finish
+an interrupted move, updates SQLite durably and restores the torrent paused for
+fresh hashing. Duplicate/missing files, changed lengths or ambiguous move chains
+stop recovery without guessing or overwriting. Cross-volume rename is not
+silently converted into a move; choose verified copy explicitly.
+
+After a copy in the current session, pause the complete destination and choose
+**Remove duplicate originals...**, or `:remove-originals CONFIRM`. This is a
+separate explicit permanent-deletion action, not Recycle Bin/Trash. It compares
+every source/destination file before removing any, then revalidates each source.
+Different/changed files are retained. Do not modify either location concurrently.
+The destination is never deleted. Cancellation/error reports the number already
+removed and retains the remaining originals. After restart, the in-memory cleanup
+authority is gone: no automatic original deletion is attempted. These filesystem
+operations are trusted-local actions, not new IPC/MCP capabilities.
 
 ## Views and measured diagnostics
 
@@ -51,12 +91,25 @@ without saving unrelated preference drafts. TUI equivalents are `:sort NAME`,
 `:descending true|false`, `:category TEXT`, `:label TEXT`, `:categorize TEXT` and
 `:save-view`. File search and Tree/Name/Largest-first views are cached independently
 of progress updates. Select all/none still applies to all files, including hidden
-matches; file priorities have not been added by these view controls.
+matches.
+
+File context menus offer High/Normal/Skip. High and Normal priority controls for
+the visible file set support whole folders by filtering their path first. TUI
+uses `:file-priority FILE_NUMBER normal|high|skip` with one-based file numbers.
+High priority changes the real piece-picker file order; explicitly prioritized
+files outrank global sequential ordering. Skip uses the existing selection map:
+pieces shared with selected files may still be received. Priorities persist and
+survive rechecks; the saved model changes only after an engine acknowledgement.
 
 Status reports observed activity, not guessed network diagnoses. GUI graphs keep
-at most 120 sampled rate points; missing time is not reconstructed. Peers displays
+at most 120 sampled rate points on a real elapsed-time axis; gaps over three
+seconds are not connected. Engine-confirmed queue admission distinguishes
+waiting for a slot from an idle connected swarm. Peers displays
 up to 128 live endpoint/client/state/counter/error snapshots in both frontends.
 These local peer addresses are not added to the redacted public observation API.
+**Export redacted diagnostics...** / `:diagnostics ABSOLUTE_NEW_FILE` exports
+bounded sampled rates, counters and observed activity without names, paths, URLs,
+peer addresses or free-form errors. Existing reports are never overwritten.
 
 ## Showing a file in its folder
 

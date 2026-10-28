@@ -118,6 +118,8 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 }
 
 pub trait TorrentStorage: Send + Sync {
+    /// One-shot pieces from a host clean-stop cache. Default: full check.
+    fn initial_verified_pieces(&self) -> Option<Vec<u8>> { None }
     // Create/open files etc.
     fn init(
         &mut self,
@@ -171,6 +173,7 @@ pub trait TorrentStorage: Send + Sync {
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+    fn initial_verified_pieces(&self) -> Option<Vec<u8>> { (**self).initial_verified_pieces() }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         (**self).pread_exact(file_id, offset, buf)
     }

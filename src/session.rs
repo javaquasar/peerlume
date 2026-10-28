@@ -47,6 +47,17 @@ fn read_metainfo_snapshot(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionCommand {
+    MoveStorage {
+        id: String,
+        parent: String,
+    },
+    CleanupStorage {
+        id: String,
+    },
+    SetFilePriorities {
+        id: String,
+        high: Vec<usize>,
+    },
     SelectStorage {
         id: String,
         directory: String,
@@ -119,6 +130,10 @@ pub enum SessionCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    FilePrioritiesApplied {
+        id: String,
+        high: Vec<usize>,
+    },
     Storage {
         id: String,
         status: crate::storage::relocation::StorageStatus,
@@ -126,6 +141,7 @@ pub enum SessionEvent {
     Peers {
         id: String,
         peers: Vec<crate::diagnostics::PeerSnapshot>,
+        queue_waiting: bool,
     },
     TransferSettingsApplied {
         id: String,
@@ -193,6 +209,9 @@ impl SessionCommand {
     fn target_id(&self) -> Option<&str> {
         match self {
             Self::AddTorrent { id, .. }
+            | Self::MoveStorage { id, .. }
+            | Self::CleanupStorage { id }
+            | Self::SetFilePriorities { id, .. }
             | Self::Pause { id }
             | Self::Resume { id }
             | Self::Remove { id }
@@ -238,6 +257,21 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    pub fn start_configured(
+        capacity: usize,
+        settings: &crate::settings::ClientSettings,
+    ) -> Result<Self, String> {
+        let options = crate::network_settings::options(settings)?;
+        let cache = crate::resume::Cache::begin(&crate::settings::data_directory())
+            .map_err(|_| "Cannot invalidate the old clean-resume cache")?;
+        Self::start_with_cache(
+            capacity,
+            PathBuf::from(&settings.download.download_directory),
+            options,
+            AnnounceJournal::open(&crate::settings::data_directory().join("announce-logs")),
+            Some(cache),
+        )
+    }
     pub fn start(
         capacity: usize,
         default_output_folder: PathBuf,
@@ -271,8 +305,18 @@ impl SessionRuntime {
     fn start_with_journal(
         capacity: usize,
         default_output_folder: PathBuf,
+        options: SessionOptions,
+        journal: AnnounceJournal,
+    ) -> Result<Self, String> {
+        Self::start_with_cache(capacity, default_output_folder, options, journal, None)
+    }
+
+    fn start_with_cache(
+        capacity: usize,
+        default_output_folder: PathBuf,
         mut options: SessionOptions,
         journal: AnnounceJournal,
+        mut resume_cache: Option<crate::resume::Cache>,
     ) -> Result<Self, String> {
         if capacity == 0 {
             return Err("channel capacity must be greater than zero".into());
@@ -364,11 +408,14 @@ impl SessionRuntime {
                     let mut initializing = std::collections::HashSet::<String>::new();
                     let mut active_modes = HashMap::<String, ModeConfig>::new();
                     let mut pending_modes = HashMap::<String, ModeConfig>::new();
+                    let mut pending_file_priorities=HashMap::<String,Vec<usize>>::new();
                     let mut pending_resume = std::collections::HashSet::<String>::new();
                     let mut repairs = HashMap::<String, RepairBudget>::new();
                     let mut manual_repairs = std::collections::HashSet::<String>::new();
                     let mut seeding_clocks = HashMap::<String, crate::transfer_settings::SeedingClock>::new();
                     let mut copy_jobs = HashMap::<String, crate::storage::relocation::CopyJob>::new();
+                    let mut cleanup_sources = HashMap::<String,(crate::storage::sandbox::Directory,Vec<(PathBuf,u64)>)>::new();
+                    let mut storage_recovery_required=std::collections::HashSet::<String>::new();
                     let mut pending_storage = HashMap::<String,(crate::storage::sandbox::Directory,String)>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -385,8 +432,19 @@ impl SessionRuntime {
                                 for (id,result) in finished {
                                     let job=copy_jobs.remove(&id).expect("known copy");
                                     match result {
-                                        Ok(())=>{pending_storage.insert(id,(job.root.clone(),job.destination.clone()));}
-                                        Err(message)=>{let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message:format!("{message}; originals retained; destination: {}",job.destination)}});}
+                                        Ok(())=>{
+                                            if job.cleanup {
+                                                cleanup_sources.remove(&id);
+                                                let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::OriginalsRemoved{destination:job.destination.clone(),removed_files:job.removed.load(std::sync::atomic::Ordering::Relaxed)}});
+                                            } else {
+                                                cleanup_sources.insert(id.clone(),(job.source.clone(),job.files.clone()));
+                                                pending_storage.insert(id,(job.root.clone(),job.destination.clone()));
+                                            }
+                                        }
+                                        Err(message)=>{
+                                            let message=if job.cleanup {format!("{message}; {} duplicate originals permanently removed before interruption; destination retained: {}",job.removed.load(std::sync::atomic::Ordering::Relaxed),job.destination)} else {format!("{message}; originals retained; partial destination: {}",job.destination)};
+                                            let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message}});
+                                        }
                                     }
                                 }
                                 for (id,(root,directory)) in std::mem::take(&mut pending_storage) {
@@ -403,6 +461,12 @@ impl SessionRuntime {
                                             let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Checking{destination:directory}});
                                         }
                                         Err(message)=>{
+                                            if let SessionCommand::AddTorrent{output_folder,..}=&previous
+                                                && (!std::path::Path::new(output_folder).exists() || pending_incomplete_move(&id, storage_roots.get(&id), torrents.get(&id))) {
+                                                storage_recovery_required.insert(id.clone());
+                                                let _=event_tx.send(SessionEvent::Error{id,message:format!("{message}; renamed data and move journal retained; restart to recover the directory before further commands")});
+                                                continue;
+                                            }
                                             let mut recovered=false;
                                             if let (Some(bytes),Some(previous_root))=(previous_bytes,previous_root)
                                                 && let Ok(restored)=verification::add_for_check(&session,bytes,&previous,previous_root).await {
@@ -415,6 +479,12 @@ impl SessionRuntime {
                                 let torrent_ids: Vec<_> = torrents.keys().cloned().collect();
                                 for id in torrent_ids {
                                     let Some(handle) = torrents.get(&id).cloned() else { continue; };
+                                    if !matches!(handle.stats().state,TorrentStatsState::Initializing{..}) && handle.with_metadata(|_|()).is_ok() && let Some(high)=pending_file_priorities.remove(&id) {
+                                        match handle.set_high_priority_files(&high) {
+                                            Ok(())=>{let _=event_tx.send(SessionEvent::FilePrioritiesApplied{id:id.clone(),high});},
+                                            Err(_)=>{let _=event_tx.send(SessionEvent::Error{id:id.clone(),message:"Invalid deferred file priorities".into()});}
+                                        }
+                                    }
                                     if check_failed.contains(&id) && !pending_modes.contains_key(&id) { continue; }
                                     let transfer_snapshot = transfers(handle.info_hash().0);
                                     let _ = event_tx.send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded, seeded_seconds: seeding_clocks.get_mut(&id).map(|clock| clock.sample(std::time::Instant::now(), false).as_secs()).unwrap_or(0) });
@@ -532,7 +602,7 @@ impl SessionRuntime {
                                         downloaded: peer.counters.fetched_bytes, uploaded: peer.counters.uploaded_bytes, errors: peer.counters.errors,
                                     }).collect::<Vec<_>>()).unwrap_or_default();
                                     peer_details.sort_by(|a,b| a.address.cmp(&b.address)); peer_details.truncate(128);
-                                    let _ = event_tx.send(SessionEvent::Peers { id: id.clone(), peers: peer_details });
+                                    let _ = event_tx.send(SessionEvent::Peers { id: id.clone(), peers: peer_details, queue_waiting: !stats.finished && !paused && !handle.download_admitted() });
                                     let _ = event_tx.send(SessionEvent::Stats {
                                         id: id.clone(),
                                         downloaded_bytes: stats.progress_bytes,
@@ -552,6 +622,9 @@ impl SessionRuntime {
                                     SessionCommand::PreparedAdd{command,prepared} if matches!(*command,SessionCommand::AddTorrent{..})=>(*command,Some(prepared)),
                                     other=>(other,None),
                                 };
+                                if let Some(id)=command.target_id().filter(|id|storage_recovery_required.contains(*id)) {
+                                    let _=event_tx.send(SessionEvent::Error{id:id.into(),message:"Storage move requires journal recovery on restart; destination retained; no more commands accepted for this torrent".into()});continue;
+                                }
                                 if let Some(id)=command.target_id().filter(|id|copy_jobs.contains_key(*id)||pending_storage.contains_key(*id))
                                     && !matches!(command,SessionCommand::CancelStorage{..}) {
                                     let _=event_tx.send(SessionEvent::Storage{id:id.to_owned(),status:crate::storage::relocation::StorageStatus::Failed{message:"Copy is active; cancel it before changing this torrent. Originals retained.".into()}});continue;
@@ -590,6 +663,52 @@ impl SessionRuntime {
                                 if let SessionCommand::AddTorrent { repair_policy, verify_after_download, .. } = &mut saved_command { *verify_after_download |= repair_policy.enabled; }
                                 match command {
                                     SessionCommand::CancelStorage{id}=>{if let Some(job)=copy_jobs.get(&id){job.cancel();}}
+                                    SessionCommand::MoveStorage{id,parent}=>{
+                                        let result=(||->Result<(),String>{
+                                            let handle=torrents.get(&id).ok_or("Torrent unavailable")?;
+                                            if checks.contains_key(&id)||!matches!(handle.stats().state,TorrentStatsState::Paused)||!handle.stats().finished {return Err("Pause a complete torrent before fast move".into());}
+                                            let root=storage_roots.get(&id).ok_or("Pinned storage unavailable")?;
+                                            let Some(SessionCommand::AddTorrent{output_folder,..})=added_commands.get(&id) else {return Err("Storage unavailable".into())};
+                                            let files=handle.with_metadata(|metadata|{
+                                                if metadata.file_infos.iter().any(|file|file.attrs.padding) {None}
+                                                else {Some(metadata.file_infos.iter().map(|file|(file.relative_filename.clone(),file.len)).collect())}
+                                            }).map_err(|_|"Metadata unavailable")?.ok_or("Padding-file torrents require verified copy")?;
+                                            let moved=crate::storage::move_plan::prepare(&crate::settings::data_directory(),&id,std::path::Path::new(output_folder),std::path::Path::new(&parent),root,files).map_err(|error|format!("Fast move failed: {error}; use verified copy for shared roots or different volumes. Check the destination before retrying."))?;
+                                            cleanup_sources.remove(&id);
+                                            pending_storage.insert(id.clone(),moved);
+                                            Ok(())
+                                        })();
+                                        if let Err(message)=result{
+                                            if let Some(SessionCommand::AddTorrent{output_folder,..})=added_commands.get(&id)
+                                                && (!std::path::Path::new(output_folder).exists() || pending_incomplete_move(&id, storage_roots.get(&id), torrents.get(&id))) {storage_recovery_required.insert(id.clone());}
+                                            let _=event_tx.send(SessionEvent::Error{id,message});
+                                        }
+                                    }
+                                    SessionCommand::CleanupStorage{id}=>{
+                                        let result=(||->Result<(),String>{
+                                            let handle=torrents.get(&id).ok_or("Torrent unavailable")?;
+                                            if checks.contains_key(&id) || !matches!(handle.stats().state,TorrentStatsState::Paused) || !handle.stats().finished {
+                                                return Err("Pause a completely checked destination before removing originals".into());
+                                            }
+                                            let (source,files)=cleanup_sources.get(&id).ok_or("No originals from a copy in this session; nothing removed")?.clone();
+                                            let target=storage_roots.get(&id).ok_or("Destination unavailable")?.clone();
+                                            let Some(SessionCommand::AddTorrent{output_folder,..})=added_commands.get(&id) else {return Err("Destination unavailable".into())};
+                                            let job=crate::storage::relocation::CopyJob::cleanup(source,target,output_folder.clone(),files).map_err(|_|"Cannot start cleanup worker")?;
+                                            copy_jobs.insert(id.clone(),job);
+                                            Ok(())
+                                        })();
+                                        if let Err(message)=result {let _=event_tx.send(SessionEvent::Error{id,message});}
+                                    }
+                                    SessionCommand::SetFilePriorities{id,high}=>{
+                                        if torrents.get(&id).is_some_and(|handle|handle.with_metadata(|_|()).is_err() || matches!(handle.stats().state,TorrentStatsState::Initializing{..})) {
+                                            pending_file_priorities.insert(id,high);continue;
+                                        }
+                                        let result=torrents.get(&id).ok_or("Torrent unavailable".to_owned()).and_then(|handle|handle.set_high_priority_files(&high).map_err(|_|"Invalid priorities or unresolved metadata".to_owned()));
+                                        match result {
+                                            Ok(())=>{let _=event_tx.send(SessionEvent::FilePrioritiesApplied{id,high});}
+                                            Err(message)=>{let _=event_tx.send(SessionEvent::Error{id,message});}
+                                        }
+                                    }
                                     SessionCommand::SelectStorage{id,directory,copy}=>{
                                         let result=(||->Result<(),String>{
                                             let handle=torrents.get(&id).ok_or("Torrent unavailable")?;
@@ -601,6 +720,7 @@ impl SessionRuntime {
                                                 let job=crate::storage::relocation::CopyJob::start(source,path,files).map_err(|error|error.to_string())?;
                                                 copy_jobs.insert(id.clone(),job);
                                             }else{
+                                                cleanup_sources.remove(&id);
                                                 let root=crate::storage::sandbox::Directory::open(path).map_err(|error|error.to_string())?;
                                                 pending_storage.insert(id.clone(),(root,directory));
                                             }
@@ -680,6 +800,7 @@ impl SessionRuntime {
                                             Ok(root)=>root,
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
                                         };
+                                        if let Some(bits) = resume_cache.as_mut().and_then(|cache|cache.take(&id,&output_folder,&root)) { root.supply_resume(bits); }
                                         let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes, upload_ratio) {
                                             Ok(registration) => registration,
                                             Err(message) => {
@@ -803,6 +924,8 @@ impl SessionRuntime {
                                                 reporting_policies.remove(&id);
                                                 active_modes.remove(&id);
                                                 pending_modes.remove(&id);
+                                                pending_file_priorities.remove(&id);
+                                                cleanup_sources.remove(&id);
                                                 pending_resume.remove(&id);
                                                 repairs.remove(&id);
                                                 manual_repairs.remove(&id);
@@ -821,6 +944,16 @@ impl SessionRuntime {
                                         let final_samples: Vec<_> = torrents.values().map(|h| final_transfer_sampler(h, &counters)).collect();
                                         librqbit_tracker_comms::stop_session_announces(session_peer_id.0).await;
                                         session.stop().await;
+                                        if let Some(cache) = resume_cache.as_mut() {
+                                            let snapshots = torrents.iter().filter_map(|(id,handle)| {
+                                                let root = storage_roots.get(id)?.clone();
+                                                let SessionCommand::AddTorrent {output_folder,..} = added_commands.get(id)? else {return None};
+                                                let bits = handle.verified_pieces().ok()?;
+                                                let paths = handle.with_metadata(|metadata|metadata.file_infos.iter().filter(|file|!file.attrs.padding).map(|file|file.relative_filename.to_string_lossy().into_owned()).collect()).ok()?;
+                                                Some((id.clone(),output_folder.clone(),bits,root,paths))
+                                            }).collect();
+                                            if cache.checkpoint(snapshots).is_err() { let _=event_tx.send(SessionEvent::Error{id:String::new(),message:"Clean-resume checkpoint failed; next start will perform a full check".into()}); }
+                                        }
                                         for sample in final_samples { sample(); }
                                         for (id,handle) in &torrents {
                                             let totals=counters.lock().unwrap_or_else(|error|error.into_inner()).get(&handle.info_hash().0).map(|counter|counter.total).unwrap_or_default();
@@ -1074,6 +1207,36 @@ mod verification_tests;
 pub(crate) fn reliability_transfer_cycle() {
     multi_peer_tests::different_torrents_are_verified_after_parallel_download_before_done();
     verification_tests::automatic_repair_fetches_only_the_damaged_piece_and_keeps_the_reporting_mode();
+}
+
+fn pending_incomplete_move(
+    id: &str,
+    root: Option<&crate::storage::sandbox::Directory>,
+    handle: Option<&Arc<ManagedTorrent>>,
+) -> bool {
+    if !crate::storage::move_plan::pending(&crate::settings::data_directory())
+        .map(|plans| plans.iter().any(|(_, plan)| plan.id == id))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let complete = root
+        .zip(handle)
+        .and_then(|(root, handle)| {
+            handle
+                .with_metadata(|metadata| {
+                    metadata
+                        .file_infos
+                        .iter()
+                        .filter(|file| !file.attrs.padding)
+                        .map(|file| (file.relative_filename.clone(), file.len))
+                        .collect::<Vec<_>>()
+                })
+                .ok()
+                .and_then(|files| root.only_payload(&files).ok())
+        })
+        .unwrap_or(false);
+    !complete
 }
 
 #[cfg(test)]

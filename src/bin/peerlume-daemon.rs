@@ -122,6 +122,7 @@ fn main() -> io::Result<()> {
     }
     let owner = Arc::new(Mutex::new(control));
     let host = Host::start(owner.clone(), |control| control, directory)?;
+    println!("PeerLume daemon ready");
     // Signals and bounded diagnostics only; the shared Host pumps the one owner.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

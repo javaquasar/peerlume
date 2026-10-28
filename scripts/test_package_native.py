@@ -2,10 +2,23 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from package_native import windows_script, debian_tree
 
 
 class NativeTests(unittest.TestCase):
+    def test_install_round_trip_refuses_a_developer_machine_before_any_subprocess(self):
+        import contextlib
+        import io
+        import os
+        import sys
+        import verify_native_install
+        with mock.patch.dict(os.environ, {'GITHUB_ACTIONS':'false'}), mock.patch.object(sys,'argv',[
+                'verify-native','--platform','windows-x64','--flavor','desktop','--commit','a'*40]), mock.patch('subprocess.run') as execute, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as failure:
+                verify_native_install.main()
+            self.assertEqual(failure.exception.code,2)
+            execute.assert_not_called()
     def test_windows_per_user_explicit_files_and_no_profile_autostart_or_deletion(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / 'archive'

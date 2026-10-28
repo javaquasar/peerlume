@@ -19,6 +19,7 @@ mod live_history;
 pub mod magnet;
 pub mod metadata;
 pub mod metainfo;
+pub mod network_settings;
 pub mod piece_map;
 #[cfg(feature = "gui")]
 pub mod preferences;

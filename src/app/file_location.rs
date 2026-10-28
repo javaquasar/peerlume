@@ -17,13 +17,17 @@ struct Location {
     select_file: bool,
 }
 
-pub(super) fn context_menu(response: &egui::Response) -> bool {
+pub(super) fn context_menu_extra(
+    response: &egui::Response,
+    extra: impl FnOnce(&mut egui::Ui),
+) -> bool {
     let mut reveal = false;
     response.context_menu(|ui| {
         if ui.button("Show in folder").clicked() {
             reveal = true;
             ui.close();
         }
+        extra(ui);
     });
     reveal
 }

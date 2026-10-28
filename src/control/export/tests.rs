@@ -132,6 +132,28 @@ fn oversized_journal_fails_without_reading_half_a_gigabyte() {
         .write(true)
         .open(journal.path().unwrap())
         .unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let mut returned = 0;
+        // Preserve the large logical file without allocating half a GiB in CI.
+        let result = unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(
+                file.as_raw_handle(),
+                windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            result, 0,
+            "Sparse journal fixture requires a sparse-capable scratch filesystem"
+        );
+    }
     file.set_len(512 * 1024 * 1024 + 1).unwrap();
     assert_eq!(
         start(&journal, "a".into(), output(root.path()), now_ms() + 10_000).err(),

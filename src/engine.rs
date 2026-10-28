@@ -99,8 +99,16 @@ pub fn diff_settings(old: &ClientSettings, new: &ClientSettings) -> SettingsDiff
         "download",
         ApplyMode::NewTorrentsOnly,
     );
-    push(old.queue != new.queue, "queue", ApplyMode::Live);
-    push(old.speed != new.speed, "speed", ApplyMode::Live);
+    push(
+        old.queue != new.queue,
+        "queue",
+        ApplyMode::RestartApplication,
+    );
+    push(
+        old.speed != new.speed,
+        "speed",
+        ApplyMode::RestartApplication,
+    );
 
     push(
         old.connection.max_connections_global != new.connection.max_connections_global
@@ -111,7 +119,7 @@ pub fn diff_settings(old: &ClientSettings, new: &ClientSettings) -> SettingsDiff
                 != new.connection.connection_timeout_seconds
             || old.connection.retry_count != new.connection.retry_count,
         "connection_limits",
-        ApplyMode::Live,
+        ApplyMode::RestartApplication,
     );
     push(
         old.connection.listen_port != new.connection.listen_port
@@ -196,10 +204,10 @@ mod tests {
         new.privacy.tracker_reporting = crate::settings::TrackerReportingMode::Disabled;
 
         let diff = diff_settings(&old, &new);
-        assert_eq!(diff.count_by_mode(ApplyMode::Live), 1);
+        assert_eq!(diff.count_by_mode(ApplyMode::Live), 0);
         assert_eq!(diff.count_by_mode(ApplyMode::NewTorrentsOnly), 1);
         assert_eq!(diff.count_by_mode(ApplyMode::ReconnectPeers), 1);
-        assert_eq!(diff.count_by_mode(ApplyMode::RestartApplication), 2);
+        assert_eq!(diff.count_by_mode(ApplyMode::RestartApplication), 3);
         assert!(diff.changes.contains(&SettingChange {
             key: "privacy.tracker_reporting",
             mode: ApplyMode::RestartApplication,

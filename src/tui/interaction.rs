@@ -262,6 +262,81 @@ impl TuiApp {
             .split_once(' ')
             .unwrap_or((command.trim(), ""));
         match verb {
+            "diagnostics" => {
+                let torrent = self.selected().ok_or("No selected torrent")?;
+                let path = std::path::Path::new(argument);
+                if !path.is_absolute() {
+                    return Err("Use an absolute report path".into());
+                }
+                crate::diagnostics::export(torrent, path)
+                    .map_err(|_| "Could not create report; existing files are never overwritten")?;
+                return Ok("Redacted diagnostics exported".into());
+            }
+            "file-priority" => {
+                let (index, value) = argument
+                    .split_once(' ')
+                    .ok_or("Use: file-priority FILE_NUMBER normal|high|skip")?;
+                let index = index
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .ok_or("File number starts at 1")?;
+                let torrent = self.selected().ok_or("No selected torrent")?;
+                if index >= torrent.files.files().len() {
+                    return Err("File number out of range".into());
+                }
+                let id = torrent.info_hashes.join(";");
+                let mut high = torrent.files.high_priority();
+                high.retain(|value| *value != index);
+                match value.trim() {
+                    "high" => high.push(index),
+                    "normal" => {}
+                    "skip" => {
+                        let files = torrent
+                            .files
+                            .files()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, file)| (i != index && file.selected).then_some(i))
+                            .collect();
+                        self.control
+                            .backend
+                            .send(crate::session::SessionCommand::SetFiles {
+                                id: id.clone(),
+                                only_files: files,
+                            })?;
+                    }
+                    _ => return Err("Priority: normal, high or skip".into()),
+                }
+                self.control.set_file_priorities(&id, high)?;
+                return Ok(COMMAND_ACCEPTED.into());
+            }
+            "remove-originals" => {
+                if argument != "CONFIRM" {
+                    return Err("Permanently remove duplicate originals after revalidation: remove-originals CONFIRM".into());
+                }
+                let id = self
+                    .selected()
+                    .ok_or("No selected torrent")?
+                    .info_hashes
+                    .join(";");
+                self.control.remove_copy_originals(&id)?;
+                return Ok(
+                    "Original cleanup queued; destination retained; inspect result before resuming"
+                        .into(),
+                );
+            }
+            "move-data" => {
+                let id = self
+                    .selected()
+                    .ok_or("No selected torrent")?
+                    .info_hashes
+                    .join(";");
+                self.control.move_storage(&id, argument.into())?;
+                return Ok(
+                    "Fast move queued; exclusive complete directory on one volume required".into(),
+                );
+            }
             "use-data" | "copy-data" => {
                 let id = self
                     .selected()

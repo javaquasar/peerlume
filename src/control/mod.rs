@@ -106,6 +106,7 @@ impl Controller {
         // mode drafts, restored counters and local errors are not acknowledgements.
         let event_id = match &event {
             SessionEvent::Mode { id, .. }
+            | SessionEvent::FilePrioritiesApplied { id, .. }
             | SessionEvent::Storage { id, .. }
             | SessionEvent::Peers { id, .. }
             | SessionEvent::RepairPolicy { id, .. }
@@ -123,6 +124,20 @@ impl Controller {
             SessionEvent::Stopped => None,
         };
         let notice = apply_session_event(&mut self.torrents, event);
+        if let SessionNotice::Added { id } = &notice
+            && let Some(torrent) = self
+                .torrents
+                .iter()
+                .find(|torrent| torrent.info_hashes.join(";") == *id)
+            && !torrent.files.high_priority().is_empty()
+        {
+            let _ = self
+                .backend
+                .send(crate::session::SessionCommand::SetFilePriorities {
+                    id: id.clone(),
+                    high: torrent.files.high_priority(),
+                });
+        }
         let old_len = self.observed.len();
         for torrent in &self.torrents {
             let id = torrent.info_hashes.join(";");
@@ -155,7 +170,9 @@ impl Controller {
         if let SessionNotice::Removed { id } = &notice
             && self.pending_removals.remove(id)
         {
-            if self.backend.remove_torrent(id).is_ok() {
+            if (!self.unpersisted_updates.contains(id) || self.persist_preserving_audit(id).is_ok())
+                && self.backend.remove_torrent(id).is_ok()
+            {
                 self.torrents
                     .retain(|torrent| torrent.info_hashes.join(";") != *id);
                 self.dirty = true;
@@ -316,6 +333,34 @@ impl Controller {
     pub fn cancel_storage(&self, id: &str) -> Result<(), String> {
         self.backend
             .send(crate::session::SessionCommand::CancelStorage { id: id.into() })
+    }
+    pub fn set_file_priorities(&self, id: &str, high: Vec<usize>) -> Result<(), String> {
+        if self.agent.as_ref().is_some_and(|agent| agent.busy(id)) {
+            return Err("Wait for the pending agent operation".into());
+        }
+        self.backend
+            .send(crate::session::SessionCommand::SetFilePriorities {
+                id: id.into(),
+                high,
+            })
+    }
+    /// Caller must obtain an explicit local confirmation. Not exposed over IPC.
+    pub fn remove_copy_originals(&self, id: &str) -> Result<(), String> {
+        if self.agent.as_ref().is_some_and(|agent| agent.busy(id)) {
+            return Err("Wait for the pending agent operation".into());
+        }
+        self.backend
+            .send(crate::session::SessionCommand::CleanupStorage { id: id.into() })
+    }
+    pub fn move_storage(&self, id: &str, parent: String) -> Result<(), String> {
+        if self.agent.as_ref().is_some_and(|agent| agent.busy(id)) {
+            return Err("Wait for the pending agent operation".into());
+        }
+        self.backend
+            .send(crate::session::SessionCommand::MoveStorage {
+                id: id.into(),
+                parent,
+            })
     }
 
     /// Stop the owner before releasing its profile lock. Drain final real network

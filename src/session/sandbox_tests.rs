@@ -12,6 +12,76 @@ fn metadata() -> (Vec<u8>, String) {
     bytes.push(b'e');
     (bytes, id)
 }
+#[test]
+fn cached_pieces_reduce_initial_reads_but_forced_check_hashes_every_piece_and_keeps_file_priority()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let piece = vec![45u8; 16384];
+    let count = 128;
+    let mut info = format!(
+        "d6:lengthi{}e4:name11:payload.bin12:piece lengthi16384e6:pieces{}:",
+        piece.len() * count,
+        20 * count
+    )
+    .into_bytes();
+    for _ in 0..count {
+        info.extend_from_slice(&Sha1::digest(&piece));
+    }
+    info.extend_from_slice(b"7:privatei1ee");
+    let id = format!("v1: {:x}", Sha1::digest(&info));
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend(info);
+    bytes.push(b'e');
+    std::fs::write(temp.path().join("payload.bin"), piece.repeat(count)).unwrap();
+    let root = crate::storage::sandbox::Directory::open(temp.path()).unwrap();
+    root.supply_resume(vec![255; 16]);
+    let runtime = runtime(temp.path());
+    runtime
+        .try_send(SessionCommand::PreparedAdd {
+            command: Box::new(add(&id, &temp.path().join("missing.torrent"), temp.path())),
+            prepared: PreparedTorrent {
+                bytes: bytes.into(),
+                directory: root.clone(),
+            },
+        })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Stats { finished: true, .. })
+    });
+    let sampled = root.read_calls();
+    assert!(
+        sampled > 0 && sampled < 128,
+        "cached check read {sampled} pieces"
+    );
+    runtime
+        .try_send(SessionCommand::SetFilePriorities {
+            id: id.clone(),
+            high: vec![0],
+        })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::FilePrioritiesApplied { .. })
+    });
+    runtime
+        .try_send(SessionCommand::Recheck { id: id.clone() })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::Verification {
+                status: CompletionStatus::Verified,
+                ..
+            }
+        )
+    });
+    assert!(root.read_calls() >= sampled + 128);
+    let engine = runtime.test_engine().unwrap();
+    assert_eq!(
+        engine.with_torrents(|torrents| torrents.next().unwrap().1.high_priority_files()),
+        vec![0]
+    );
+    runtime.shutdown().unwrap();
+}
 fn runtime(root: &Path) -> SessionRuntime {
     SessionRuntime::start_with_options(
         64,

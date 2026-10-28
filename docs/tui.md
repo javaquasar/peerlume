@@ -125,4 +125,14 @@ strict allowlists and extracted binary smoke tests also cover this flavor.
 Linux baseline is Ubuntu 24.04 / glibc 2.39, not Alpine/musl. No X11/Wayland is
 required. Persistent private-tracker credentials still require a DBus session
 and unlocked Secret Service keyring; no plaintext fallback is added for SSH.
-Unsigned artifacts are not installers. See [distribution](distribution.md).
+Portable archives and separate unsigned native installers are available.
+See [distribution](distribution.md) for isolated installation checks and limitations.
+
+Trusted local storage/diagnostic commands include `:move-data ABSOLUTE_PARENT`
+(exclusive complete same-volume payload only), `:remove-originals CONFIRM`
+(permanent duplicate cleanup after a copy in this session), and
+`:diagnostics ABSOLUTE_NEW_FILE` (redacted bounded report; no overwrite).
+`:file-priority FILE_NUMBER high|normal|skip` uses one-based file numbers; a
+`[high]` marker identifies high-priority files. File selection checkboxes remain
+separate from high/normal ordering. See [runtime controls](runtime-controls.md)
+for recheck, recovery and platform limits before using storage commands.

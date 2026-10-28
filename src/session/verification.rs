@@ -29,7 +29,12 @@ pub(super) async fn restart_for_check(
     let deleted = session.delete(handle.id().into(), false).await;
     final_sample();
     deleted.map_err(|_| "Could not stop the torrent for verification".to_owned())?;
-    add_for_check(session, bytes.to_vec(), saved, root).await
+    let high = handle.high_priority_files();
+    let checked = add_for_check(session, bytes.to_vec(), saved, root).await?;
+    checked
+        .set_high_priority_files(&high)
+        .map_err(|_| "Could not restore file priorities")?;
+    Ok(checked)
 }
 
 pub(super) async fn add_for_check(
@@ -38,6 +43,7 @@ pub(super) async fn add_for_check(
     saved: &SessionCommand,
     root: crate::storage::sandbox::Directory,
 ) -> Result<Arc<ManagedTorrent>, String> {
+    root.clear_resume(); // Explicit checks must never consult fast-resume hints.
     let SessionCommand::AddTorrent {
         transfer,
         output_folder,

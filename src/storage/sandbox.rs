@@ -14,7 +14,12 @@ use std::{
 };
 
 #[derive(Clone)]
-pub struct Directory(Arc<Dir>);
+pub struct Directory {
+    dir: Arc<Dir>,
+    resume: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    #[cfg(test)]
+    read_calls: Arc<std::sync::atomic::AtomicU64>,
+}
 impl std::fmt::Debug for Directory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Directory(<pinned>)")
@@ -22,15 +27,36 @@ impl std::fmt::Debug for Directory {
 }
 impl PartialEq for Directory {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.dir, &other.dir)
     }
 }
 impl Eq for Directory {}
 
 impl Directory {
+    #[cfg(test)]
+    pub(crate) fn read_calls(&self) -> u64 {
+        self.read_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn supply_resume(&self, bits: Vec<u8>) {
+        *self
+            .resume
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(bits);
+    }
+    pub(crate) fn clear_resume(&self) {
+        self.resume
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
     /// Only the explicitly selected root uses ambient authority. Descendants never do.
     pub fn open(path: &Path) -> io::Result<Self> {
-        Dir::open_ambient_dir(path, cap_std::ambient_authority()).map(|dir| Self(Arc::new(dir)))
+        Dir::open_ambient_dir(path, cap_std::ambient_authority()).map(|dir| Self {
+            dir: Arc::new(dir),
+            resume: Default::default(),
+            #[cfg(test)]
+            read_calls: Default::default(),
+        })
     }
     pub fn create_root(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
@@ -44,7 +70,9 @@ impl Directory {
                 "Expected one new directory name",
             ));
         }
-        self.0.create_dir(name)?;
+        self.dir.create_dir(name)?;
+        #[cfg(unix)]
+        self.dir.try_clone()?.into_std_file().sync_all()?;
         self.descendant(name)
     }
     pub(crate) fn read_payload(&self, relative: &Path) -> io::Result<File> {
@@ -64,6 +92,99 @@ impl Directory {
         }
         Ok(file.into_std())
     }
+    pub(crate) fn sync_payload(&self, relative: &Path) -> io::Result<()> {
+        let parts = Self::components(relative)?;
+        let (name, parents) = parts
+            .split_last()
+            .ok_or_else(|| io::Error::other("Empty payload path"))?;
+        let dir = self.walk(parents, false)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        dir.open_with(name, &options)?.sync_all()
+    }
+    pub(crate) fn remove_payload(&self, relative: &Path) -> io::Result<()> {
+        self.remove(relative, false)
+    }
+    pub(crate) fn rename_payload(&self, target: &Self, relative: &Path) -> io::Result<()> {
+        let parts = Self::components(relative)?;
+        let (name, parents) = parts
+            .split_last()
+            .ok_or_else(|| io::Error::other("Empty move path"))?;
+        match target.read_payload(relative) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Move destination file exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let identity = same_file::Handle::from_file(self.read_payload(relative)?)?;
+        let from = self.walk(parents, false)?;
+        let to = target.walk(parents, true)?;
+        from.rename(name, &to, name)?;
+        if identity != same_file::Handle::from_file(target.read_payload(relative)?)? {
+            return Err(io::Error::other(
+                "Moved file identity changed; recovery required",
+            ));
+        }
+        target.sync_payload(relative)?;
+        #[cfg(unix)]
+        {
+            from.into_std_file().sync_all()?;
+            to.into_std_file().sync_all()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        Ok(
+            same_file::Handle::from_file(self.dir.try_clone()?.into_std_file())?
+                == same_file::Handle::from_path(path)?,
+        )
+    }
+    /// Reject a shared directory, unexpected files, missing data and links.
+    pub(crate) fn only_payload(&self, files: &[(std::path::PathBuf, u64)]) -> io::Result<bool> {
+        self.payload_subset(files, true)
+    }
+    pub(crate) fn payload_subset(
+        &self,
+        files: &[(std::path::PathBuf, u64)],
+        complete: bool,
+    ) -> io::Result<bool> {
+        use std::collections::{HashMap, HashSet};
+        let expected: HashMap<_, _> = files.iter().cloned().collect();
+        let mut parents = HashSet::new();
+        for path in expected.keys() {
+            Self::components(path)?;
+            let mut parent = path.parent();
+            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                parents.insert(path.to_path_buf());
+                parent = path.parent();
+            }
+        }
+        let mut queue = vec![(self.dir.try_clone()?, std::path::PathBuf::new())];
+        let mut seen = HashSet::new();
+        while let Some((dir, prefix)) = queue.pop() {
+            for entry in dir.entries()? {
+                let entry = entry?;
+                let path = prefix.join(entry.file_name());
+                let kind = entry.file_type()?;
+                if kind.is_dir() && parents.contains(&path) {
+                    queue.push((dir.open_dir_nofollow(entry.file_name())?, path));
+                } else if kind.is_file()
+                    && expected
+                        .get(&path)
+                        .is_some_and(|length| entry.metadata().is_ok_and(|m| m.len() == *length))
+                {
+                    seen.insert(path);
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(!complete || (seen.len() == expected.len() && !seen.is_empty()))
+    }
     fn components(relative: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
         let text = relative
             .to_str()
@@ -82,11 +203,15 @@ impl Directory {
             .collect()
     }
     fn walk(&self, components: &[&std::ffi::OsStr], create: bool) -> io::Result<Dir> {
-        let mut dir = self.0.try_clone()?;
+        let mut dir = self.dir.try_clone()?;
         for name in components {
             if create {
                 match dir.create_dir(name) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        // Persist each new parent link before a move unlinks its source.
+                        #[cfg(unix)]
+                        dir.try_clone()?.into_std_file().sync_all()?;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
                 }
@@ -97,7 +222,12 @@ impl Directory {
     }
     pub fn descendant(&self, relative: &str) -> io::Result<Self> {
         let parts = Self::components(Path::new(relative))?;
-        self.walk(&parts, false).map(|dir| Self(Arc::new(dir)))
+        self.walk(&parts, false).map(|dir| Self {
+            dir: Arc::new(dir),
+            resume: Default::default(),
+            #[cfg(test)]
+            read_calls: Default::default(),
+        })
     }
     pub(crate) fn open_payload(&self, relative: &Path, overwrite: bool) -> io::Result<File> {
         let parts = Self::components(relative)?;
@@ -189,6 +319,13 @@ impl Payload {
     }
 }
 impl TorrentStorage for Payload {
+    fn initial_verified_pieces(&self) -> Option<Vec<u8>> {
+        self.root
+            .resume
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
     fn init(&mut self, _: &ManagedTorrentShared, metadata: &TorrentMetadata) -> Result<()> {
         let limits = crate::limits::ResourceLimits::default();
         crate::limits::validate_relative_paths(
@@ -223,6 +360,10 @@ impl TorrentStorage for Payload {
         Ok(())
     }
     fn pread_exact(&self, index: usize, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        #[cfg(test)]
+        self.root
+            .read_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.access(index, |entry| {
             if offset
                 .checked_add(buffer.len() as u64)

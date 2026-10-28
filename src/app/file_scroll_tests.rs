@@ -21,7 +21,10 @@ fn file_region_fills_remaining_height_for_empty_short_and_long_lists() {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                            assert_eq!(
+                                PeerLumeApp::show_file_tree(ui, &torrent),
+                                (None, None, None)
+                            );
                         });
                     },
                 ));
@@ -53,7 +56,7 @@ fn blank_space_after_a_left_aligned_file_name_keeps_its_context_menu() {
     let mut torrent = crate::client::tests::torrent();
     torrent.files = FileSelectionModel::from_files([("a.bin".into(), 100)]);
     let frame = |events| {
-        let mut action = (None, None);
+        let mut action = (None, None, None);
         let output = context.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -96,18 +99,18 @@ fn blank_space_after_a_left_aligned_file_name_keeps_its_context_menu() {
     };
     frame(vec![]);
     let (output, action) = frame(vec![]);
-    assert_eq!(action, (None, None));
+    assert_eq!(action, (None, None, None));
     let name = text_center(&output, "a.bin");
     assert!(name.x < 100.0);
     let blank = egui::pos2(400.0, name.y);
     frame(pointer(blank, egui::PointerButton::Secondary, true));
     frame(pointer(blank, egui::PointerButton::Secondary, false));
     let (output, action) = frame(vec![]);
-    assert_eq!(action, (None, None));
+    assert_eq!(action, (None, None, None));
     let menu = text_center(&output, "Show in folder");
     frame(pointer(menu, egui::PointerButton::Primary, true));
     let (_, action) = frame(pointer(menu, egui::PointerButton::Primary, false));
-    assert_eq!(action, (None, Some(0)));
+    assert_eq!(action, (None, Some(0), None));
     assert!(torrent.files.files()[0].selected);
     assert_eq!(torrent.downloaded_bytes, 0);
 }
@@ -142,7 +145,10 @@ fn file_names_start_at_the_left_inside_a_visible_list_border() {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                            assert_eq!(
+                                PeerLumeApp::show_file_tree(ui, &torrent),
+                                (None, None, None)
+                            );
                         });
                     },
                 ));
@@ -226,7 +232,7 @@ fn file_count_header_stays_fixed_while_rows_scroll_to_the_end_and_back() {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.style_mut().animation_time = 0.0;
-                    assert_eq!(PeerLumeApp::show_file_tree(ui, torrent), (None, None));
+                    assert_eq!(PeerLumeApp::show_file_tree(ui, torrent), (None, None, None));
                 });
             },
         )
@@ -323,7 +329,10 @@ fn fixed_file_count_covers_empty_single_and_multiple_root_lists() {
         let label = format!("Files/ ({} files)", paths.len());
         let output = context.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                assert_eq!(
+                    PeerLumeApp::show_file_tree(ui, &torrent),
+                    (None, None, None)
+                );
             });
         });
         let texts: Vec<_> = output
@@ -406,7 +415,10 @@ fn file_sizes_stay_clear_of_the_scrollbar_when_narrowed_or_hovered() {
                                     egui::Sense::hover(),
                                 );
                             });
-                            assert_eq!(PeerLumeApp::show_file_tree(ui, &torrent), (None, None));
+                            assert_eq!(
+                                PeerLumeApp::show_file_tree(ui, &torrent),
+                                (None, None, None)
+                            );
                             assert!(ui.spacing().scroll.floating, "style must remain local");
                         });
                     },

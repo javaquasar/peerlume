@@ -54,6 +54,7 @@ impl UpdateKind {
             SessionEvent::TransferSettingsApplied { .. } => Self::Other,
             SessionEvent::FilesApplied { .. } => Self::Selection,
             SessionEvent::Peers { .. } => Self::Other,
+            SessionEvent::FilePrioritiesApplied { .. } => Self::Other,
             SessionEvent::Storage { .. } => Self::Other,
         }
     }

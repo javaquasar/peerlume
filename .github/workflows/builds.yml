@@ -14,6 +14,9 @@ on:
       - 'scripts/verify_build.py'
       - 'scripts/package_native.py'
       - 'scripts/test_package_native.py'
+      - 'scripts/verify_native_install.py'
+      - 'scripts/verify_daemon_crash.py'
+      - 'rust-toolchain.toml'
       - 'scripts/test-build-arguments.ps1'
       - 'scripts/check_fuzz_patches.py'
       - 'Cargo.toml'
@@ -81,9 +84,9 @@ jobs:
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal --target $env:BUILD_TARGET
+          rustup toolchain install 1.93.0 --profile minimal --target $env:BUILD_TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
-          "version=$(rustc +stable --version)" >> $env:GITHUB_OUTPUT
+          "version=$(rustc +1.93.0 --version)" >> $env:GITHUB_OUTPUT
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -107,9 +110,9 @@ jobs:
           BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
           [string[]]$features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features') }
-          cargo +stable test --locked @features --target $env:BUILD_TARGET --lib -p peerlume -p librqbit-tracker-comms
+          cargo +1.93.0 test --locked @features --target $env:BUILD_TARGET --lib -p peerlume -p librqbit-tracker-comms
           if ($LASTEXITCODE -ne 0) { throw 'Library tests failed' }
-          cargo +stable test --locked @features --target $env:BUILD_TARGET --test core_workflows
+          cargo +1.93.0 test --locked @features --target $env:BUILD_TARGET --test core_workflows
           if ($LASTEXITCODE -ne 0) { throw 'Core workflow tests failed' }
       - name: Build release GUI, TUI, CLI and MCP adapter
         env:
@@ -117,7 +120,7 @@ jobs:
           BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
           [string[]]$features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features', '--bin', 'peerlume') }
-          cargo +stable build --release --locked @features --target $env:BUILD_TARGET --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp --bin peerlume-daemon
+          cargo +1.93.0 build --release --locked @features --target $env:BUILD_TARGET --bin peerlume-tui --bin peerlume-control --bin peerlume-mcp --bin peerlume-daemon
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
       - name: Verify the embedded Windows application icon
         if: runner.os == 'Windows' && matrix.flavor == 'desktop'
@@ -157,6 +160,13 @@ jobs:
         run: |
           python scripts/package_native.py --platform $env:BUILD_PLATFORM --flavor $env:BUILD_FLAVOR --commit $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { throw 'Native package build failed' }
+      - name: Test native installation, replacement upgrade and uninstall on isolated fixtures
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          python scripts/verify_native_install.py --platform $env:BUILD_PLATFORM --flavor $env:BUILD_FLAVOR --commit $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Native installation round-trip failed' }
       - name: Upload native installer and checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

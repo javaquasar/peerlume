@@ -215,6 +215,12 @@ pub struct TorrentStateLive {
 }
 
 impl TorrentStateLive {
+    pub(crate) fn update_file_priorities(&self, high: &[usize]) {
+        self.lock_write("file_priorities").file_priorities.sort_by_key(|index| (
+            !high.contains(index),
+            self.metadata.file_infos[*index].relative_filename.clone()
+        ));
+    }
     pub(crate) fn new(
         paused: TorrentStatePaused,
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
@@ -244,6 +250,8 @@ impl TorrentStateLive {
                     .get(*id)
                     .map(|fi| fi.relative_filename.as_path())
             });
+            let high=paused.shared.high_priority_files.read().clone();
+            pri.sort_by_key(|id| !high.contains(id));
             pri
         };
 
@@ -1430,7 +1438,9 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let sequential = self.state.shared.transfer.read().sequential;
+                // Explicit file priorities outrank global sequential ordering.
+                let sequential = self.state.shared.transfer.read().sequential
+                    && self.state.shared.high_priority_files.read().is_empty();
                 let result = pieces.acquire_piece_ordered(
                     sequential,
                     AcquireRequest {

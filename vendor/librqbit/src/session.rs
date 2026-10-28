@@ -131,6 +131,7 @@ pub struct Session {
     default_storage_factory: Option<BoxStorageFactory>,
     persistence: Option<Arc<dyn SessionPersistenceStore>>,
     trackers: HashSet<url::Url>,
+    proxy_only: bool,
 
     lsd: Option<LocalServiceDiscovery>,
 
@@ -696,7 +697,7 @@ impl Session {
             let proxy_config = match proxy_url {
                 Some(pu) => Some(
                     SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
+                        .context("error parsing proxy URL (credentials redacted)")?,
                 ),
                 None => None,
             };
@@ -806,6 +807,7 @@ impl Session {
                 max_active_downloads: Default::default(),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
+                proxy_only: opts.connect.as_ref().is_some_and(|options|options.proxy_url.is_some()),
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
@@ -1342,6 +1344,7 @@ impl Session {
             let peer_opts = self.merge_peer_opts(opts.peer_opts);
             let metadata = Arc::new(metadata);
             let minfo = Arc::new(ManagedTorrentShared {
+                high_priority_files: Default::default(),
                 transfer: RwLock::new(crate::torrent_state::TransferSettings::default()),
                 transfer_limits: Limits::new(opts.ratelimits),
                 id,
@@ -1568,6 +1571,11 @@ impl Session {
             trackers.extend(self.trackers.iter().cloned());
         }
 
+        // SOCKS5 is used for peers and HTTP trackers, not native UDP sockets.
+        // Never silently send UDP tracker traffic outside a requested proxy.
+        if self.proxy_only {
+            trackers.retain(|url| matches!(url.scheme(), "http" | "https"));
+        }
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
             session: self.clone(),

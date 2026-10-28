@@ -6,6 +6,7 @@ use std::{
 
 use crate::limits::{ResourceLimits, validate_relative_paths};
 
+pub(crate) mod move_plan;
 pub mod relocation;
 pub mod sandbox;
 

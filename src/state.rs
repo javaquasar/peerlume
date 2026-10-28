@@ -62,6 +62,204 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    /// Remove completed intents only AFTER the controller durably saved this path.
+    pub(crate) fn acknowledge_storage_move(&self, torrent: &TorrentRecord) -> Result<(), String> {
+        let Some(database) = self.connection.path().filter(|path| !path.is_empty()) else {
+            return Ok(());
+        };
+        let Some(profile) = Path::new(database)
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        else {
+            return Ok(());
+        };
+        let plans = crate::storage::move_plan::pending(profile)
+            .map_err(|_| "Cannot read move acknowledgement journals")?
+            .into_iter()
+            .filter(|(_, plan)| plan.id == torrent.id)
+            .collect::<Vec<_>>();
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let Some(folder) = torrent.download_directory.as_deref() else {
+            return Ok(());
+        };
+        let key = crate::storage::move_plan::root_key(Path::new(folder));
+        if !plans
+            .iter()
+            .any(|(_, plan)| crate::storage::move_plan::root_key(&plan.destination) == key)
+        {
+            return Ok(());
+        }
+        let root = crate::storage::sandbox::Directory::open(Path::new(folder))
+            .map_err(|_| "Cannot pin acknowledged move destination")?;
+        if !root
+            .only_payload(&plans[0].1.files)
+            .map_err(|_| "Cannot inspect acknowledged move destination")?
+        {
+            return Ok(());
+        }
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .map_err(|_| "Cannot flush acknowledged move state")?;
+        for (path, _) in plans {
+            std::fs::remove_file(path).map_err(|_| "Move saved but intent cleanup failed")?;
+        }
+        crate::storage::move_plan::sync(profile).map_err(|_| "Cannot sync move acknowledgement")?;
+        Ok(())
+    }
+    /// Reconcile durable rename intents before any network session is created.
+    /// Several consecutive moves of one torrent form a chain with one live root.
+    pub(crate) fn recover_storage_moves(
+        &mut self,
+        profile: &Path,
+        default_folder: &str,
+    ) -> Result<(), String> {
+        let plans = crate::storage::move_plan::pending(profile)
+            .map_err(|_| "Cannot read storage move journals")?;
+        if plans.is_empty() {
+            return Ok(());
+        }
+        // Journal recovery always hashes afresh, even after a later clean stop.
+        let _ = crate::resume::Cache::begin(profile)
+            .map_err(|_| "Cannot invalidate resume hints before move recovery")?;
+        let records = self
+            .load_all_torrents()
+            .map_err(|_| "Cannot restore state for move recovery")?;
+        let mut groups = std::collections::BTreeMap::<String, Vec<_>>::new();
+        for (path, plan) in plans {
+            groups
+                .entry(plan.id.clone())
+                .or_default()
+                .push((path, plan));
+        }
+        self.connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|_| "Cannot make move recovery durable")?;
+        for (id, plans) in groups {
+            let record = records
+                .iter()
+                .find(|record| record.id == id)
+                .ok_or("Move journal references an unknown torrent; no data moved")?;
+            let expected: std::collections::BTreeMap<_, _> = record
+                .files
+                .iter()
+                .map(|file| (std::path::PathBuf::from(&file.path), file.size_bytes))
+                .collect();
+            let mut roots = std::collections::BTreeMap::new();
+            for (_, plan) in &plans {
+                if plan
+                    .files
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    != expected
+                {
+                    return Err(
+                        "Move journal file list differs from saved torrent; recovery stopped"
+                            .into(),
+                    );
+                }
+                roots.insert(
+                    crate::storage::move_plan::root_key(&plan.source),
+                    plan.source.clone(),
+                );
+                roots.insert(
+                    crate::storage::move_plan::root_key(&plan.destination),
+                    plan.destination.clone(),
+                );
+            }
+            let current = Path::new(
+                record
+                    .download_directory
+                    .as_deref()
+                    .unwrap_or(default_folder),
+            );
+            if !roots.contains_key(&crate::storage::move_plan::root_key(current)) {
+                return Err("Move journal does not match the saved storage root".into());
+            }
+            let sources: std::collections::BTreeSet<_> = plans
+                .iter()
+                .map(|(_, plan)| crate::storage::move_plan::root_key(&plan.source))
+                .collect();
+            let ends: std::collections::BTreeSet<_> = plans
+                .iter()
+                .map(|(_, plan)| crate::storage::move_plan::root_key(&plan.destination))
+                .filter(|key| !sources.contains(key))
+                .collect();
+            if ends.len() != 1 {
+                return Err("Ambiguous move chain; recovery stopped".into());
+            }
+            let destination = roots.get(ends.first().unwrap()).unwrap();
+            let target = crate::storage::sandbox::Directory::open(destination)
+                .map_err(|_| "Move destination unavailable; journal retained")?;
+            let files = expected.into_iter().collect::<Vec<_>>();
+            if !target
+                .payload_subset(&files, false)
+                .map_err(|_| "Cannot inspect move destination")?
+            {
+                return Err(
+                    "Move destination contains changed or unrelated files; recovery stopped".into(),
+                );
+            }
+            let mut located = Vec::new();
+            for (path, length) in &files {
+                let mut found = Vec::new();
+                for folder in roots.values().filter(|folder| folder.exists()) {
+                    let root = crate::storage::sandbox::Directory::open(folder)
+                        .map_err(|_| "Cannot pin move recovery root")?;
+                    match root.read_payload(path) {
+                        Ok(file) => {
+                            if file
+                                .metadata()
+                                .map_err(|_| "Cannot inspect moved file")?
+                                .len()
+                                != *length
+                            {
+                                return Err("Moved file size changed; recovery stopped".into());
+                            }
+                            found.push((crate::storage::move_plan::root_key(folder), root));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => return Err(
+                            "Cannot inspect moved file without following links; recovery stopped"
+                                .into(),
+                        ),
+                    }
+                }
+                if found.len() != 1 {
+                    return Err("Ambiguous moved file: expected exactly one copy; all files and journals retained".into());
+                }
+                located.push((path.clone(), found.pop().unwrap()));
+            }
+            for (path, (key, root)) in located {
+                if key != *ends.first().unwrap() {
+                    root.rename_payload(&target, &path).map_err(
+                        |_| "Interrupted move could not finish; files and journal retained",
+                    )?;
+                }
+            }
+            crate::storage::move_plan::sync(destination)
+                .map_err(|_| "Cannot sync recovered destination")?;
+            let directory = destination.to_string_lossy();
+            self.connection
+                .execute(
+                    "UPDATE torrents SET download_directory=?1,state='paused' WHERE id=?2",
+                    params![directory, id],
+                )
+                .map_err(|_| "Cannot save recovered storage")?;
+            self.connection
+                .execute_batch("PRAGMA wal_checkpoint(FULL);")
+                .map_err(|_| "Cannot flush recovered storage")?;
+            for (path, _) in plans {
+                std::fs::remove_file(path)
+                    .map_err(|_| "Recovered storage saved but journal cleanup failed")?;
+            }
+            crate::storage::move_plan::sync(profile)
+                .map_err(|_| "Cannot sync recovered move state")?;
+        }
+        Ok(())
+    }
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -128,6 +326,7 @@ impl StateStore {
 
     fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         #[cfg(windows)]
         let secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets> =
             std::sync::Arc::new(crate::secrets::PlatformSecrets);
@@ -1026,6 +1225,135 @@ mod tests {
                 }],
             }),
         }
+    }
+    #[test]
+    fn rename_crash_before_database_ack_recovers_path_and_pauses_before_network() {
+        let profile = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("payload");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file.bin"), vec![7u8; 100]).unwrap();
+        let mut store = StateStore::in_memory().unwrap();
+        let mut record = record();
+        record.download_directory = Some(source.display().to_string());
+        store.save_torrent(&record).unwrap();
+        let root = crate::storage::sandbox::Directory::open(&source).unwrap();
+        let (_, destination) = crate::storage::move_plan::prepare(
+            profile.path(),
+            &record.id,
+            &source,
+            parent.path(),
+            &root,
+            vec![("file.bin".into(), 100)],
+        )
+        .unwrap();
+        store
+            .recover_storage_moves(profile.path(), "unused")
+            .unwrap();
+        let recovered = store.load_torrent(&record.id).unwrap().unwrap();
+        assert_eq!(
+            recovered.download_directory.as_deref(),
+            Some(destination.as_str())
+        );
+        assert_eq!(recovered.state, "paused");
+        assert!(
+            crate::storage::move_plan::pending(profile.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(Path::new(&destination).join("file.bin")).unwrap(),
+            vec![7u8; 100]
+        );
+    }
+    #[test]
+    fn interrupted_multi_file_move_preflights_duplicates_then_recovers_and_ack_clears_intent() {
+        let profile = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        let destination = parent.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("file.bin"), b"one").unwrap();
+        std::fs::write(source.join("second.bin"), b"two").unwrap();
+        let files = vec![
+            (std::path::PathBuf::from("file.bin"), 3),
+            ("second.bin".into(), 3),
+        ];
+        let mut record = record();
+        record.trackers.clear();
+        record.tracker_audit = None;
+        record.download_directory = Some(source.display().to_string());
+        record.files = files
+            .iter()
+            .enumerate()
+            .map(|(index, (path, size))| StoredFile {
+                index: index as u32,
+                path: path.display().to_string(),
+                size_bytes: *size,
+                downloaded_bytes: *size,
+                selected: true,
+                priority: 0,
+            })
+            .collect();
+        let mut store = StateStore::open(&profile.path().join("state.sqlite3")).unwrap();
+        store.save_torrent(&record).unwrap();
+        let plan = crate::storage::move_plan::Plan {
+            id: record.id.clone(),
+            source: source.clone(),
+            destination: destination.clone(),
+            files: files.clone(),
+        };
+        std::fs::write(
+            profile.path().join("storage-move-synthetic.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        let from = crate::storage::sandbox::Directory::open(&source).unwrap();
+        let to = crate::storage::sandbox::Directory::open(&destination).unwrap();
+        from.rename_payload(&to, Path::new("file.bin")).unwrap(); // Simulate a crash here.
+        std::fs::write(destination.join("second.bin"), b"bad").unwrap();
+        assert!(
+            store
+                .recover_storage_moves(profile.path(), "unused")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(source.join("second.bin")).unwrap(), b"two");
+        assert_eq!(
+            std::fs::read(destination.join("second.bin")).unwrap(),
+            b"bad"
+        );
+        std::fs::remove_file(destination.join("second.bin")).unwrap(); // Only this synthetic collision.
+        store
+            .recover_storage_moves(profile.path(), "unused")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("second.bin")).unwrap(),
+            b"two"
+        );
+        assert!(!source.join("second.bin").exists());
+        assert!(
+            crate::storage::move_plan::pending(profile.path())
+                .unwrap()
+                .is_empty()
+        );
+        let (_, moved) = crate::storage::move_plan::prepare(
+            profile.path(),
+            &record.id,
+            &destination,
+            parent.path(),
+            &to,
+            files,
+        )
+        .unwrap();
+        record.download_directory = Some(moved);
+        store.save_torrent(&record).unwrap();
+        store.acknowledge_storage_move(&record).unwrap();
+        assert!(
+            crate::storage::move_plan::pending(profile.path())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
