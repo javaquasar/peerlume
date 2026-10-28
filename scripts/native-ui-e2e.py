@@ -34,6 +34,16 @@ def wait_for(action, timeout=60):
     raise AssertionError("Native workflow timed out")
 
 
+def isolated_settings(downloads):
+    # Real engine settings are now honored. This loopback fixture must not
+    # depend on a fixed public port, multicast, UPnP, or a remote blocklist.
+    return ('version = 2\n[download]\ndownload_directory = ' + json.dumps(str(downloads)) +
+            '\n[connection]\nrandom_port_on_start = true\nport_forwarding = false\n'
+            'utp_enabled = false\nprefer_utp = false\n'
+            '[bittorrent]\ndht = false\npex = false\nlsd = false\n'
+            '[privacy]\nblocklist_enabled = false\nblocklist_auto_update = false\n')
+
+
 def bencode(value):
     if isinstance(value, int):
         return b"i" + str(value).encode() + b"e"
@@ -174,7 +184,22 @@ class Desktop:
             assert app.poll() is None, "GUI exited before creating its native window; see application.log"
             result = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "^PeerLume$"], capture_output=True)
             return result.stdout.decode().splitlines() if result.returncode == 0 else None
-        self.window = wait_for(window, timeout=45)[-1]
+        try:
+            self.window = wait_for(window, timeout=45)[-1]
+        except AssertionError:
+            # Capture bounded symbol-only stacks, without arguments or locals,
+            # from ONLY our synthetic child before its temporary profile goes.
+            if app.poll() is None and shutil.which('gdb'):
+                try:
+                    trace = subprocess.run(['sudo', '-n', 'gdb', '-q', '-batch',
+                                            '-ex', 'set pagination off',
+                                            '-ex', 'set print frame-arguments none',
+                                            '-ex', 'thread apply all bt 12', '-p', str(app.pid)],
+                                           capture_output=True, timeout=20)
+                    (self.report / 'startup-stacks.txt').write_bytes((trace.stdout + trace.stderr)[-131072:])
+                except (OSError, subprocess.TimeoutExpired):
+                    (self.report / 'startup-stacks.txt').write_text('Startup stack capture unavailable or timed out\n')
+            raise
         subprocess.run(["xdotool", "windowactivate", "--sync", self.window], check=True)
 
     def add(self):
@@ -243,7 +268,7 @@ def run(args):
             cli = Path(shutil.copy2(args.cli, installed / "peerlume-control"))
             source = root / "fixture.torrent"
             source.write_bytes(fixture.metainfo)
-            (profile / "settings.toml").write_text('version = 2\n[download]\ndownload_directory = ' + json.dumps(str(downloads)) + '\n[bittorrent]\ndht = false\npex = false\nlsd = false\n', encoding="utf-8")
+            (profile / "settings.toml").write_text(isolated_settings(downloads), encoding="utf-8")
             log = (report / "application.log").open("wb")
 
             def launch(first):

@@ -27,7 +27,7 @@ unlocked keyring are needed for persistent credentials.
 On Ubuntu 24.04, install runtime dependencies if they are not already provided:
 
 ```sh
-sudo apt-get install libgl1 libegl1 libx11-6 libxi6 libxrandr2 libxcb1 libxkbcommon0 libxkbcommon-x11-0 xdg-desktop-portal xdg-desktop-portal-gtk gnome-keyring
+sudo apt-get install ca-certificates libgl1 libegl1 libx11-6 libxi6 libxrandr2 libxcb1 libxkbcommon0 libxkbcommon-x11-0 xdg-desktop-portal xdg-desktop-portal-gtk gnome-keyring
 ```
 
 Extract the TAR.GZ and run from its directory:
@@ -91,7 +91,9 @@ upgrade. Uninstall removes program files, never the profile or downloaded data.
 
 The amd64 Debian package targets Ubuntu 24.04 or compatible newer GNU/glibc
 systems. Install with `sudo apt install ./peerlume-....deb` so dependencies are
-resolved. Desktop and headless packages conflict intentionally because their
+resolved, including the system CA certificate store required by both flavors.
+Portable headless archives also require `ca-certificates` on minimal systems.
+Desktop and headless packages conflict intentionally because their
 shared executables occupy the same `/usr/bin` paths. The package installs a
 **user** systemd unit, but has no installation scripts and does not enable or
 start it automatically. Test with `peerlume-daemon --check-config` before use.

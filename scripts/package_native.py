@@ -53,7 +53,9 @@ def debian_tree(root, stage, repository, version, commit, flavor):
     conflicts = 'peerlume-headless' if flavor == 'desktop' else 'peerlume'
     control = stage / 'DEBIAN'
     control.mkdir(parents=True)
-    dependencies = 'libc6 (>= 2.39), libgcc-s1'
+    # rustls-native-certs needs a real system trust store even before the first
+    # HTTPS request. Minimal Ubuntu installations do not necessarily have one.
+    dependencies = 'libc6 (>= 2.39), libgcc-s1, ca-certificates'
     if flavor == 'desktop':
         dependencies += ', libx11-6, libxi6, libxrandr2, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libegl1, libgl1'
     (control / 'control').write_text(

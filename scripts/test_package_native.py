@@ -1,12 +1,37 @@
 """Static native package contract; synthetic binaries are never executed."""
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 from package_native import windows_script, debian_tree
 
 
 class NativeTests(unittest.TestCase):
+    def test_native_gui_fixture_uses_only_isolated_network_settings(self):
+        import runpy
+        fixture = runpy.run_path(str(Path(__file__).with_name('native-ui-e2e.py')))
+        settings = tomllib.loads(fixture['isolated_settings'](Path('/synthetic/downloads')))
+        self.assertTrue(settings['connection']['random_port_on_start'])
+        self.assertFalse(settings['connection']['port_forwarding'])
+        self.assertFalse(settings['connection']['utp_enabled'])
+        self.assertFalse(settings['connection']['prefer_utp'])
+        self.assertFalse(settings['privacy']['blocklist_auto_update'])
+        self.assertFalse(any(settings['bittorrent'].values()))
+
+    def test_both_debian_flavors_require_a_system_certificate_store(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'archive'
+            root.mkdir()
+            repository = Path(__file__).resolve().parent.parent
+            for flavor in ('tui', 'desktop'):
+                with self.subTest(flavor=flavor):
+                    stage = Path(temporary) / flavor
+                    debian_tree(root, stage, repository, '0.1.0', 'a' * 40, flavor)
+                    control = (stage / 'DEBIAN/control').read_text()
+                    depends = next(line for line in control.splitlines() if line.startswith('Depends:'))
+                    self.assertIn('ca-certificates', depends.split(':', 1)[1].strip().split(', '))
+
     def test_install_round_trip_refuses_a_developer_machine_before_any_subprocess(self):
         import contextlib
         import io
