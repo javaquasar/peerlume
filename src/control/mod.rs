@@ -493,6 +493,8 @@ mod agent_tests;
 #[cfg(test)]
 mod continuous_soak;
 #[cfg(test)]
+mod removal_tests;
+#[cfg(test)]
 pub(crate) mod soak_tests;
 #[cfg(test)]
 mod swarm_soak;

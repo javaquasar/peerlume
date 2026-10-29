@@ -896,7 +896,19 @@ impl SessionRuntime {
                                         emit_state_result(&event_tx, id, result, "downloading");
                                     }
                                     SessionCommand::Remove { id } => {
-                                        let result = if let Some(handle) = torrents.get(&id).cloned() {
+                                        // Failed adds have a saved row but no actor handle. A failed
+                                        // recheck can also leave an obsolete handle. Resolve the
+                                        // current engine generation by hash before acknowledging removal.
+                                        let info_hash = torrents.get(&id).map(|handle| handle.info_hash().0)
+                                            .or_else(|| id.split(';').find_map(|part| part.strip_prefix("v1: "))
+                                                .and_then(|hash| crate::tracker::parse_info_hash_hex(hash).ok()));
+                                        let handle = info_hash.and_then(|hash| session.with_torrents(|registered| {
+                                            for (_, handle) in registered {
+                                                if handle.info_hash().0 == hash { return Some(handle.clone()); }
+                                            }
+                                            None
+                                        }));
+                                        let result = if let Some(handle) = handle {
                                             let final_sample = final_transfer_sampler(&handle, &counters);
                                             librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, session_peer_id.0).await;
                                             let result = session
@@ -904,16 +916,19 @@ impl SessionRuntime {
                                                 .await
                                                 .map_err(|error| format!("{error:#}"));
                                             final_sample();
-                                            if result.is_ok() {
-                                                counters.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle.info_hash().0);
-                                                librqbit_tracker_comms::forget_torrent_lifecycle(handle.info_hash().0, session_peer_id.0);
-                                            }
                                             result
                                         } else {
-                                            Err("Torrent is not registered in the transfer engine".into())
+                                            if let Some(hash) = info_hash {
+                                                librqbit_tracker_comms::stop_torrent_announces(hash, session_peer_id.0).await;
+                                            }
+                                            Ok(()) // Already absent from the engine; keep-data removal is idempotent.
                                         };
                                         let event = match result {
                                             Ok(()) => {
+                                                if let Some(hash) = info_hash {
+                                                    counters.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash);
+                                                    librqbit_tracker_comms::forget_torrent_lifecycle(hash, session_peer_id.0);
+                                                }
                                                 torrents.remove(&id);
                                                 storage_roots.remove(&id);
                                                 checks.remove(&id);
