@@ -1,5 +1,6 @@
 //! Headless layout and interaction regressions for the real torrent header.
 use super::*;
+use crate::session::SessionEvent;
 
 fn frame(
     context: &egui::Context,
@@ -8,7 +9,7 @@ fn frame(
     state: TorrentState,
     tab: &mut DetailsTab,
     events: Vec<egui::Event>,
-) -> (egui::FullOutput, Option<TorrentCommand>) {
+) -> (egui::FullOutput, Option<HeaderAction>) {
     let mut command = None;
     let output = context.run(
         egui::RawInput {
@@ -23,7 +24,10 @@ fn frame(
             egui::CentralPanel::default().show(ctx, |ui| {
                 // A horizontal parent must not put title and controls together.
                 ui.horizontal(|ui| {
-                    command = PeerLumeApp::show_torrent_header(ui, name, state, tab);
+                    let mut torrent = crate::client::tests::torrent();
+                    torrent.name = name.into();
+                    torrent.state = state;
+                    command = PeerLumeApp::show_torrent_header(ui, &torrent, tab);
                 });
                 ui.label("Details content");
             });
@@ -120,7 +124,7 @@ fn separate_control_rows_keep_pause_resume_and_every_tab_interactive() {
         let (_, command) = frame(&context, 220.0, "Short", state, &mut tab, click(pos, true));
         assert_eq!(command, None);
         let (_, command) = frame(&context, 220.0, "Short", state, &mut tab, click(pos, false));
-        assert_eq!(command, Some(expected));
+        assert_eq!(command, Some(HeaderAction::Transfer(expected)));
         assert_eq!(tab, DetailsTab::Status);
     }
 }
@@ -135,4 +139,154 @@ fn click(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
             modifiers: egui::Modifiers::NONE,
         },
     ]
+}
+
+fn feedback_frame(
+    context: &egui::Context,
+    width: f32,
+    torrent: &TorrentItem,
+    tab: &mut DetailsTab,
+    events: Vec<egui::Event>,
+) -> (egui::FullOutput, Option<HeaderAction>) {
+    let mut action = None;
+    let output = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 1200.0),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    action = PeerLumeApp::show_torrent_header(ui, torrent, tab);
+                });
+                ui.label("Details content");
+            });
+        },
+    );
+    (output, action)
+}
+
+#[test]
+fn feedback_is_visible_on_every_tab_and_pending_pause_cannot_be_double_clicked() {
+    let mut torrent = crate::client::tests::torrent();
+    torrent.state = TorrentState::Downloading;
+    torrent
+        .runtime
+        .command
+        .begin(crate::runtime_status::TransferAction::Pause);
+    for width in [220.0, 420.0, 1000.0] {
+        let context = egui::Context::default();
+        for mut tab in DetailsTab::ALL {
+            feedback_frame(&context, width, &torrent, &mut tab, vec![]);
+            let (output, _) = feedback_frame(&context, width, &torrent, &mut tab, vec![]);
+            let button = text_rect(&output, "Pausing...");
+            let message = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if text.galley.job.text.starts_with("Pause requested") =>
+                    {
+                        Some(text.galley.job.text.clone())
+                    }
+                    _ => None,
+                })
+                .expect(
+                    "Pending pause feedback must remain visible even after the five-second hint",
+                );
+            let feedback = text_rect(&output, &message);
+            assert!(feedback.bottom() <= text_rect(&output, "Details content").top());
+            for pressed in [true, false] {
+                assert_eq!(
+                    feedback_frame(
+                        &context,
+                        width,
+                        &torrent,
+                        &mut tab,
+                        click(button.center(), pressed)
+                    )
+                    .1,
+                    None
+                );
+            }
+        }
+    }
+    let id = torrent.info_hashes.join(";");
+    crate::client::apply_session_event(
+        std::slice::from_mut(&mut torrent),
+        SessionEvent::StateChanged {
+            id,
+            state: "paused",
+        },
+    );
+    let context = egui::Context::default();
+    let mut tab = DetailsTab::Files;
+    feedback_frame(&context, 420.0, &torrent, &mut tab, vec![]);
+    let (output, _) = feedback_frame(&context, 420.0, &torrent, &mut tab, vec![]);
+    text_rect(&output, "Resume");
+    text_rect(&output, "Paused - confirmed by engine");
+}
+
+#[test]
+fn failed_start_shows_its_reason_and_retry_instead_of_pause_on_every_tab() {
+    let mut torrent = crate::client::tests::torrent();
+    torrent.state = TorrentState::Error;
+    let reason =
+        "Source .torrent file was not found. Check its path or reconnect the source drive.";
+    torrent.runtime.record_error(reason);
+    for width in [220.0, 420.0, 1000.0] {
+        let context = egui::Context::default();
+        for mut tab in DetailsTab::ALL {
+            feedback_frame(&context, width, &torrent, &mut tab, vec![]);
+            let (output, _) = feedback_frame(&context, width, &torrent, &mut tab, vec![]);
+            let button = text_rect(&output, "Retry start");
+            text_rect(&output, "Transfer error");
+            let error = text_rect(&output, reason);
+            assert!(
+                error.right() <= width
+                    && error.bottom() <= text_rect(&output, "Details content").top()
+            );
+            feedback_frame(
+                &context,
+                width,
+                &torrent,
+                &mut tab,
+                click(button.center(), true),
+            );
+            assert_eq!(
+                feedback_frame(
+                    &context,
+                    width,
+                    &torrent,
+                    &mut tab,
+                    click(button.center(), false)
+                )
+                .1,
+                Some(HeaderAction::RetryStart)
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_registered_transfer_offers_repair_and_unconfirmed_restore_cannot_retry() {
+    let mut torrent = crate::client::tests::torrent();
+    torrent.state = TorrentState::Error;
+    assert!(transfer_feedback::primary_control(&torrent).1.is_none());
+    torrent
+        .runtime
+        .record_error("Download directory cannot be read");
+    assert_eq!(
+        transfer_feedback::primary_control(&torrent).1,
+        Some(HeaderAction::RetryStart)
+    );
+    torrent.runtime.registered = true;
+    assert_eq!(
+        transfer_feedback::primary_control(&torrent).1,
+        Some(HeaderAction::Transfer(TorrentCommand::RecheckAndRepair))
+    );
 }

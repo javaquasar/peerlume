@@ -49,6 +49,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                 } else if let crate::storage::relocation::StorageStatus::Failed { message } =
                     &status
                 {
+                    torrent.runtime.record_error(message);
                     notice = SessionNotice::Error {
                         id: id.clone(),
                         message: message.clone(),
@@ -107,6 +108,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                         return SessionNotice::SettingsApplied { id };
                     }
                     crate::runtime_status::ModeApplication::Failed { message, .. } => {
+                        torrent.runtime.record_error(&message);
                         return SessionNotice::Error { id, message };
                     }
                     _ => {}
@@ -147,17 +149,25 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 match &status {
                     crate::completion::CompletionStatus::Checking { .. } => {
+                        torrent
+                            .runtime
+                            .command
+                            .confirm(crate::runtime_status::TransferAction::Recheck);
                         torrent.state = TorrentState::Checking;
                         torrent.download_rate = 0;
                         torrent.upload_rate = 0;
                     }
                     crate::completion::CompletionStatus::Failed { message } => {
+                        torrent.runtime.record_error(message);
                         torrent.state = TorrentState::VerificationFailed;
                         torrent.completion = status.clone();
                         return SessionNotice::Error {
                             id,
                             message: message.clone(),
                         };
+                    }
+                    crate::completion::CompletionStatus::Verified => {
+                        torrent.runtime.last_error = None;
                     }
                     _ => {}
                 }
@@ -166,10 +176,18 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             SessionNotice::None
         }
         SessionEvent::Added { id } => {
-            if let Some(torrent) = find_torrent_mut(torrents, &id)
-                && torrent.state == TorrentState::WaitingForEngine
-            {
-                torrent.state = TorrentState::Downloading;
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                let start_requested = torrent.runtime.command.pending_action()
+                    == Some(crate::runtime_status::TransferAction::Start);
+                torrent.runtime.registered = true;
+                torrent
+                    .runtime
+                    .command
+                    .confirm(crate::runtime_status::TransferAction::Start);
+                torrent.runtime.last_error = None;
+                if torrent.state == TorrentState::WaitingForEngine || start_requested {
+                    torrent.state = TorrentState::Downloading;
+                }
             }
             SessionNotice::Added { id }
         }
@@ -179,8 +197,19 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                     torrent.completion = crate::completion::CompletionStatus::Pending;
                 }
                 torrent.state = if state == "paused" {
+                    torrent
+                        .runtime
+                        .command
+                        .confirm(crate::runtime_status::TransferAction::Pause);
+                    torrent.download_rate = 0;
+                    torrent.upload_rate = 0;
                     TorrentState::Paused
                 } else {
+                    torrent
+                        .runtime
+                        .command
+                        .confirm(crate::runtime_status::TransferAction::Resume);
+                    torrent.runtime.last_error = None;
                     TorrentState::Downloading
                 };
                 return SessionNotice::StateApplied { id };
@@ -199,6 +228,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             paused,
         } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.registered = true;
                 if matches!(
                     torrent.completion,
                     crate::completion::CompletionStatus::Checking { .. }
@@ -246,7 +276,9 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             SessionNotice::None
         }
         SessionEvent::Error { id, message } => {
+            let message = crate::runtime_status::display_error(&message);
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                torrent.runtime.record_error(&message);
                 torrent.completion = crate::completion::CompletionStatus::Pending;
                 torrent.state = TorrentState::Error;
                 torrent.download_rate = 0;
@@ -255,7 +287,20 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             SessionNotice::Error { id, message }
         }
         SessionEvent::Removed { id } => SessionNotice::Removed { id },
-        SessionEvent::Stopped => SessionNotice::Stopped,
+        SessionEvent::Stopped => {
+            for torrent in torrents {
+                torrent.runtime.registered = false;
+                if torrent.runtime.command.pending_action().is_some() {
+                    torrent
+                        .runtime
+                        .record_error("Transfer engine stopped before confirming the request");
+                    torrent.state = TorrentState::Error;
+                    torrent.download_rate = 0;
+                    torrent.upload_rate = 0;
+                }
+            }
+            SessionNotice::Stopped
+        }
     }
 }
 

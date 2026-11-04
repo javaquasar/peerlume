@@ -76,7 +76,7 @@ impl fmt::Display for CommandError {
             Self::EngineUnavailable => "Transfer engine is unavailable",
             Self::QueueFull => "Transfer command queue is full; retry after refreshing",
             Self::EngineClosed => "Transfer engine command channel is closed",
-            Self::OperationInProgress => "An agent operation is awaiting confirmation",
+            Self::OperationInProgress => "Another torrent operation is awaiting confirmation",
             Self::PersistenceUnavailable => "Persistent state store is unavailable",
         })
     }
@@ -95,6 +95,15 @@ impl From<SessionSendError> for CommandError {
 }
 
 impl TorrentCommand {
+    pub(crate) fn feedback_action(&self) -> Option<crate::runtime_status::TransferAction> {
+        use crate::runtime_status::TransferAction;
+        match self {
+            Self::Pause => Some(TransferAction::Pause),
+            Self::Resume => Some(TransferAction::Resume),
+            Self::Recheck | Self::RecheckAndRepair => Some(TransferAction::Recheck),
+            _ => None,
+        }
+    }
     fn prepare(&self, torrent: &TorrentItem, id: String) -> Result<SessionCommand, CommandError> {
         Ok(match self {
             Self::SetTransferSettings(settings) => {
@@ -247,13 +256,32 @@ impl Controller {
             .command_clock
             .checked_add(1)
             .ok_or(CommandError::RevisionExhausted)?;
+        let feedback_action = command.feedback_action();
+        if feedback_action.is_some()
+            && self.torrents[index]
+                .runtime
+                .command
+                .pending_action()
+                .is_some()
+        {
+            return Err(CommandError::OperationInProgress);
+        }
         if let Err(error) = send(&self.backend, prepared) {
+            if let Some(action) = feedback_action {
+                self.torrents[index]
+                    .runtime
+                    .command
+                    .reject(action, &error.to_string());
+            }
             if let TorrentCommand::SetMode(config) = command {
                 mode_submission_failed(&mut self.torrents[index], config, error.to_string());
             }
             return Err(error);
         }
         self.command_clock = next;
+        if let Some(action) = feedback_action {
+            self.torrents[index].runtime.command.begin(action);
+        }
         self.observed
             .get_mut(&id)
             .expect("registered above")
@@ -270,6 +298,74 @@ impl Controller {
             torrent_id: id,
             command_revision: next,
         })
+    }
+
+    /// Trusted local retry, using this owner's saved settings and existing engine.
+    /// No new IPC command or grant. A failed registration is not a resumable handle.
+    #[cfg(any(test, feature = "gui"))]
+    pub(crate) fn retry_start(
+        &mut self,
+        id: &str,
+        settings: &crate::settings::ClientSettings,
+    ) -> Result<(), String> {
+        use crate::runtime_status::TransferAction;
+        let index = self
+            .torrents
+            .iter()
+            .position(|torrent| torrent.info_hashes.join(";") == id)
+            .ok_or("Torrent is unavailable")?;
+        self.reconcile();
+        if self.agent.as_ref().is_some_and(|agent| agent.busy(id))
+            || self.torrents[index]
+                .runtime
+                .command
+                .pending_action()
+                .is_some()
+        {
+            return Err(CommandError::OperationInProgress.to_string());
+        }
+        let torrent = &self.torrents[index];
+        if torrent.state != TorrentState::Error
+            || torrent.runtime.registered
+            || torrent.runtime.last_error.is_none()
+        {
+            return Err("Retry start requires a failed registration reported by the engine".into());
+        }
+        if !self.backend.persistence_available() {
+            return Err(CommandError::PersistenceUnavailable.to_string());
+        }
+        if !settings.validate().is_empty() {
+            return Err("Correct invalid client settings before retrying".into());
+        }
+        let next = self
+            .command_clock
+            .checked_add(1)
+            .ok_or("Command revision space is exhausted")?;
+        let mut retry = torrent.clone();
+        retry.state = TorrentState::WaitingForEngine;
+        if let Err(error) = self
+            .backend
+            .send_checked(crate::client::add_torrent_command(&retry, settings))
+        {
+            let message = CommandError::from(error).to_string();
+            self.torrents[index]
+                .runtime
+                .command
+                .reject(TransferAction::Start, &message);
+            return Err(message);
+        }
+        self.torrents[index]
+            .runtime
+            .command
+            .begin(TransferAction::Start);
+        self.command_clock = next;
+        self.observed
+            .get_mut(id)
+            .expect("registered above")
+            .command_revision = next;
+        self.dirty = true;
+        self.publish();
+        Ok(())
     }
 
     /// The audit profile is presentation-independent data supplied by the UI.

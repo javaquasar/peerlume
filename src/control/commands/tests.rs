@@ -12,6 +12,184 @@ fn controller() -> Controller {
     Controller::new(ClientBackend::offline(), vec![torrent()])
 }
 
+#[test]
+fn registration_alone_does_not_claim_a_restored_failed_torrent_is_downloading() {
+    let mut control = controller();
+    control.torrents[0].state = TorrentState::Error;
+    control.apply(SessionEvent::Added {
+        id: "v1: abc".into(),
+    });
+    assert!(control.torrents[0].runtime.registered);
+    assert_eq!(
+        control.torrents[0].state,
+        TorrentState::Error,
+        "Wait for a real state sample; restored errors are added paused"
+    );
+    control.apply(SessionEvent::Stats {
+        id: "v1: abc".into(),
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        download_rate: 0,
+        upload_rate: 0,
+        file_progress: vec![0],
+        peers: 0,
+        finished: false,
+        paused: true,
+    });
+    assert_eq!(control.torrents[0].state, TorrentState::Paused);
+}
+
+#[test]
+fn transfer_feedback_waits_for_matching_ack_not_a_stale_stats_sample() {
+    use crate::runtime_status::{TransferAction, TransferFeedback};
+    let mut control = controller();
+    control.torrents[0].state = TorrentState::Downloading;
+    accept(&mut control, TorrentCommand::Pause);
+    assert_eq!(control.torrents[0].state, TorrentState::Downloading);
+    assert_eq!(control.torrents[0].status_text(), "Pausing...");
+    control.torrents[0].runtime.command = TransferFeedback::Pending {
+        action: TransferAction::Pause,
+        since: std::time::Instant::now() - std::time::Duration::from_secs(6),
+    };
+    assert!(
+        control.torrents[0]
+            .runtime
+            .command
+            .summary(false)
+            .unwrap()
+            .contains("Still waiting")
+    );
+    control.apply(SessionEvent::Stats {
+        id: "v1: abc".into(),
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        download_rate: 0,
+        upload_rate: 0,
+        file_progress: vec![0],
+        peers: 0,
+        finished: false,
+        paused: false,
+    });
+    assert_eq!(
+        control.torrents[0].runtime.command.pending_action(),
+        Some(TransferAction::Pause)
+    );
+    assert_eq!(
+        control.submit_via("v1: abc", TorrentCommand::Resume, None, |_, _| panic!(
+            "duplicate pending command"
+        )),
+        Err(CommandError::OperationInProgress)
+    );
+    control.apply(SessionEvent::StateChanged {
+        id: "v1: abc".into(),
+        state: "paused",
+    });
+    assert_eq!(control.torrents[0].state, TorrentState::Paused);
+    assert!(matches!(
+        control.torrents[0].runtime.command,
+        TransferFeedback::Confirmed {
+            action: TransferAction::Pause
+        }
+    ));
+    assert_eq!(control.torrents[0].runtime.command.pending_action(), None);
+}
+
+#[test]
+fn transfer_feedback_reports_queue_rejection_without_faking_pause() {
+    use crate::runtime_status::{TransferAction, TransferFeedback};
+    let mut control = controller();
+    control.torrents[0].state = TorrentState::Downloading;
+    let revision = control.command_revision("v1: abc").unwrap();
+    assert_eq!(
+        control.submit_via("v1: abc", TorrentCommand::Pause, None, |_, _| Err(
+            CommandError::QueueFull
+        )),
+        Err(CommandError::QueueFull)
+    );
+    assert_eq!(control.torrents[0].state, TorrentState::Downloading);
+    assert_eq!(control.command_revision("v1: abc").unwrap(), revision);
+    assert!(
+        matches!(&control.torrents[0].runtime.command, TransferFeedback::Failed { action: TransferAction::Pause, message } if message.contains("queue is full"))
+    );
+}
+
+#[test]
+fn transfer_feedback_keeps_per_torrent_errors_and_redacts_embedded_endpoints() {
+    let mut control = controller();
+    let mut other = torrent();
+    other.info_hashes = vec!["v1: xyz".into()];
+    control.torrents.push(other);
+    control.apply(SessionEvent::Error { id: "v1: abc".into(), message: "Source file missing https://user:password@tracker.test/uk/SYNTHETIC_SECRET/announce?token=secret".into() });
+    let error = control.torrents[0].runtime.last_error.clone().unwrap();
+    assert!(error.contains("Source file missing"));
+    for secret in ["password", "SYNTHETIC_SECRET", "token=secret"] {
+        assert!(!error.contains(secret));
+    }
+    control.apply(SessionEvent::Error {
+        id: "v1: xyz".into(),
+        message: "Other drive unavailable".into(),
+    });
+    control.apply(SessionEvent::Error {
+        id: "v1: abc".into(),
+        message: "Torrent is not registered in the transfer engine".into(),
+    });
+    assert_eq!(
+        control.torrents[0].runtime.last_error.as_deref(),
+        Some(error.as_str())
+    );
+    assert_eq!(
+        control.torrents[1].runtime.last_error.as_deref(),
+        Some("Other drive unavailable")
+    );
+    control.publish();
+    let public =
+        serde_json::to_string(&control.read_handle().page(0, 10, None, None).unwrap()).unwrap();
+    assert!(
+        !public.contains("Source file missing") && !public.contains("Other drive unavailable"),
+        "Local error details must not leak into the read-only IPC projection"
+    );
+    let bounded =
+        crate::runtime_status::display_error(&("\u{1b}[31m\n".to_owned() + &"x".repeat(16000)));
+    assert!(bounded.chars().count() <= 2048 && !bounded.chars().any(char::is_control));
+}
+
+#[test]
+fn transfer_feedback_explains_checking_and_engine_shutdown() {
+    use crate::runtime_status::{TransferAction, TransferFeedback};
+    let mut control = controller();
+    control.torrents[0].state = TorrentState::Checking;
+    control.torrents[0].completion = CompletionStatus::Checking {
+        checked_bytes: 1,
+        total_bytes: 100,
+    };
+    accept(&mut control, TorrentCommand::Pause);
+    control.apply(SessionEvent::Verification {
+        id: "v1: abc".into(),
+        status: CompletionStatus::Checking {
+            checked_bytes: 2,
+            total_bytes: 100,
+        },
+    });
+    assert_eq!(control.torrents[0].state, TorrentState::Checking);
+    assert_eq!(
+        control.torrents[0].runtime.command.pending_action(),
+        Some(TransferAction::Pause)
+    );
+    assert!(
+        control.torrents[0]
+            .runtime
+            .command
+            .summary(true)
+            .unwrap()
+            .contains("checking continues")
+    );
+    control.apply(SessionEvent::Stopped);
+    assert!(
+        matches!(&control.torrents[0].runtime.command, TransferFeedback::Failed { message, .. } if message.contains("engine stopped"))
+    );
+    assert_eq!(control.torrents[0].state, TorrentState::Error);
+}
+
 fn accept(control: &mut Controller, command: TorrentCommand) -> SessionCommand {
     let mut sent = None;
     control
@@ -525,9 +703,14 @@ fn accepted_commands_do_not_accumulate_operation_history() {
     let mut control = controller();
     for _ in 0..10_000 {
         accept(&mut control, TorrentCommand::Pause);
+        // State requests are serialized; exercise 10,000 real request/ACK pairs.
+        control.apply(SessionEvent::StateChanged {
+            id: "v1: abc".into(),
+            state: "paused",
+        });
     }
     assert_eq!(control.observed.len(), 1);
-    assert_eq!(control.unpersisted_updates.len(), 0);
+    assert_eq!(control.unpersisted_updates.len(), 1);
     let receipt = control
         .submit_via("v1: abc", TorrentCommand::Pause, None, |_, _| Ok(()))
         .unwrap();

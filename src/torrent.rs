@@ -194,6 +194,9 @@ impl TorrentItem {
     }
 
     pub fn status_text(&self) -> String {
+        if let Some(action) = self.runtime.command.pending_action() {
+            return action.pending_label().into();
+        }
         if self.completed_successfully() {
             format!("Done · {}", self.state.label())
         } else {

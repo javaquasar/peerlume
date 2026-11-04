@@ -30,7 +30,9 @@ mod status_filter;
 #[cfg(test)]
 mod torrent_menu_tests;
 mod torrent_panes;
+mod transfer_feedback;
 mod upload_ratio;
+use transfer_feedback::HeaderAction;
 
 use crate::{
     blocklist::{self, Blocklist, BlocklistUpdate},
@@ -952,7 +954,8 @@ impl PeerLumeApp {
                 let mut recheck_action = None;
                 let other_columns_width =
                     name_column::reserved_width(ui, &self.control.torrents, self.status_filter);
-                let pane = torrent_panes::table_with_percent(ui, self.settings.ui.torrent_pane_percent, |ui| {
+                let feedback_height = visible_selection.map(|index| transfer_feedback::extra_details_height(&self.control.torrents[index])).unwrap_or(0.0);
+                let pane = torrent_panes::table_with_percent(ui, self.settings.ui.torrent_pane_percent, feedback_height, |ui| {
                     ui.scope(|ui| {
                         ui.style_mut().spacing.scroll.floating = false;
                         name_column::scroll_area(name_column::viewport_width(ui))
@@ -1579,10 +1582,9 @@ impl PeerLumeApp {
         let mut commands = Vec::new();
         let torrent = &mut self.control.torrents[self.selected_torrent];
         let torrent_id = torrent.info_hashes.join(";");
-        if let Some(command) =
-            Self::show_torrent_header(ui, &torrent.name, torrent.state, &mut self.details_tab)
-        {
-            commands.push(command);
+        let header_action = Self::show_torrent_header(ui, torrent, &mut self.details_tab);
+        if let Some(HeaderAction::Transfer(command)) = &header_action {
+            commands.push(command.clone());
         }
         match self.details_tab {
             DetailsTab::Status => {
@@ -1929,6 +1931,26 @@ impl PeerLumeApp {
         {
             self.add_status = status;
         }
+        if matches!(header_action, Some(HeaderAction::RetryStart)) {
+            self.add_status = match self.control.retry_start(&torrent_id, &self.settings) {
+                Ok(()) => "Start requested; awaiting engine confirmation".into(),
+                Err(error) => {
+                    if let Some(torrent) = self
+                        .control
+                        .torrents
+                        .iter_mut()
+                        .find(|torrent| torrent.info_hashes.join(";") == torrent_id)
+                        && torrent.runtime.command.pending_action().is_none()
+                    {
+                        torrent
+                            .runtime
+                            .command
+                            .reject(crate::runtime_status::TransferAction::Start, &error);
+                    }
+                    error
+                }
+            };
+        }
     }
 
     fn show_recheck_menu(
@@ -1974,28 +1996,28 @@ impl PeerLumeApp {
 
     fn show_torrent_header(
         ui: &mut egui::Ui,
-        name: &str,
-        state: TorrentState,
+        torrent: &TorrentItem,
         details_tab: &mut DetailsTab,
-    ) -> Option<TorrentCommand> {
+    ) -> Option<HeaderAction> {
         let mut command = None;
         // Keep these as separate rows even inside a horizontal parent layout.
         ui.vertical(|ui| {
-            ui.add(egui::Label::new(egui::RichText::new(name).heading()).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(&torrent.name).heading()).wrap());
             ui.horizontal_wrapped(|ui| {
-                let (label, action) = if state == TorrentState::Paused {
-                    ("Resume", TorrentCommand::Resume)
-                } else {
-                    ("Pause", TorrentCommand::Pause)
-                };
-                if ui.button(label).clicked() {
-                    command = Some(action);
+                let (label, action, hint) = transfer_feedback::primary_control(torrent);
+                if ui
+                    .add_enabled(action.is_some(), egui::Button::new(label))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    command = action;
                 }
                 ui.separator();
                 for tab in DetailsTab::ALL {
                     ui.selectable_value(details_tab, tab, tab.label());
                 }
             });
+            transfer_feedback::show(ui, torrent);
         });
         command
     }
@@ -2009,9 +2031,19 @@ impl PeerLumeApp {
         let mut accepted = 0;
         let mut rejected = 0;
         for command in commands {
+            let action = command.feedback_action();
             match control.submit(id, command, None) {
                 Ok(_) => accepted += 1,
                 Err(error) => {
+                    if let Some(action) = action
+                        && let Some(torrent) = control
+                            .torrents
+                            .iter_mut()
+                            .find(|torrent| torrent.info_hashes.join(";") == id)
+                        && torrent.runtime.command.pending_action().is_none()
+                    {
+                        torrent.runtime.command.reject(action, &error.to_string());
+                    }
                     rejected += 1;
                     first_error.get_or_insert_with(|| error.to_string());
                 }

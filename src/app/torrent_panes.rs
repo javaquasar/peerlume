@@ -2,16 +2,17 @@
 use eframe::egui;
 
 const MIN_TABLE_HEIGHT: f32 = 96.0;
-const MIN_DETAILS_HEIGHT: f32 = 180.0;
+const MIN_DETAILS_HEIGHT: f32 = 210.0;
 
 pub(super) fn table_with_percent<R>(
     ui: &mut egui::Ui,
     percent: u16,
+    feedback_height: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let available = ui.available_height().max(0.0);
     let minimum = MIN_TABLE_HEIGHT.min(available * 0.35);
-    let maximum = (available - MIN_DETAILS_HEIGHT).max(minimum);
+    let maximum = (available - MIN_DETAILS_HEIGHT - feedback_height).max(minimum);
     egui::TopBottomPanel::top("torrent_list_pane")
         .frame(egui::Frame::NONE.inner_margin(egui::Margin {
             bottom: 6,

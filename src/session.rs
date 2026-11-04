@@ -32,16 +32,31 @@ impl std::fmt::Debug for PreparedTorrent {
     }
 }
 
-fn read_metainfo_snapshot(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+fn read_metainfo_snapshot(path: &std::path::Path, id: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let limit = crate::limits::ResourceLimits::default().max_torrent_bytes;
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(limit + 1)
         .read_to_end(&mut bytes)?;
-    crate::metainfo::TorrentMetainfo::parse(&bytes).map_err(|_| {
+    let metainfo = crate::metainfo::TorrentMetainfo::parse(&bytes).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid metainfo snapshot")
     })?;
+    if let Some(expected) = id
+        .split(';')
+        .find_map(|part| part.strip_prefix("v1: "))
+        .and_then(|hash| crate::tracker::parse_info_hash_hex(hash).ok())
+        && metainfo
+            .info_hash_v1_hex
+            .as_deref()
+            .and_then(|hash| crate::tracker::parse_info_hash_hex(hash).ok())
+            != Some(expected)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the source file now describes a different torrent; restore the original .torrent",
+        ));
+    }
     Ok(bytes)
 }
 
@@ -813,9 +828,14 @@ impl SessionRuntime {
                                         } else if source.starts_with("magnet:") {
                                             Ok(AddTorrent::from_url(source))
                                         } else {
-                                            read_metainfo_snapshot(std::path::Path::new(&source))
+                                            read_metainfo_snapshot(std::path::Path::new(&source), &id)
                                                 .map(AddTorrent::from_bytes)
-                                                .map_err(|_| "Could not read bounded torrent metadata".to_owned())
+                                                .map_err(|error| match error.kind() {
+                                                    std::io::ErrorKind::NotFound => "Source .torrent file was not found. Check its path or reconnect the source drive.".into(),
+                                                    std::io::ErrorKind::PermissionDenied => "Source .torrent file cannot be read. Check file permissions and drive access.".into(),
+                                                    std::io::ErrorKind::InvalidData => format!("Source .torrent metadata cannot be used: {error}"),
+                                                    _ => "Could not read source .torrent metadata. Check the source file and its drive.".into(),
+                                                })
                                         };
                                         let result = match add {
                                             Ok(add) => session

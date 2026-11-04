@@ -138,6 +138,10 @@ pub enum RepairStatus {
 }
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
+    /// Observed registration, never inferred from queue acceptance or a UI click.
+    pub registered: bool,
+    pub last_error: Option<String>,
+    pub command: TransferFeedback,
     pub storage: crate::storage::relocation::StorageStatus,
     pub diagnostics: crate::diagnostics::Diagnostics,
     pub seeded_seconds: u64,
@@ -146,6 +150,135 @@ pub struct RuntimeStatus {
     pub repair: RepairStatus,
     pub network_downloaded: u64,
     pub network_uploaded: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferAction {
+    Pause,
+    Resume,
+    Start,
+    Recheck,
+}
+
+impl TransferAction {
+    pub fn pending_label(self) -> &'static str {
+        match self {
+            Self::Pause => "Pausing...",
+            Self::Resume => "Resuming...",
+            Self::Start => "Starting...",
+            Self::Recheck => "Requesting recheck...",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+            Self::Start => "Start",
+            Self::Recheck => "Recheck",
+        }
+    }
+}
+
+/// Runtime-only feedback. Queue acceptance is never a confirmed transfer state.
+#[derive(Clone, Debug, Default)]
+pub enum TransferFeedback {
+    #[default]
+    Idle,
+    Pending {
+        action: TransferAction,
+        since: Instant,
+    },
+    Confirmed {
+        action: TransferAction,
+    },
+    Failed {
+        action: TransferAction,
+        message: String,
+    },
+}
+
+impl TransferFeedback {
+    pub fn pending_action(&self) -> Option<TransferAction> {
+        match self {
+            Self::Pending { action, .. } => Some(*action),
+            _ => None,
+        }
+    }
+    pub fn begin(&mut self, action: TransferAction) {
+        *self = Self::Pending {
+            action,
+            since: Instant::now(),
+        };
+    }
+    pub fn reject(&mut self, action: TransferAction, message: &str) {
+        *self = Self::Failed {
+            action,
+            message: display_error(message),
+        };
+    }
+    pub fn confirm(&mut self, expected: TransferAction) {
+        if matches!(self, Self::Pending { action, .. } | Self::Failed { action, .. } if *action == expected)
+        {
+            *self = Self::Confirmed { action: expected };
+        }
+    }
+    pub fn summary(&self, checking: bool) -> Option<String> {
+        Some(match self {
+            Self::Idle => return None,
+            Self::Pending { action: TransferAction::Pause, .. } if checking =>
+                "Pause requested. Integrity checking continues; the transfer will stay paused afterwards.".into(),
+            Self::Pending { action: TransferAction::Resume, .. } if checking =>
+                "Resume requested. Waiting for integrity checking to finish.".into(),
+            Self::Pending { action, since } => {
+                let seconds = since.elapsed().as_secs();
+                if seconds >= 5 { format!("{} requested. Still waiting for engine confirmation ({seconds} s).", action.label()) }
+                else { format!("{} requested; awaiting engine confirmation.", action.label()) }
+            }
+            Self::Confirmed { action } => match action {
+                TransferAction::Pause => "Paused - confirmed by engine".into(),
+                TransferAction::Resume => "Resume confirmed by engine".into(),
+                TransferAction::Start => "Torrent registered - confirmed by engine".into(),
+                TransferAction::Recheck => "Integrity check running - confirmed by engine".into(),
+            },
+            Self::Failed { action, message } => format!("{} request failed: {message}", action.label()),
+        })
+    }
+}
+
+impl RuntimeStatus {
+    pub fn record_error(&mut self, message: &str) {
+        let message = display_error(message);
+        if let Some(action) = self.command.pending_action() {
+            self.command.reject(action, &message);
+        }
+        // A follow-up pause/resume must not hide why initial registration failed.
+        if !self.registered
+            && self.last_error.is_some()
+            && message == "Torrent is not registered in the transfer engine"
+        {
+            return;
+        }
+        self.last_error = Some(message);
+    }
+}
+
+/// Bounded local feedback, never a way to reveal embedded tracker credentials.
+pub(crate) fn display_error(message: &str) -> String {
+    let bounded: String = message.chars().take(8192).collect();
+    bounded
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") || word.to_ascii_lowercase().contains("magnet:") {
+                "[redacted endpoint]".to_owned()
+            } else {
+                word.chars().filter(|c| !c.is_control()).collect()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+        .chars()
+        .take(2048)
+        .collect()
 }
 
 pub const REPAIR_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -241,6 +374,16 @@ pub fn status_card(torrent: &TorrentItem, last: Option<&JournalEntry>) -> Vec<(S
             ),
         ),
     ];
+    if let Some(message) = torrent
+        .runtime
+        .command
+        .summary(torrent.state == crate::torrent::TorrentState::Checking)
+    {
+        rows.push(("Transfer command".into(), message));
+    }
+    if let Some(message) = &torrent.runtime.last_error {
+        rows.push(("Last transfer error".into(), message.clone()));
+    }
     match &torrent.runtime.mode {
         ModeApplication::Applying { requested, .. } => {
             rows.push(("Requested mode".into(), requested.label()))

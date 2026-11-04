@@ -86,6 +86,9 @@ impl Controller {
     }
 
     fn apply(&mut self, event: SessionEvent) -> SessionNotice {
+        let retry_acknowledged = matches!(&event, SessionEvent::Added { id } if self.torrents.iter()
+            .any(|torrent| torrent.info_hashes.join(";") == *id
+                && torrent.runtime.command.pending_action() == Some(crate::runtime_status::TransferAction::Start)));
         let acknowledgement = if self.agent.is_some()
             && !matches!(
                 event,
@@ -150,7 +153,8 @@ impl Controller {
             if matches!(
                 notice,
                 SessionNotice::SettingsApplied { .. } | SessionNotice::StateApplied { .. }
-            ) {
+            ) || retry_acknowledged
+            {
                 self.unpersisted_updates.insert(id.clone());
             }
             let observation = self.observed.entry(id).or_insert_with(|| {
@@ -186,7 +190,10 @@ impl Controller {
             service.event(&event, self);
             self.agent = Some(service);
         }
-        notice
+        match notice {
+            SessionNotice::Added { id } if retry_acknowledged => SessionNotice::StateApplied { id },
+            other => other,
+        }
     }
 
     fn reconcile(&mut self) {
@@ -492,6 +499,8 @@ impl Drop for Controller {
 mod agent_tests;
 #[cfg(test)]
 mod continuous_soak;
+#[cfg(test)]
+mod feedback_tests;
 #[cfg(test)]
 mod removal_tests;
 #[cfg(test)]

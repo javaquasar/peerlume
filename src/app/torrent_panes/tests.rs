@@ -82,7 +82,7 @@ fn border(output: &egui::FullOutput, below: f32) -> egui::Rect {
     output
         .shapes
         .iter()
-        .find_map(|shape| match &shape.shape {
+        .filter_map(|shape| match &shape.shape {
             egui::epaint::Shape::Rect(rect)
                 if rect.stroke.width > 0.0
                     && rect.rect.width() > 500.0
@@ -92,6 +92,7 @@ fn border(output: &egui::FullOutput, below: f32) -> egui::Rect {
             }
             _ => None,
         })
+        .next_back()
         .expect("file-list border below the divider")
 }
 
@@ -312,6 +313,32 @@ fn real_divider_drag_grows_shrinks_and_clamps_without_transfer_changes() {
             .iter()
             .all(|torrent| torrent.state == TorrentState::Downloading)
     );
+}
+
+#[test]
+fn feedback_error_card_keeps_file_space_at_small_windows_and_maximum_divider_drag() {
+    for width in [820.0, 1080.0] {
+        for height in [560.0, 720.0, 1000.0] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(50, 65);
+            app.control.torrents[0].state = TorrentState::Error;
+            app.control.torrents[0]
+                .runtime
+                .record_error(&"Source drive is unavailable. ".repeat(100));
+            let size = egui::vec2(width, height);
+            settle(&ctx, &mut app, size);
+            let bottom_edge = height - pane(&ctx).bottom() - 1.0;
+            let output = drag(&ctx, &mut app, size, bottom_edge);
+            let files = border(&output, pane(&ctx).bottom());
+            assert!(
+                files.height() > 40.0,
+                "Error feedback consumed the file viewport: {width} / {height}: {files:?}"
+            );
+            assert!((files.bottom() - (height - 8.0)).abs() <= 1.0);
+            text_rect(&output, "Transfer error");
+            text_rect(&output, "Retry start");
+        }
+    }
 }
 
 #[test]
