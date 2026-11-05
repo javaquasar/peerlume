@@ -90,6 +90,15 @@ impl TuiApp {
         for (id, revision) in targets {
             let result = if self.control.command_revision(&id).ok() != Some(revision) {
                 Err("Torrent changed while awaiting confirmation; refresh and retry".to_owned())
+            } else if let Some(client) = self.control.backend.attached_client() {
+                let command = match action {
+                    BatchAction::Pause => TorrentCommand::Pause,
+                    BatchAction::Resume => TorrentCommand::Resume,
+                    BatchAction::Check => TorrentCommand::Recheck,
+                    BatchAction::Repair => TorrentCommand::RecheckAndRepair,
+                    BatchAction::Remove => TorrentCommand::Remove,
+                };
+                client.enqueue_submit(&id, command, Some(revision))
             } else if action == BatchAction::Remove {
                 self.control
                     .remove(&id)
@@ -113,7 +122,13 @@ impl TuiApp {
                 Err(error) => errors.push(error),
             }
         }
-        self.status = if total == 1 && accepted == 1 && action != BatchAction::Remove {
+        self.status = if self.control.backend.attached_client().is_some() {
+            format!(
+                "Awaiting background owner: {accepted}/{total} queued; {} not queued. {}",
+                errors.len(),
+                errors.first().cloned().unwrap_or_default()
+            )
+        } else if total == 1 && accepted == 1 && action != BatchAction::Remove {
             COMMAND_ACCEPTED.into()
         } else {
             format!(
@@ -381,6 +396,13 @@ impl TuiApp {
                 map.insert(id, argument.into());
             }
             "save-view" => {
+                if let Some(client) = self.control.backend.attached_client() {
+                    let mut view = self.settings.ui.clone();
+                    view.search = self.search.clone();
+                    view.torrent_pane_percent = self.split_percent;
+                    client.save_view(&view)?;
+                    return Ok("Awaiting owner view save".into());
+                }
                 let path = crate::settings::data_directory().join("settings.toml");
                 let mut saved = match ClientSettings::load_from(&path) {
                     Ok(saved) => saved,
@@ -544,6 +566,22 @@ impl TuiApp {
     }
 
     pub(super) fn save_preferences_draft(&mut self) {
+        if let Some(client) = self.control.backend.attached_client() {
+            let mut next = self
+                .preferences_draft
+                .clone()
+                .unwrap_or_else(|| self.settings.clone());
+            if let Err(error) = preferences_editor::validate(&next) {
+                self.status = error;
+                return;
+            }
+            next.ui.last_preferences_tab = self.preferences_tab.index();
+            self.status = client
+                .save_settings(&next)
+                .map(|()| "Awaiting background owner preferences save; draft retained".into())
+                .unwrap_or_else(|error| error);
+            return;
+        }
         self.save_preferences_with(ClientSettings::save);
     }
 

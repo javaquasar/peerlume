@@ -1,0 +1,30 @@
+{
+  "completed": true,
+  "export_elapsed_ns": 8225600,
+  "exported_records": 128,
+  "files": 1000,
+  "identity": {
+    "architecture": "x86_64",
+    "compiled_inputs_sha256": {
+      "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+      "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+      "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+      "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+    },
+    "debug_assertions": false,
+    "os": "windows"
+  },
+  "operation": "journal",
+  "page_p50_ns": 600,
+  "page_p95_ns": 61200,
+  "record_128_elapsed_ns": 9276600,
+  "schema_version": 1,
+  "workload": "optimization_workload_0_3_0",
+  "pair": 1,
+  "pair_order": [
+    "baseline",
+    "optimized"
+  ],
+  "executable_sha256": "98e09d53921a74ae1e3283428e581f45230de7d7e81e756e38279c1051ccef4b",
+  "process_wall_ns": 289303300
+}

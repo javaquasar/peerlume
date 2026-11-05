@@ -16,9 +16,11 @@ pub struct ClientBackend {
     state_store: Option<StateStore>,
     session_runtime: Option<SessionRuntime>,
     startup_error: Option<String>,
+    attached: Option<crate::control::frontend::Client>,
+    file_loader: Option<crate::state::FileDetailLoader>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionNotice {
     None,
     Added { id: String },
@@ -95,7 +97,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 let selected: std::collections::HashSet<_> = only_files.into_iter().collect();
                 let mut changed = false;
-                for index in 0..torrent.files.files().len() {
+                for index in 0..torrent.files.file_count() {
                     changed |= torrent.files.set_selected(index, selected.contains(&index));
                 }
                 torrent.downloaded_bytes = torrent.files.selected_downloaded();
@@ -254,7 +256,7 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                         torrent.files.set_file_downloaded(index, progress);
                     }
                 }
-                torrent.downloaded_bytes = if torrent.files.files().is_empty() {
+                torrent.downloaded_bytes = if torrent.files.file_count() == 0 {
                     downloaded_bytes
                 } else {
                     torrent.files.selected_downloaded()
@@ -325,30 +327,24 @@ fn find_torrent_mut<'a>(torrents: &'a mut [TorrentItem], id: &str) -> Option<&'a
     })
 }
 
-pub fn file_selection_command(torrent: &TorrentItem) -> SessionCommand {
-    SessionCommand::SetFiles {
+pub fn file_selection_command(torrent: &TorrentItem) -> Result<SessionCommand, String> {
+    Ok(SessionCommand::SetFiles {
         id: torrent.info_hashes.join(";"),
         only_files: torrent
             .files
-            .files()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| f.selected.then_some(i))
-            .collect(),
-    }
+            .selected_indices()
+            .ok_or("Complete file selection is unavailable")?,
+    })
 }
 
 pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> SessionCommand {
     let effective =
         EffectiveTorrentSettings::resolve(settings, &torrent.overrides, torrent.is_private);
-    let selected: Vec<_> = torrent
+    let selected = torrent
         .files
-        .files()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, file)| file.selected.then_some(index))
-        .collect();
-    let only_files = (selected.len() != torrent.files.files().len()).then_some(selected);
+        .selected_indices()
+        .expect("Owner registration requires an authoritative file selection");
+    let only_files = (selected.len() != torrent.files.file_count()).then_some(selected);
     SessionCommand::AddTorrent {
         resume: crate::resume::ResumeCounters {
             downloaded: torrent.runtime.network_downloaded,
@@ -366,12 +362,7 @@ pub fn add_torrent_command(torrent: &TorrentItem, settings: &ClientSettings) -> 
         } else {
             torrent.overrides.freeze_after_bytes
         },
-        full_size: torrent
-            .files
-            .files()
-            .iter()
-            .map(|file| file.size_bytes)
-            .sum(),
+        full_size: torrent.files.total_size(),
         id: torrent.info_hashes.join(";"),
         source: torrent.source.clone(),
         output_folder: effective.download_directory,
@@ -396,6 +387,7 @@ pub fn torrent_to_record(
             .find_map(|value| value.strip_prefix(prefix).map(str::to_owned))
     };
     TorrentRecord {
+        files_complete: torrent.files.details_loaded(),
         resume: crate::resume::ResumeCounters {
             downloaded: torrent.runtime.network_downloaded,
             uploaded: torrent.runtime.network_uploaded,
@@ -451,7 +443,10 @@ pub fn mode_change_command(
     config.validate()?;
     config.mode.validate_metadata(
         torrent.info_hashes.iter().any(|h| h.starts_with("v1: ")),
-        torrent.files.files().iter().map(|f| f.size_bytes).sum(),
+        torrent
+            .files
+            .checked_total_size()
+            .ok_or("Content size overflow")?,
     )?;
     torrent.runtime.mode = crate::runtime_status::ModeApplication::Applying {
         requested: config,
@@ -546,7 +541,211 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
     item
 }
 
+pub fn torrent_from_deferred(
+    record: crate::state::DeferredRecord,
+    settings: &ClientSettings,
+) -> TorrentItem {
+    let mut item = torrent_from_record(record.record, settings);
+    item.downloaded_bytes = record.files.selected_downloaded();
+    item.files = record.files;
+    item
+}
+
 impl ClientBackend {
+    pub fn attached_client(&self) -> Option<&crate::control::frontend::Client> {
+        self.attached.as_ref()
+    }
+
+    pub fn attach(directory: &std::path::Path) -> Result<Self, String> {
+        let client = crate::control::frontend::Client::connect_or_launch(directory)?;
+        Ok(Self {
+            state_store: None,
+            session_runtime: None,
+            startup_error: None,
+            attached: Some(client),
+            file_loader: None,
+        })
+    }
+
+    pub(crate) fn set_event_wake(&self, wake: std::sync::Arc<tokio::sync::Notify>) {
+        if let Some(runtime) = &self.session_runtime {
+            runtime.set_event_wake(wake.clone());
+        }
+        if let Some(client) = &self.attached {
+            client.set_event_wake(wake.clone());
+        }
+        if let Some(loader) = &self.file_loader {
+            loader.set_waker(std::sync::Arc::new(move || wake.notify_one()));
+        }
+    }
+
+    pub(crate) fn set_detail_interest_for(
+        &self,
+        consumer: &str,
+        interest: Option<(String, crate::session::DetailInterest)>,
+    ) -> Result<(), String> {
+        if let Some(runtime) = &self.session_runtime {
+            runtime.set_detail_interest_for(consumer, interest)
+        } else if let Some(client) = &self.attached {
+            client.set_detail_interest(interest);
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn load_deferred_torrents(&self) -> Result<Vec<crate::state::DeferredRecord>, String> {
+        self.state_store.as_ref().map_or_else(
+            || Ok(Vec::new()),
+            |store| {
+                store
+                    .load_deferred_torrents()
+                    .map_err(|error| error.to_string())
+            },
+        )
+    }
+
+    pub fn load_file_page(
+        &self,
+        id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::state::FilePage, String> {
+        self.state_store
+            .as_ref()
+            .ok_or("Owner state store is unavailable")?
+            .load_file_page(id, offset, limit)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn request_file_details(&self, id: &str, generation: u64) -> Result<(), String> {
+        self.file_loader
+            .as_ref()
+            .ok_or("File detail worker is unavailable")?
+            .request(id.into(), generation);
+        Ok(())
+    }
+    pub fn poll_file_details(&self) -> Option<crate::state::FileDetailReply> {
+        self.file_loader.as_ref()?.poll()
+    }
+    pub fn cancel_file_details(&self) {
+        if let Some(loader) = &self.file_loader {
+            loader.cancel();
+        }
+    }
+    pub fn file_details_loading(&self) -> bool {
+        self.file_loader
+            .as_ref()
+            .is_some_and(|loader| loader.is_loading())
+    }
+
+    pub fn persist_torrent_update(
+        &mut self,
+        torrent: &TorrentItem,
+        intent: crate::state::PersistenceIntent,
+        audit: Option<&StoredTrackerAuditProfile>,
+    ) -> Result<(), String> {
+        if self.attached.is_some() {
+            return Err(
+                "Acknowledgements are persisted by the background owner, not its frontend mirror"
+                    .into(),
+            );
+        }
+        let Some(store) = &mut self.state_store else {
+            return Err("Persistent state store is unavailable".into());
+        };
+        let files = if intent.selection || intent.priorities {
+            Some(
+                torrent
+                    .files
+                    .persistence_snapshot(intent.selection)
+                    .ok_or("Complete file state is unavailable")?,
+            )
+        } else {
+            None
+        };
+        match store.persist_acknowledged_with_audit(
+            &crate::state::ScalarUpdate::from_torrent(torrent),
+            intent,
+            files.as_ref(),
+            audit,
+        ) {
+            Ok(()) => Ok(()),
+            Err(rusqlite::Error::QueryReturnedNoRows) if torrent.files.details_loaded() => store
+                .save_torrent(&torrent_to_record(torrent, audit.cloned()))
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn save_tracker_audit(
+        &mut self,
+        id: &str,
+        audit: Option<&StoredTrackerAuditProfile>,
+    ) -> Result<(), String> {
+        if let Some(client) = &self.attached {
+            return client.save_audit(id, audit);
+        }
+        let store = self
+            .state_store
+            .as_mut()
+            .ok_or("Owner state store is unavailable")?;
+        let saved = if let Some(audit) = audit {
+            store.save_tracker_audit(id, audit)
+        } else {
+            store.clear_tracker_audit(id)
+        }
+        .map_err(|error| error.to_string())?;
+        if saved {
+            Ok(())
+        } else {
+            Err("Torrent is unavailable".into())
+        }
+    }
+    pub fn save_tracker_configuration(
+        &mut self,
+        id: &str,
+        trackers: &[String],
+        audit: Option<&StoredTrackerAuditProfile>,
+    ) -> Result<(), String> {
+        if let Some(client) = &self.attached {
+            return client.save_editable(id, trackers, audit);
+        }
+        let store = self
+            .state_store
+            .as_mut()
+            .ok_or("Owner state store is unavailable")?;
+        if store
+            .save_tracker_configuration(id, trackers, audit)
+            .map_err(|error| error.to_string())?
+        {
+            Ok(())
+        } else {
+            Err("Torrent is unavailable".into())
+        }
+    }
+
+    pub fn load_tracker_audit(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredTrackerAuditProfile>, String> {
+        self.state_store
+            .as_ref()
+            .ok_or("Owner state store is unavailable")?
+            .load_tracker_audit(id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn persist_native_stopped(
+        &mut self,
+        scalar: &crate::state::ScalarUpdate,
+    ) -> Result<(), String> {
+        self.state_store
+            .as_mut()
+            .ok_or("Owner state store is unavailable")?
+            .persist_acknowledged(scalar, crate::state::PersistenceIntent::SCALAR, None)
+            .map_err(|error| error.to_string())
+    }
     #[cfg(test)]
     pub(crate) fn test_engine(&self) -> Option<std::sync::Arc<librqbit::Session>> {
         self.session_runtime.as_ref()?.test_engine()
@@ -565,6 +764,8 @@ impl ClientBackend {
             state_store: Some(state_store),
             session_runtime: None,
             startup_error: None,
+            attached: None,
+            file_loader: None,
         }
     }
 
@@ -574,11 +775,16 @@ impl ClientBackend {
             state_store: None,
             session_runtime: Some(session_runtime),
             startup_error: None,
+            attached: None,
+            file_loader: None,
         }
     }
 
     pub fn journal(&self) -> Option<&crate::announce_journal::AnnounceJournal> {
-        self.session_runtime.as_ref().map(|s| &s.journal)
+        self.attached
+            .as_ref()
+            .map(|client| client.journal())
+            .or_else(|| self.session_runtime.as_ref().map(|s| &s.journal))
     }
 
     pub(crate) fn set_detail_interest(
@@ -587,6 +793,8 @@ impl ClientBackend {
     ) {
         if let Some(runtime) = &self.session_runtime {
             runtime.set_detail_interest(interest);
+        } else if let Some(client) = &self.attached {
+            client.set_detail_interest(interest);
         }
     }
     pub fn offline() -> Self {
@@ -594,6 +802,8 @@ impl ClientBackend {
             state_store: None,
             session_runtime: None,
             startup_error: None,
+            attached: None,
+            file_loader: None,
         }
     }
 
@@ -629,9 +839,13 @@ impl ClientBackend {
         state_store
             .recover_storage_moves(&data_directory(), &settings.download.download_directory)?;
         state_store
-            .load_all_torrents()
+            .load_deferred_torrents()
             .map_err(|e| format!("Cannot restore persistent state; engine not started: {e}"))?;
         let backend = Self {
+            file_loader: state_store
+                .database_path()
+                .map(crate::state::FileDetailLoader::new),
+            attached: None,
             state_store: Some(state_store),
             session_runtime: Some(
                 SessionRuntime::start_configured(256, settings)
@@ -658,6 +872,9 @@ impl ClientBackend {
 
     /// Shared startup presentation: a restore failure must not look like an empty profile.
     pub fn restore_for_frontend(&self) -> (Vec<TorrentRecord>, Option<String>) {
+        if self.attached.is_some() {
+            return (Vec::new(), Some("Connecting to background owner...".into()));
+        }
         if let Some(error) = &self.startup_error {
             return (Vec::new(), Some(error.clone()));
         }
@@ -673,6 +890,13 @@ impl ClientBackend {
     }
 
     pub fn save_torrent(&mut self, torrent: &TorrentRecord) -> Result<(), String> {
+        if let Some(client) = &self.attached {
+            return client.save_editable(
+                &torrent.id,
+                &torrent.trackers,
+                torrent.tracker_audit.as_ref(),
+            );
+        }
         self.state_store.as_mut().map_or_else(
             || Ok(()),
             |store| {
@@ -704,6 +928,9 @@ impl ClientBackend {
     }
 
     pub fn remove_torrent(&self, id: &str) -> Result<(), String> {
+        if self.attached.is_some() {
+            return Err("Only the background owner may remove durable torrent rows".into());
+        }
         self.state_store.as_ref().map_or_else(
             || Ok(()),
             |store| {
@@ -716,6 +943,9 @@ impl ClientBackend {
     }
 
     pub fn send(&self, command: SessionCommand) -> Result<(), String> {
+        if self.attached.is_some() {
+            return Err("Native frontends must submit validated owner commands".into());
+        }
         self.session_runtime
             .as_ref()
             .ok_or_else(|| "Transfer engine is unavailable".to_owned())?
@@ -743,11 +973,11 @@ impl ClientBackend {
     }
 
     pub fn session_available(&self) -> bool {
-        self.session_runtime.is_some()
+        self.session_runtime.is_some() || self.attached.is_some()
     }
 
     pub(crate) fn persistence_available(&self) -> bool {
-        self.state_store.is_some()
+        self.state_store.is_some() || self.attached.is_some()
     }
 }
 
@@ -975,6 +1205,7 @@ pub(crate) mod tests {
     fn unavailable_optional_services_have_frontend_friendly_semantics() {
         let mut backend = ClientBackend::offline();
         let record = TorrentRecord {
+            files_complete: true,
             resume: Default::default(),
             transfer_settings: None,
             repair_policy: Default::default(),

@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "kind": "windows_candidate_validation",
+  "date": "2026-11-05",
+  "timezone": "Europe/Berlin",
+  "base_commit": "3d8242fd0e34347e287e693f224de9873ff97e4f",
+  "candidate_is_a_new_commit": false,
+  "toolchain": "Rust 1.93.0 stable, x86_64-pc-windows-msvc",
+  "records": [
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--all-features",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 729,
+      "failed": 0,
+      "ignored": 12,
+      "raw_log": "all-features-complete.log",
+      "raw_log_sha256": "2337469add6a62f5b417d533639d0ca2d954e2dda3847f2ec82e22743befd027"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 597,
+      "failed": 0,
+      "ignored": 10,
+      "raw_log": "core-complete.log",
+      "raw_log_sha256": "abb9d4d2925ee2d8e077423b0c4d74894923df8e25a1e5059877d53d4eab255a"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "tui",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 655,
+      "failed": 0,
+      "ignored": 11,
+      "raw_log": "tui-complete.log",
+      "raw_log_sha256": "9f79bf31a65e5a0b8d6da10569b63057eb1628d8e8b88c6f0031ae7c422d5487"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--all-features",
+        "--doc",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 0,
+      "ignored": 0,
+      "raw_log": "doc-all-features-complete.log",
+      "raw_log_sha256": "7be54c570601383158a3970213358c91682fa168c845fd6e1886831db6c05607"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--doc",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 0,
+      "ignored": 0,
+      "raw_log": "doc-core-complete.log",
+      "raw_log_sha256": "7be54c570601383158a3970213358c91682fa168c845fd6e1886831db6c05607"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "tui",
+        "--doc",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--quiet"
+      ],
+      "exit_code_verified": 0,
+      "passed": 0,
+      "ignored": 0,
+      "raw_log": "doc-tui-complete.log",
+      "raw_log_sha256": "7be54c570601383158a3970213358c91682fa168c845fd6e1886831db6c05607"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "clippy",
+        "--locked",
+        "--all-features",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code_verified": 0,
+      "raw_log": "clippy-all-features-complete-3.log",
+      "raw_log_sha256": "0c4c5387d63913ec15f7441888c7622c0485b599f4a4174ce83804cc4f8abd32"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "clippy",
+        "--locked",
+        "--no-default-features",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code_verified": 0,
+      "raw_log": "clippy-core-complete.log",
+      "raw_log_sha256": "cb06b3566c686683e0b4ec7fd56e8a0397351f917a19a92e4f390364416db8cb"
+    },
+    {
+      "command": [
+        "cargo",
+        "+stable",
+        "clippy",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "tui",
+        "--all-targets",
+        "-p",
+        "peerlume",
+        "-p",
+        "librqbit-tracker-comms",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code_verified": 0,
+      "raw_log": "clippy-tui-complete-2.log",
+      "raw_log_sha256": "f3a5d6a2ea49e0e29d6d34d05296e38aca5d32c6b598a08a2dea912f9756ca1b"
+    }
+  ],
+  "python_contracts_passed": 33,
+  "powershell_launcher_contracts": "passed",
+  "headless_dependency_graph": "passed",
+  "notes": [
+    "Feature counts overlap and are not a sum of unique tests.",
+    "Documentation commands completed successfully but found zero doctests.",
+    "Raw logs are retained in the local release evidence directory; this file stores their exact SHA-256 identities.",
+    "The final LiveHistory display-label and GUI-only-method cfg corrections do not change all-feature runtime semantics; later TUI tests and strict all-feature Clippy cover those final source bytes.",
+    "Environment-dependent ignored cases are not claimed as passes.",
+    "This is Windows execution evidence, not Linux execution or a long-duration soak."
+  ]
+}

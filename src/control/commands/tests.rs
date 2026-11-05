@@ -13,6 +13,52 @@ fn controller() -> Controller {
 }
 
 #[test]
+fn failed_cold_selection_ack_is_merged_with_later_pause_without_erasing_paths() {
+    let mut item = torrent();
+    item.files = crate::file_selection::FileSelectionModel::from_files([
+        ("folder/first.bin".into(), 100),
+        ("folder/second.bin".into(), 100),
+    ]);
+    let mut backend = ClientBackend::with_state_store(StateStore::in_memory().unwrap());
+    backend
+        .save_torrent(&torrent_to_record(&item, None))
+        .unwrap();
+    item.files.defer_details();
+    let mut control = Controller::new(backend, vec![item]);
+    control.apply(SessionEvent::FileSnapshot {
+        id: "v1: abc".into(),
+        progress: vec![50, 75],
+    });
+    control.apply(SessionEvent::FilesApplied {
+        id: "v1: abc".into(),
+        only_files: vec![1],
+    });
+    control.torrents[0].uploaded_bytes = u64::MAX;
+    assert!(control.persist_confirmed_update("v1: abc", None).is_err());
+    assert!(
+        control.backend.load_torrents().unwrap()[0]
+            .files
+            .iter()
+            .all(|file| file.selected)
+    );
+    control.apply(SessionEvent::StateChanged {
+        id: "v1: abc".into(),
+        state: "paused",
+    });
+    control.torrents[0].uploaded_bytes = 0;
+    control.persist_confirmed_update("v1: abc", None).unwrap();
+    let restored = control.backend.load_torrents().unwrap().remove(0);
+    assert_eq!(restored.state, "paused");
+    assert_eq!(restored.downloaded_bytes, 75);
+    assert_eq!(restored.files.len(), 2);
+    assert_eq!(restored.files[0].path, "folder/first.bin");
+    assert!(!restored.files[0].selected);
+    assert!(restored.files[1].selected);
+    assert_eq!(restored.files[1].downloaded_bytes, 75);
+    assert!(control.unpersisted_updates.is_empty());
+}
+
+#[test]
 fn registration_alone_does_not_claim_a_restored_failed_torrent_is_downloading() {
     let mut control = controller();
     control.torrents[0].state = TorrentState::Error;
@@ -217,6 +263,7 @@ fn every_existing_command_uses_canonical_identity_and_does_not_claim_completion(
     for command in commands {
         let mut control = controller();
         control.torrents[0].info_hashes.push("v2: def".into());
+        control.invalidate_torrent_index();
         control.publish();
         let before = control.torrents[0].state;
         let revision = control.command_revision("v2: def").unwrap();
@@ -665,7 +712,7 @@ fn a_missing_state_store_is_not_reported_as_successful_persistence() {
             .unwrap_err()
             .contains("unavailable")
     );
-    assert!(control.unpersisted_updates.contains("v1: abc"));
+    assert!(control.unpersisted_updates.contains_key("v1: abc"));
 }
 
 #[test]
@@ -760,7 +807,7 @@ fn persistence_requires_confirmation_preserves_audit_and_retains_retry_on_failur
     });
     control.torrents[0].uploaded_bytes = u64::MAX;
     assert!(control.persist_confirmed_update("v1: abc", None).is_err());
-    assert!(control.unpersisted_updates.contains("v1: abc"));
+    assert!(control.unpersisted_updates.contains_key("v1: abc"));
     assert!(control.backend.load_torrents().unwrap()[0].verify_after_download);
     control.torrents[0].uploaded_bytes = 0;
     control.persist_confirmed_update("v1: abc", None).unwrap();
@@ -1001,7 +1048,7 @@ fn a_state_acknowledgement_checkpoints_only_the_known_torrent_and_can_retry() {
     );
     control.torrents[0].uploaded_bytes = u64::MAX;
     assert!(control.persist_confirmed_update("v1: abc", None).is_err());
-    assert!(control.unpersisted_updates.contains("v1: abc"));
+    assert!(control.unpersisted_updates.contains_key("v1: abc"));
     assert!(control.backend.load_torrents().unwrap().is_empty());
     control.torrents[0].uploaded_bytes = 0;
     control.persist_confirmed_update("v1: abc", None).unwrap();

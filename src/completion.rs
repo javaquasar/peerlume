@@ -1,6 +1,6 @@
 //! Shared, engine-confirmed completion and integrity-check presentation.
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompletionStatus {
     #[default]
     Pending,

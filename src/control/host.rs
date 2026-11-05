@@ -72,6 +72,9 @@ struct Envelope {
 }
 pub struct Host {
     stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pump_count: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<thread::JoinHandle<()>>,
     pub error: Arc<Mutex<Option<ErrorCode>>>,
 }
@@ -85,9 +88,20 @@ impl Host {
         let address = endpoint(&directory)?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let enabled = Arc::new(AtomicBool::new(false));
+        let (enabled, enabled_changes) = tokio::sync::watch::channel(false);
         let error = Arc::new(Mutex::new(None));
         let worker_error = error.clone();
+        let wake = {
+            let mut owner = owner
+                .lock()
+                .map_err(|_| io::Error::other("Owner lock poisoned"))?;
+            controller(&mut owner).owner_wake()
+        };
+        let worker_wake = wake.clone();
+        #[cfg(test)]
+        let pump_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_pump_count = pump_count.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -96,19 +110,31 @@ impl Host {
             .spawn(move || {
                 runtime.block_on(async move {
                     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
-                    let listener = tokio::spawn(listen(address, tx, enabled.clone(), worker_error));
-                    let mut interval = tokio::time::interval(Duration::from_millis(20));
+                    let listener = tokio::spawn(listen(address, tx, enabled_changes, worker_error));
+                    let mut incoming = None;
                     while !worker_stop.load(Ordering::Relaxed) {
-                        interval.tick().await;
+                        // Register before draining. A producer at the boundary
+                        // either completes this future or leaves a Notify permit.
+                        let notified = worker_wake.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        let mut delay = Duration::from_millis(10);
+                        let mut owner_available = false;
                         if let Ok(mut owner) = owner.try_lock() {
+                            owner_available = true;
                             let control = controller(&mut owner);
+                            #[cfg(test)]
+                            worker_pump_count.fetch_add(1, Ordering::Relaxed);
                             control.tick();
-                            enabled.store(
-                                control.agent.as_ref().is_some_and(|a| a.enabled),
-                                Ordering::Relaxed,
-                            );
+                            let next_enabled = control.agent.as_ref().is_some_and(|a| a.enabled);
+                            enabled.send_if_modified(|current| {
+                                let changed = *current != next_enabled;
+                                *current = next_enabled;
+                                changed
+                            });
                             for _ in 0..16 {
-                                let Ok(envelope) = rx.try_recv() else {
+                                let Some(envelope) = incoming.take().or_else(|| rx.try_recv().ok())
+                                else {
                                     break;
                                 };
                                 if !envelope.reply.is_closed() {
@@ -117,6 +143,15 @@ impl Host {
                                         .send(control.handle_request(envelope.request));
                                 }
                             }
+                            delay = control.next_wake_delay();
+                        }
+                        if owner_available && !rx.is_empty() {
+                            continue;
+                        }
+                        tokio::select! {
+                            _ = &mut notified => {},
+                            envelope = rx.recv(), if incoming.is_none() => { incoming = envelope; },
+                            _ = tokio::time::sleep(delay) => {},
                         }
                     }
                     listener.abort();
@@ -125,6 +160,9 @@ impl Host {
             })?;
         Ok(Self {
             stop,
+            wake,
+            #[cfg(test)]
+            pump_count,
             thread: Some(thread),
             error,
         })
@@ -133,6 +171,7 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -196,15 +235,17 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
 async fn listen(
     address: String,
     tx: mpsc::Sender<Envelope>,
-    enabled: Arc<AtomicBool>,
+    mut enabled: tokio::sync::watch::Receiver<bool>,
     error: Arc<Mutex<Option<ErrorCode>>>,
 ) {
     let permits = Arc::new(tokio::sync::Semaphore::new(wire::MAX_CONNECTIONS));
     let mut listening = None;
     loop {
-        if !enabled.load(Ordering::Relaxed) {
+        if !*enabled.borrow() {
             listening = None;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if enabled.changed().await.is_err() {
+                return;
+            }
             continue;
         }
         let pipe = match listening
@@ -226,8 +267,9 @@ async fn listen(
             .await
             .expect("semaphore open");
         loop {
-            match tokio::time::timeout(Duration::from_millis(50), pipe.connect()).await {
-                Ok(Ok(())) => {
+            tokio::select! {
+                result = pipe.connect() => match result {
+                Ok(()) => {
                     // Keep at least one pipe instance alive continuously. The first
                     // creation is exclusive, so a pre-existing endpoint is never trusted.
                     match windows_pipe(&address, false) {
@@ -245,9 +287,11 @@ async fn listen(
                     });
                     break;
                 }
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    if !enabled.load(Ordering::Relaxed) {
+                Err(_) => break,
+                },
+                changed = enabled.changed() => {
+                    if changed.is_err() { return; }
+                    if !*enabled.borrow() {
                         break;
                     }
                 }
@@ -257,7 +301,7 @@ async fn listen(
 }
 
 #[cfg(windows)]
-fn windows_pipe(
+pub(crate) fn windows_pipe(
     address: &str,
     first: bool,
 ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
@@ -356,14 +400,16 @@ fn windows_endpoint_rejects_an_existing_server_before_accepting_credentials() {
 async fn listen(
     address: String,
     tx: mpsc::Sender<Envelope>,
-    enabled: Arc<AtomicBool>,
+    mut enabled: tokio::sync::watch::Receiver<bool>,
     error: Arc<Mutex<Option<ErrorCode>>>,
 ) {
     use std::os::unix::fs::PermissionsExt;
     let permits = Arc::new(tokio::sync::Semaphore::new(wire::MAX_CONNECTIONS));
     loop {
-        if !enabled.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        if !*enabled.borrow() {
+            if enabled.changed().await.is_err() {
+                return;
+            }
             continue;
         }
         // InstanceLock is held by the owner; only this fixed stale socket is removed.
@@ -385,20 +431,24 @@ async fn listen(
         if std::fs::set_permissions(&address, std::fs::Permissions::from_mode(0o600)).is_err() {
             return;
         }
-        while enabled.load(Ordering::Relaxed) {
+        while *enabled.borrow() {
             let permit = permits
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("open semaphore");
-            if let Ok(Ok((stream, _))) =
-                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
-            {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break; };
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     connection(stream, tx).await;
                 });
+                },
+                changed = enabled.changed() => {
+                    if changed.is_err() { return; }
+                },
             }
         }
         drop(listener);

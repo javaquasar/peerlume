@@ -48,6 +48,7 @@ fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
         behavior_catalog: Err("Not used by layout tests".into()),
         trash_confirmation: None,
         pending_trash: None,
+        native_trash_plan: None,
     }
 }
 

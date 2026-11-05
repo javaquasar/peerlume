@@ -1,5 +1,47 @@
 use super::*;
 use serde_json::json;
+
+#[test]
+fn idle_owner_sleeps_until_notified_and_drop_wakes_it_promptly() {
+    let directory = tempfile::tempdir().unwrap();
+    let _lock = InstanceLock::acquire(directory.path()).unwrap();
+    let owner = Arc::new(Mutex::new(Controller::new(
+        crate::client::ClientBackend::offline(),
+        vec![],
+    )));
+    let host = Host::start(
+        owner.clone(),
+        |control| control,
+        directory.path().to_owned(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while host.pump_count.load(Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(30));
+    let before = host.pump_count.load(Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(140));
+    assert_eq!(
+        host.pump_count.load(Ordering::Relaxed),
+        before,
+        "idle pump must not poll every 20ms"
+    );
+    owner.lock().unwrap().owner_wake.notify_one();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while host.pump_count.load(Ordering::Relaxed) == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner lost an explicit wake"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let start = std::time::Instant::now();
+    drop(host);
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -243,10 +285,11 @@ fn unix_listener_never_removes_a_non_socket_discovery_path() {
     std::fs::write(&path, b"keep existing user file").unwrap();
     let error = Arc::new(Mutex::new(None));
     let (tx, _rx) = mpsc::channel(1);
+    let (_enabled, enabled_changes) = tokio::sync::watch::channel(true);
     runtime().block_on(listen(
         path.to_string_lossy().into_owned(),
         tx,
-        Arc::new(AtomicBool::new(true)),
+        enabled_changes,
         error.clone(),
     ));
     assert_eq!(*error.lock().unwrap(), Some(ErrorCode::PathDenied));

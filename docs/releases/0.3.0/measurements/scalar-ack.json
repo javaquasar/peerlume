@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "source_file_set_sha256": "6d35f25ec85a63b5f207053ec9b0aab079898578b3a3c517c355f6bd27c3ec61",
+  "comparison": "optimized_only_no_baseline",
+  "measurements": [
+    {
+      "acknowledgements": 20,
+      "canonical_child_read_authorizations": 0,
+      "canonical_child_write_authorizations": 0,
+      "canonical_child_write_guards": "15 aborting triggers; all acknowledgements succeeded",
+      "comparison": "optimized_only_no_baseline",
+      "debug_assertions": false,
+      "elapsed_ms": 28.1176,
+      "files": 100000,
+      "fullscan_steps": 0,
+      "kind": "opt4_scalar_ack_100k",
+      "limits": "SQL authorizations count preparation access requests, not rows or physical reads; PROFILE reports SQLite VM counters. Instrumentation overhead is included. Setup, guard creation and post-verification excluded. No matching baseline or speedup claim.",
+      "profiled_statements": 100,
+      "samples_ms": [
+        1.5081,
+        1.3575,
+        1.4021000000000001,
+        1.3520999999999999,
+        1.3663,
+        1.3758,
+        1.289,
+        1.2215,
+        1.3745999999999998,
+        1.3774,
+        1.4158,
+        1.5645,
+        1.358,
+        1.4597,
+        1.4673,
+        1.2925,
+        1.4915,
+        1.6513,
+        1.4913,
+        1.2826
+      ],
+      "schema": 1,
+      "setup_ms_excluded": 169.7737,
+      "sqlite_synchronous": "FULL",
+      "sqlite_total_changes_delta": 40,
+      "vm_steps": 1860
+    }
+  ]
+}

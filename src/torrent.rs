@@ -6,7 +6,7 @@ use crate::{
 #[cfg(test)]
 mod reliability_tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentState {
     Downloading,
     WaitingForEngine,
@@ -31,7 +31,7 @@ impl TorrentState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentPriority {
     Low,
     #[default]
@@ -39,7 +39,7 @@ pub enum TorrentPriority {
     High,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TorrentOverrides {
     pub transfer_settings: Option<crate::transfer_settings::TransferSettings>,
     pub repair_policy: crate::runtime_status::RepairPolicy,

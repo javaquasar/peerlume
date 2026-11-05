@@ -790,10 +790,8 @@ fn egui_trusted_access_panel_renders_without_enabling_access_or_issuing_tokens()
     control.agent_access().unwrap().enabled = false;
     let before = control.agent_access().unwrap().clients.len();
     let ctx = eframe::egui::Context::default();
-    let mut panel = frontends::AccessPanel {
-        open: true,
-        ..Default::default()
-    };
+    let mut panel = frontends::AccessPanel::default();
+    panel.open = true;
     let _ = ctx.run(Default::default(), |ctx| panel.show(&mut control, ctx));
     assert!(!control.agent_access().unwrap().enabled);
     assert_eq!(control.agent_access().unwrap().clients.len(), before);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run a local PeerLume frontend; Release is the default."""
+"""Build the PeerLume frontend and its background owner; Release is the default."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def launch_plan(arguments: list[str], root: Path) -> dict:
         forwarded.extend(arguments[separator + 1 :])
     profile = "debug" if options.dev else "release"
     binary_name = "peerlume-tui" if options.tui else "peerlume"
-    cargo = ["cargo", "build", "--locked", "--bin", binary_name]
+    cargo = ["cargo", "build", "--locked", "--bin", binary_name, "--bin", "peerlume-daemon"]
     cargo.extend(["--no-default-features", "--features", "tui"] if options.tui else ["--all-features"])
     if not options.dev:
         cargo.append("--release")
@@ -38,12 +38,14 @@ def launch_plan(arguments: list[str], root: Path) -> dict:
         # Cargo uses the JSON target's file stem as the output subdirectory.
         target_root /= Path(target).stem if target.endswith(".json") else target
     binary = target_root / profile / (binary_name + (".exe" if os.name == "nt" else ""))
+    daemon = binary.with_name("peerlume-daemon" + (".exe" if os.name == "nt" else ""))
     return {
         "profile": profile,
         "frontend": "tui" if options.tui else "gui",
         "repository": str(root),
         "build_command": [] if options.no_build else cargo,
         "client_command": [str(binary), *forwarded],
+        "daemon_executable": str(daemon),
         "print_only": options.print_command,
     }
 
@@ -63,8 +65,11 @@ def main(arguments: list[str] | None = None, *, root: Path | None = None) -> int
         if not Path(plan["client_command"][0]).is_file():
             print("The selected PeerLume executable does not exist; build it first.", file=sys.stderr)
             return 1
-        # No shell expansion and no profile rewriting. The application's existing
-        # per-profile owner lock remains authoritative, including duplicate launch.
+        if not Path(plan["daemon_executable"]).is_file():
+            print("The matching peerlume-daemon executable is missing beside the frontend; build the complete application first.", file=sys.stderr)
+            return 1
+        # The frontend attaches to the profile owner or starts its sibling daemon.
+        # No shell expansion or rewriting of an existing profile is performed here.
         return subprocess.run(plan["client_command"], cwd=root, check=False).returncode
     except OSError as error:
         print(f"Cannot build or launch PeerLume: {error}", file=sys.stderr)

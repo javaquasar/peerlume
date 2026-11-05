@@ -52,7 +52,7 @@ impl ModeConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModeApplication {
     #[default]
     AwaitingEngine,
@@ -115,7 +115,7 @@ impl RepairPolicy {
         }
     }
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RepairStatus {
     #[default]
     Idle,
@@ -152,7 +152,7 @@ pub struct RuntimeStatus {
     pub network_uploaded: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransferAction {
     Pause,
     Resume,

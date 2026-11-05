@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "workload": "empty_owner_idle_0_3_0",
+  "completed": true,
+  "source_label": "0.3.0-integrated-release",
+  "os": "Windows",
+  "architecture": "AMD64",
+  "daemon_sha256": "5383b1f3efc80ef7452990b6b37a15e563e131636d928c9e7c38a00b8be94f8e",
+  "frontend_sha256": "990973981ed79092c6ac4b3b1abff7fb9ba623043c75a508b4c445d58669fbd6",
+  "fixture": {
+    "torrents": 0,
+    "dht": false,
+    "pex": false,
+    "lsd": false,
+    "upnp": false,
+    "public_extra_trackers": false,
+    "utp": false,
+    "blocklist_update": false,
+    "listener": "engine default; fixture is not OS network isolation"
+  },
+  "limitations": [
+    "Optimized only: no paired baseline or CPU-reduction percentage",
+    "Empty disposable owner; not an active swarm or a long soak",
+    "Attach latency includes frontend process startup and native handshake/snapshot",
+    "Finite sampling can miss shorter RSS peaks; CPU timer granularity applies"
+  ],
+  "idle": {
+    "wall_ns": 2001084800,
+    "cpu_user_time_ns": 0,
+    "cpu_kernel_time_ns": 0,
+    "cpu_time_ns": 0,
+    "cpu_method": "GetProcessTimes live-owner delta",
+    "memory_sampling": {
+      "successful_samples": 20,
+      "requested_interval_ns": 100000000,
+      "first_sample_offset_ns": 400,
+      "last_sample_offset_ns": 1909872100,
+      "max_successful_sample_gap_ns": 101056000,
+      "unsampled_start_ns": 400,
+      "unsampled_tail_ns": 91212700,
+      "sampled_rss_peak_bytes": 12455936,
+      "sampled_rss_peak_offset_ns": 400,
+      "os_high_water_mark_observed_bytes": 12460032
+    }
+  },
+  "attach_probe_process_wall_ns": 181397900,
+  "owner_instance_unchanged": true,
+  "stop_cli_process_wall_ns": 1150209000,
+  "stop_cli_exit_code": 0,
+  "owner_exit_code": 0,
+  "journal_shutdown": {
+    "clean_shutdown": true,
+    "incomplete": false,
+    "error": null,
+    "segments": 1
+  }
+}

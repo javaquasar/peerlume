@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "workload": "optimization_comparison_0_3_0",
+  "source_label": "3d8242f-baseline",
+  "executable_file_name": "baseline-optimization-workload.exe",
+  "executable_sha256": "98e09d53921a74ae1e3283428e581f45230de7d7e81e756e38279c1051ccef4b",
+  "identity": {
+    "architecture": "x86_64",
+    "compiled_inputs_sha256": {
+      "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+      "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+      "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+      "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+    },
+    "debug_assertions": false,
+    "os": "windows"
+  },
+  "cases": [
+    {
+      "completed": true,
+      "elapsed_ns": 59351000,
+      "encoded_metainfo_bytes": 0,
+      "files": 1000,
+      "identity": {
+        "architecture": "x86_64",
+        "compiled_inputs_sha256": {
+          "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+          "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+          "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+          "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+        },
+        "debug_assertions": false,
+        "os": "windows"
+      },
+      "operation": "validate",
+      "schema_version": 1,
+      "workload": "optimization_workload_0_3_0",
+      "process_wall_ns": 104559200
+    },
+    {
+      "completed": true,
+      "elapsed_ns": 5604980300,
+      "encoded_metainfo_bytes": 0,
+      "files": 10000,
+      "identity": {
+        "architecture": "x86_64",
+        "compiled_inputs_sha256": {
+          "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+          "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+          "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+          "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+        },
+        "debug_assertions": false,
+        "os": "windows"
+      },
+      "operation": "validate",
+      "schema_version": 1,
+      "workload": "optimization_workload_0_3_0",
+      "process_wall_ns": 5639438700
+    },
+    {
+      "completed": false,
+      "timed_out": true,
+      "timeout_seconds": 15.0,
+      "operation": "validate",
+      "files": 100000,
+      "process_wall_ns": 15012801400
+    },
+    {
+      "completed": true,
+      "elapsed_ns": 58530300,
+      "encoded_metainfo_bytes": 49090,
+      "files": 1000,
+      "identity": {
+        "architecture": "x86_64",
+        "compiled_inputs_sha256": {
+          "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+          "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+          "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+          "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+        },
+        "debug_assertions": false,
+        "os": "windows"
+      },
+      "operation": "import",
+      "schema_version": 1,
+      "workload": "optimization_workload_0_3_0",
+      "process_wall_ns": 93240700
+    },
+    {
+      "completed": true,
+      "elapsed_ns": 5542272100,
+      "encoded_metainfo_bytes": 490090,
+      "files": 10000,
+      "identity": {
+        "architecture": "x86_64",
+        "compiled_inputs_sha256": {
+          "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+          "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+          "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+          "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+        },
+        "debug_assertions": false,
+        "os": "windows"
+      },
+      "operation": "import",
+      "schema_version": 1,
+      "workload": "optimization_workload_0_3_0",
+      "process_wall_ns": 5578640900
+    },
+    {
+      "completed": false,
+      "timed_out": true,
+      "timeout_seconds": 15.0,
+      "operation": "import",
+      "files": 100000,
+      "process_wall_ns": 15014392200
+    },
+    {
+      "completed": true,
+      "export_elapsed_ns": 7764600,
+      "exported_records": 128,
+      "files": 1000,
+      "identity": {
+        "architecture": "x86_64",
+        "compiled_inputs_sha256": {
+          "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+          "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+          "src/announce_journal.rs": "18dbc7ebd59ad1ec0985077f01a3834db3f1e590a9b0bd6d5be1fefb9c298742",
+          "src/limits.rs": "05750098cbe7c3a499848daed0dce8b55c3ac6f3e9730320bfb1ac8a4e2a9050"
+        },
+        "debug_assertions": false,
+        "os": "windows"
+      },
+      "operation": "journal",
+      "page_p50_ns": 600,
+      "page_p95_ns": 59700,
+      "record_128_elapsed_ns": 8994200,
+      "schema_version": 1,
+      "workload": "optimization_workload_0_3_0",
+      "process_wall_ns": 56795800
+    }
+  ],
+  "completed": false,
+  "limitations": [
+    "Wall-clock synthetic workloads; no network or user profile",
+    "Each child is bounded; timed-out cases retain their exact timeout instead of a guessed duration",
+    "No real-client RSS, sustained throughput or leak-absence claim"
+  ]
+}

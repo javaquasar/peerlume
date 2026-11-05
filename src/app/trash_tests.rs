@@ -112,6 +112,7 @@ impl Fixture {
             behavior_catalog: Err("Not used by recycling tests".into()),
             trash_confirmation: None,
             pending_trash: None,
+            native_trash_plan: None,
         };
         Self {
             _root: root,

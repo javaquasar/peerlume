@@ -1110,10 +1110,23 @@ impl SessionRuntime {
         self.events.try_recv().ok()
     }
 
+    pub(crate) fn set_event_wake(&self, wake: Arc<tokio::sync::Notify>) {
+        self.events.set_owner_wake(wake);
+    }
+
     /// A frontend lease, separate from acknowledged transfer command traffic.
     pub fn set_detail_interest(&self, interest: Option<(String, DetailInterest)>) {
         self.detail_interest
             .set(interest, std::time::Instant::now());
+    }
+
+    pub(crate) fn set_detail_interest_for(
+        &self,
+        consumer: &str,
+        interest: Option<(String, DetailInterest)>,
+    ) -> Result<(), String> {
+        self.detail_interest
+            .set_for(consumer, interest, std::time::Instant::now())
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<SessionEvent, String> {

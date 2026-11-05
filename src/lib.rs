@@ -16,6 +16,10 @@ pub mod identity;
 pub mod limits;
 #[cfg(any(feature = "gui", feature = "tui"))]
 mod live_history;
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub use live_history::finish_all_audit_writers;
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub mod audit_workers;
 pub mod magnet;
 pub mod metadata;
 pub mod metainfo;

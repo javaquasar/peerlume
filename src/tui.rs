@@ -126,13 +126,17 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn load() -> Self {
         let loaded = ClientSettings::load_checked();
-        let settings = loaded.as_ref().cloned().unwrap_or_default();
-        let backend = match loaded {
-            Ok(_) => ClientBackend::start(&settings),
+        let backend = match &loaded {
+            Ok(_) => ClientBackend::attach(&crate::settings::data_directory())
+                .unwrap_or_else(ClientBackend::blocked),
             Err(error) => {
                 ClientBackend::blocked(format!("Cannot read settings; engine not started: {error}"))
             }
         };
+        let settings = backend
+            .attached_client()
+            .map(|client| client.settings())
+            .unwrap_or_else(|| loaded.as_ref().cloned().unwrap_or_default());
         let (records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = records
             .iter()
@@ -147,7 +151,10 @@ impl TuiApp {
             .into_iter()
             .map(|record| torrent_from_record(record, &settings))
             .collect();
-        for torrent in &torrents {
+        for torrent in torrents
+            .iter()
+            .filter(|_| backend.attached_client().is_none())
+        {
             let _ = backend.send(add_torrent_command(torrent, &settings));
         }
         let mut app = Self::from_parts(settings, backend, torrents, tracker_audits);
@@ -208,6 +215,30 @@ impl TuiApp {
     }
 
     fn poll(&mut self) {
+        self.agent_panel.poll(&self.control);
+        if let Some(client) = self.control.backend.attached_client() {
+            for receipt in client.take_receipts() {
+                if receipt.label == "Agent view" {
+                    self.ui_dirty = true;
+                    continue;
+                }
+                self.status = receipt.message;
+                self.ui_dirty = true;
+                if let Some(settings) = receipt.settings {
+                    self.settings = settings;
+                    self.preferences_draft = None;
+                }
+            }
+            for (id, audit) in client.take_audits() {
+                if let Some(audit) = audit {
+                    self.tracker_audits.insert(id, audit);
+                    self.ui_dirty = true;
+                } else {
+                    self.tracker_audits.remove(&id);
+                    self.ui_dirty = true;
+                }
+            }
+        }
         let started = Instant::now();
         for _ in 0..256 {
             if started.elapsed() >= Duration::from_millis(4) {
@@ -283,8 +314,17 @@ impl TuiApp {
         } else {
             None
         };
-        self.control
-            .set_detail_interest(interest.filter(|(_, detail)| detail.files || detail.peers));
+        self.control.set_detail_interest(
+            interest
+                .clone()
+                .filter(|(_, detail)| detail.files || detail.peers),
+        );
+        if let Some(client) = self.control.backend.attached_client() {
+            client.set_journal_active(
+                self.page == MainPage::Torrents && self.details_tab == TorrentDetailsTab::Log,
+            );
+            client.set_visible_torrent(interest.map(|(id, _)| id));
+        }
     }
 
     fn push_log(&mut self, message: impl Into<String>) {
@@ -713,6 +753,12 @@ impl TuiApp {
             .ok_or("No selected torrent")?
             .info_hashes
             .join(";");
+        if let Some(client) = self.control.backend.attached_client() {
+            client.enqueue_submit(&id, command, self.control.command_revision(&id).ok())?;
+            return Ok(
+                "Awaiting background owner; engine confirmation and persistence pending".into(),
+            );
+        }
         self.control
             .submit(&id, command, None)
             .map_err(|error| error.to_string())?;
@@ -782,6 +828,13 @@ impl TuiApp {
         };
         let id = torrent.info_hashes.join(";");
         let audit = self.tracker_audits.get(&id).cloned();
+        if let Some(client) = self.control.backend.attached_client() {
+            self.status = client
+                .save_editable(&id, &torrent.trackers, audit.as_ref())
+                .map(|()| "Awaiting owner tracker settings save".into())
+                .unwrap_or_else(|error| error);
+            return;
+        }
         let record = torrent_to_record(torrent, audit);
         if let Err(error) = self.control.backend.save_torrent(&record) {
             self.status = format!("Could not save torrent: {error}");
@@ -940,6 +993,20 @@ impl TuiApp {
     }
 
     fn export_journal(&self, path: &Path, all: bool) -> Result<String, String> {
+        if let Some(client) = self.control.backend.attached_client() {
+            let id = if all {
+                None
+            } else {
+                Some(
+                    self.selected()
+                        .ok_or("Select a torrent")?
+                        .info_hashes
+                        .join(";"),
+                )
+            };
+            client.export(id, path.to_path_buf())?;
+            return Ok("Awaiting background owner full journal export".into());
+        }
         let hash = if all {
             None
         } else {
@@ -1062,6 +1129,9 @@ impl TuiApp {
         let name = torrent.name.clone();
         self.control
             .add(torrent, &self.settings, Some(audit.clone()))?;
+        if self.control.backend.attached_client().is_some() {
+            return Ok(format!("Awaiting owner registration of {name}"));
+        }
         self.tracker_audits.insert(id, audit);
         self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
@@ -1092,6 +1162,9 @@ impl TuiApp {
             overrides: TorrentOverrides::default(),
         };
         self.control.add(torrent, &self.settings, None)?;
+        if self.control.backend.attached_client().is_some() {
+            return Ok(format!("Awaiting owner registration of {name}"));
+        }
         self.selected_torrent = self.control.torrents.len() - 1;
         Ok(format!("Added {name}"))
     }
@@ -1116,6 +1189,22 @@ impl TuiApp {
         {
             return Err("Tracker URL must use http, https, or udp".into());
         }
+        if let Some(client) = self.control.backend.attached_client() {
+            let id = self
+                .selected()
+                .ok_or("No torrent selected")?
+                .info_hashes
+                .join(";");
+            if !client.audit_ready(&id) {
+                return Err("Authoritative tracker audit settings are still loading".into());
+            }
+            let trackers: Vec<_> = (!tracker_url.is_empty())
+                .then_some(tracker_url)
+                .into_iter()
+                .collect();
+            client.save_editable(&id, &trackers, client.audit_profile(&id).as_ref())?;
+            return Ok("Awaiting background owner tracker URL save".into());
+        }
         let Some(torrent) = self.selected_mut() else {
             return Err("No torrent selected".into());
         };
@@ -1128,6 +1217,15 @@ impl TuiApp {
     }
 
     fn start_tracker_audit(&mut self) {
+        if self.selected().is_some_and(|item| {
+            self.control
+                .backend
+                .attached_client()
+                .is_some_and(|client| !client.audit_ready(&item.info_hashes.join(";")))
+        }) {
+            self.status = "Authoritative tracker audit settings are still loading".into();
+            return;
+        }
         if self.audit_result.is_some() {
             self.status = "Tracker audit already running".into();
             return;
@@ -1173,12 +1271,7 @@ impl TuiApp {
             }
         };
         let steps = if profile.started_only {
-            let full_size = torrent
-                .files
-                .files()
-                .iter()
-                .map(|file| file.size_bytes)
-                .sum();
+            let full_size = torrent.files.total_size();
             vec![StoredTrackerAuditStep {
                 delay_seconds: 0,
                 uploaded: 0,
@@ -1199,14 +1292,14 @@ impl TuiApp {
             .collect::<Vec<_>>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        self.audit_cancel = Some(cancel);
+        self.audit_cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.audit_result = Some(receiver);
         self.status = format!(
             "Running {} tracker scenario step(s); x cancels",
             steps.len()
         );
-        std::thread::spawn(move || {
+        if let Err(error) = crate::audit_workers::spawn("peerlume-tui-audit", cancel, move || {
             let mut messages = crate::live_history::LiveHistory::default();
             for (index, step) in steps.iter().enumerate() {
                 if !crate::tracker_behavior::wait_for_delay(step.delay_seconds, &worker_cancel) {
@@ -1259,7 +1352,11 @@ impl TuiApp {
             let result = format!("{}\n{summary}", messages.status());
             messages.clear();
             let _ = sender.send(result);
-        });
+        }) {
+            self.audit_result = None;
+            self.audit_cancel = None;
+            self.status = format!("Could not start audit worker: {error}");
+        }
     }
 
     fn apply_behavior_profile(&mut self, id: &str) -> Result<String, String> {
@@ -1270,10 +1367,8 @@ impl TuiApp {
         let torrent = self.selected().ok_or("No torrent selected")?;
         let full_size = torrent
             .files
-            .files()
-            .iter()
-            .map(|file| file.size_bytes)
-            .sum();
+            .checked_total_size()
+            .ok_or("Torrent total size overflow")?;
         let profile = catalog.resolve(
             id,
             full_size,
@@ -1281,9 +1376,13 @@ impl TuiApp {
             self.settings.connection.listen_port,
         )?;
         let torrent_id = torrent.info_hashes.join(";");
-        let record = torrent_to_record(torrent, Some(profile.clone()));
-        self.control.backend.save_torrent(&record)?;
+        self.control
+            .backend
+            .save_tracker_audit(&torrent_id, Some(&profile))?;
         self.tracker_audits.insert(torrent_id, profile);
+        if self.control.backend.attached_client().is_some() {
+            return Ok(format!("Awaiting owner save for tracker profile '{id}'"));
+        }
         Ok(format!(
             "Applied tracker profile '{id}'; A runs the saved scenario"
         ))
@@ -1583,6 +1682,10 @@ impl TuiApp {
                 );
             }
             TorrentDetailsTab::Files => {
+                if !torrent.files.details_loaded() {
+                    frame.render_widget(Paragraph::new(format!("Loading {} authoritative file details. Errors are shown in the status line; selection commands wait for the full tree.",torrent.files.file_count())).wrap(Wrap{trim:false}).block(Block::default().title(" Files ").borders(Borders::ALL)),areas[1]);
+                    return;
+                }
                 let height = areas[1].height.saturating_sub(2).max(1) as usize;
                 let start = self.selected_file.saturating_sub(height - 1);
                 let items = torrent
@@ -1961,17 +2064,17 @@ impl Drop for TuiApp {
 pub fn run() -> io::Result<()> {
     crate::settings::configure_profile_from_args()?;
     let directory = crate::settings::data_directory();
-    let _instance = crate::control::host::InstanceLock::acquire(&directory)?;
-    let mut terminal = TerminalGuard::enter()?;
     let mut app = TuiApp::load();
+    if app.control.backend.attached_client().is_none() {
+        return Err(io::Error::other(app.status.clone()));
+    }
+    let mut terminal = TerminalGuard::enter()?;
     let download_root = PathBuf::from(&app.settings.download.download_directory);
     app.control
         .configure_agents(&directory, download_root)
         .map_err(|e| io::Error::other(format!("Agent initialization failed: {e:?}")))?;
     let _ = app.control.set_agent_settings(&app.settings);
     let owner = Arc::new(std::sync::Mutex::new(app));
-    let _host =
-        crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
     let mut last_draw = Instant::now();
     let mut drawn_revision = None;
     let mut input_changed = true;
@@ -2163,6 +2266,19 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+
+    fn add_audit_state_store(app: &mut TuiApp) {
+        let mut store = crate::state::StateStore::in_memory_with_secrets(Arc::new(
+            crate::secrets::MemorySecrets::default(),
+        ))
+        .unwrap();
+        for torrent in &app.control.torrents {
+            store
+                .save_torrent(&torrent_to_record(torrent, None))
+                .unwrap();
+        }
+        app.control.backend = ClientBackend::with_state_store(store);
+    }
 
     #[test]
     #[ignore = "installed frontend workflow; Reliability CI supplies the copied adapter"]
@@ -2534,6 +2650,7 @@ mod tests {
     #[test]
     fn external_profile_application_uses_shared_resolver_and_keeps_url() {
         let mut app = app();
+        add_audit_state_store(&mut app);
         app.behavior_catalog =
             BehaviorCatalog::from_toml(include_str!("../config/tracker-behaviors.example.toml"));
         let original_trackers = app.control.torrents[0].trackers.clone();
@@ -2598,6 +2715,7 @@ mod tests {
 
         let mut app = app();
         app.control.torrents[0].trackers = vec![format!("http://{address}/announce")];
+        add_audit_state_store(&mut app);
         app.behavior_catalog = BehaviorCatalog::from_toml(
             &include_str!("../config/tracker-behaviors.example.toml")
                 .replace("delay_seconds = 1800", "delay_seconds = 0"),

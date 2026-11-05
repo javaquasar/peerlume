@@ -1,7 +1,7 @@
 //! Latest telemetry per torrent, with ordered, non-dropping control delivery.
 use super::{CompletionStatus, SessionEvent};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -23,6 +23,7 @@ struct Pending {
     sequence: u64,
     controls: VecDeque<Stamped>,
     telemetry: HashMap<(String, Kind), Stamped>,
+    ordered: BTreeMap<u64, (String, Kind)>,
     sender_closed: bool,
     receiver_closed: bool,
     control_capacity: usize,
@@ -31,6 +32,7 @@ struct Pending {
 struct Shared {
     pending: Mutex<Pending>,
     ready: Condvar,
+    owner_wake: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 pub(super) struct Sender(Arc<Shared>);
 pub(super) struct Receiver(Arc<Shared>);
@@ -82,7 +84,17 @@ impl Sender {
             }
         }
         if let SessionEvent::Removed { id } = &event {
-            pending.telemetry.retain(|(torrent, _), _| torrent != id);
+            for kind in [
+                Kind::Storage,
+                Kind::Peers,
+                Kind::Stats,
+                Kind::Network,
+                Kind::Checking,
+            ] {
+                if let Some(previous) = pending.telemetry.remove(&(id.clone(), kind)) {
+                    pending.ordered.remove(&previous.sequence);
+                }
+            }
             if pending.telemetry.is_empty() {
                 pending.telemetry.shrink_to_fit();
             }
@@ -93,6 +105,9 @@ impl Sender {
             pending
                 .telemetry
                 .retain(|(_, kind), _| matches!(kind, Kind::Network));
+            pending
+                .ordered
+                .retain(|_, (_, kind)| matches!(kind, Kind::Network));
         }
         pending.sequence += 1;
         let stamped = Stamped {
@@ -100,45 +115,68 @@ impl Sender {
             event,
         };
         if let Some(key) = key {
-            pending.telemetry.insert(key, stamped);
+            let sequence = stamped.sequence;
+            if let Some(previous) = pending.telemetry.insert(key.clone(), stamped) {
+                pending.ordered.remove(&previous.sequence);
+            }
+            pending.ordered.insert(sequence, key);
         } else {
             pending.controls.push_back(stamped);
         }
         self.0.ready.notify_one();
+        drop(pending);
+        if let Some(wake) = self
+            .0
+            .owner_wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            wake.notify_one();
+        }
         Ok(())
     }
 }
 impl Pending {
     fn pop(&mut self) -> Option<SessionEvent> {
-        let first = self
-            .telemetry
-            .iter()
-            .min_by_key(|(_, value)| value.sequence);
-        if let Some((key, value)) = first
-            && self
-                .controls
-                .front()
-                .is_none_or(|c| value.sequence < c.sequence)
+        let first = self.ordered.first_key_value();
+        if let Some((&sequence, _)) = first
+            && self.controls.front().is_none_or(|c| sequence < c.sequence)
         {
-            let key = key.clone();
+            let (_, key) = self.ordered.pop_first().expect("first entry exists");
             return self.telemetry.remove(&key).map(|item| item.event);
         }
         self.controls.pop_front().map(|item| item.event)
     }
 }
 impl Receiver {
+    pub fn set_owner_wake(&self, wake: Arc<tokio::sync::Notify>) {
+        *self.0.owner_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake.clone());
+        // Installing after an event was queued must still wake the new owner.
+        wake.notify_one();
+    }
     #[cfg(test)]
     pub fn pending_controls(&self) -> usize {
         self.0.pending.lock().unwrap().controls.len()
     }
     pub fn try_recv(&self) -> Result<SessionEvent, String> {
-        let event = self
-            .0
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop();
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let event = pending.pop();
+        let more = !pending.controls.is_empty() || !pending.ordered.is_empty();
+        drop(pending);
         self.0.ready.notify_all();
+        // The owner drains bounded batches. Preserve a permit while work is
+        // left even when thousands of producer notifications were coalesced.
+        if more
+            && let Some(wake) = self
+                .0
+                .owner_wake
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+        {
+            wake.notify_one();
+        }
         event.ok_or_else(|| "No session event available".into())
     }
     pub fn close(&self) {
@@ -146,6 +184,7 @@ impl Receiver {
         pending.receiver_closed = true;
         pending.controls.clear();
         pending.telemetry.clear();
+        pending.ordered.clear();
         self.0.ready.notify_all();
     }
     pub fn recv_timeout(&self, timeout: Duration) -> Result<SessionEvent, String> {
@@ -191,6 +230,63 @@ impl Drop for Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordered_index_tracks_replacement_removal_and_control_barriers() {
+        let (sender, receiver) = channel(8);
+        for index in 0..5_000 {
+            sender.send(stats(&index.to_string(), 1, 0)).unwrap();
+        }
+        sender
+            .send(SessionEvent::Added {
+                id: "barrier".into(),
+            })
+            .unwrap();
+        for index in 0..5_000 {
+            sender.send(stats(&index.to_string(), 2, 0)).unwrap();
+        }
+        assert!(
+            matches!(receiver.try_recv().unwrap(), SessionEvent::Added { id } if id == "barrier")
+        );
+        sender
+            .send(SessionEvent::Removed { id: "17".into() })
+            .unwrap();
+        {
+            let pending = sender.0.pending.lock().unwrap();
+            assert_eq!(pending.ordered.len(), 4_999);
+            assert_eq!(pending.ordered.len(), pending.telemetry.len());
+        }
+        for index in (0..5_000).filter(|index| *index != 17) {
+            assert!(
+                matches!(receiver.try_recv().unwrap(), SessionEvent::Stats { id, downloaded_bytes: 2, .. } if id == index.to_string())
+            );
+        }
+        assert!(matches!(receiver.try_recv().unwrap(), SessionEvent::Removed { id } if id == "17"));
+        assert!(receiver.try_recv().is_err());
+        let pending = sender.0.pending.lock().unwrap();
+        assert!(pending.ordered.is_empty());
+    }
+
+    #[test]
+    fn event_arriving_before_owner_registration_leaves_a_wake_permit() {
+        let (sender, receiver) = channel(8);
+        sender.send(stats("a", 1, 0)).unwrap();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        receiver.set_owner_wake(wake.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), wake.notified())
+                .await
+                .unwrap();
+            receiver.try_recv().unwrap();
+            sender.send(stats("a", 2, 0)).unwrap();
+            tokio::time::timeout(Duration::from_millis(100), wake.notified())
+                .await
+                .unwrap();
+        });
+    }
     #[test]
     fn final_network_totals_are_delivered_before_shutdown_acknowledgement() {
         let (sender, receiver) = channel(8);

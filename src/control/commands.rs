@@ -5,9 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::Controller;
-#[cfg(any(test, feature = "gui", feature = "tui"))]
+#[cfg(test)]
+use crate::client::torrent_to_record;
+use crate::state::StoredTrackerAuditProfile;
 use crate::torrent::TorrentState;
-use crate::{client::torrent_to_record, state::StoredTrackerAuditProfile};
 use crate::{
     client::{ClientBackend, mode_submission_failed},
     runtime_status::{ModeApplication, ModeConfig, RepairPolicy},
@@ -124,9 +125,7 @@ impl TorrentCommand {
                 config.validate().map_err(|_| CommandError::InvalidMode)?;
                 let full_size = torrent
                     .files
-                    .files()
-                    .iter()
-                    .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
+                    .checked_total_size()
                     .ok_or(CommandError::InvalidMode)?;
                 config
                     .mode
@@ -157,10 +156,10 @@ impl TorrentCommand {
                 enabled: *enabled,
             },
             Self::SetFiles(indices) => {
-                if indices.len() > torrent.files.files().len()
+                if indices.len() > torrent.files.file_count()
                     || indices
                         .iter()
-                        .any(|index| *index >= torrent.files.files().len())
+                        .any(|index| *index >= torrent.files.file_count())
                 {
                     return Err(CommandError::InvalidFileSelection);
                 }
@@ -179,13 +178,15 @@ impl Controller {
     /// Revision changes on registration and accepted commands, not telemetry.
     /// It is local to this controller lifetime; durable operations are a later slice.
     pub fn command_revision(&self, id: &str) -> Result<u64, CommandError> {
+        let matches = |torrent: &&crate::torrent::TorrentItem| {
+            torrent.info_hashes.join(";") == id || torrent.info_hashes.iter().any(|hash| hash == id)
+        };
         let torrent = self
-            .torrents
-            .iter()
-            .find(|torrent| {
-                torrent.info_hashes.join(";") == id
-                    || torrent.info_hashes.iter().any(|hash| hash == id)
-            })
+            .torrent_indices
+            .get(id)
+            .and_then(|index| self.torrents.get(*index))
+            .filter(matches)
+            .or_else(|| self.torrents.iter().find(matches))
             .ok_or(CommandError::UnknownTorrent)?;
         self.observed
             .get(&torrent.info_hashes.join(";"))
@@ -199,6 +200,9 @@ impl Controller {
         command: TorrentCommand,
         expected_revision: Option<u64>,
     ) -> Result<AcceptedCommand, CommandError> {
+        if let Some(client) = self.backend.attached_client() {
+            return client.submit(id, &command, expected_revision);
+        }
         self.submit_via(id, command, expected_revision, |backend, command| {
             backend.send_checked(command).map_err(Into::into)
         })
@@ -211,20 +215,9 @@ impl Controller {
         expected_revision: Option<u64>,
         send: impl FnOnce(&ClientBackend, SessionCommand) -> Result<(), CommandError>,
     ) -> Result<AcceptedCommand, CommandError> {
-        let index = self
-            .torrents
-            .iter()
-            .position(|torrent| {
-                torrent.info_hashes.join(";") == id
-                    || torrent.info_hashes.iter().any(|hash| hash == id)
-            })
-            .ok_or(CommandError::UnknownTorrent)?;
+        let index = self.torrent_index(id).ok_or(CommandError::UnknownTorrent)?;
         self.reconcile();
-        if self
-            .agent
-            .as_ref()
-            .is_some_and(|agent| agent.busy(&self.torrents[index].info_hashes.join(";")))
-        {
+        if self.is_busy(&self.torrents[index].info_hashes.join(";")) {
             return Err(CommandError::OperationInProgress);
         }
         let result = self.submit_registered_via(index, command, expected_revision, send);
@@ -302,20 +295,18 @@ impl Controller {
 
     /// Trusted local retry, using this owner's saved settings and existing engine.
     /// No new IPC command or grant. A failed registration is not a resumable handle.
-    #[cfg(any(test, feature = "gui"))]
     pub(crate) fn retry_start(
         &mut self,
         id: &str,
         settings: &crate::settings::ClientSettings,
     ) -> Result<(), String> {
+        if let Some(client) = self.backend.attached_client() {
+            return client.retry_start(id, settings);
+        }
         use crate::runtime_status::TransferAction;
-        let index = self
-            .torrents
-            .iter()
-            .position(|torrent| torrent.info_hashes.join(";") == id)
-            .ok_or("Torrent is unavailable")?;
+        let index = self.torrent_index(id).ok_or("Torrent is unavailable")?;
         self.reconcile();
-        if self.agent.as_ref().is_some_and(|agent| agent.busy(id))
+        if self.is_busy(id)
             || self.torrents[index]
                 .runtime
                 .command
@@ -376,19 +367,16 @@ impl Controller {
         id: &str,
         audit: Option<StoredTrackerAuditProfile>,
     ) -> Result<(), String> {
-        let torrent = self
-            .torrents
-            .iter()
-            .find(|torrent| torrent.info_hashes.join(";") == id)
-            .ok_or("Torrent is unavailable")?;
-        if !self.unpersisted_updates.contains(id) {
+        let index = self.torrent_index(id).ok_or("Torrent is unavailable")?;
+        let torrent = &self.torrents[index];
+        let Some(intent) = self.unpersisted_updates.get(id).copied() else {
             return Err("No confirmed update to persist".into());
-        }
+        };
         if !self.backend.persistence_available() {
             return Err("Persistent state store is unavailable".into());
         }
-        let record = torrent_to_record(torrent, audit);
-        self.backend.save_torrent(&record)?;
+        self.backend
+            .persist_torrent_update(torrent, intent, audit.as_ref())?;
         self.unpersisted_updates.remove(id);
         Ok(())
     }
@@ -397,6 +385,45 @@ impl Controller {
     /// have changed state. The same validation/send path handles each request.
     #[cfg(any(test, feature = "gui", feature = "tui"))]
     pub(crate) fn submit_batch(&mut self, resume: bool) -> String {
+        if let Some(client) = self.backend.attached_client() {
+            let command = if resume {
+                TorrentCommand::Resume
+            } else {
+                TorrentCommand::Pause
+            };
+            let mut queued = 0;
+            let mut failed = 0;
+            for item in &self.torrents {
+                let eligible = if resume {
+                    matches!(
+                        item.state,
+                        TorrentState::Paused
+                            | TorrentState::Error
+                            | TorrentState::VerificationFailed
+                    )
+                } else {
+                    matches!(
+                        item.state,
+                        TorrentState::Downloading
+                            | TorrentState::WaitingForEngine
+                            | TorrentState::Seeding
+                            | TorrentState::Checking
+                    )
+                };
+                if eligible {
+                    let id = item.info_hashes.join(";");
+                    match client.enqueue_submit(
+                        &id,
+                        command.clone(),
+                        self.command_revision(&id).ok(),
+                    ) {
+                        Ok(()) => queued += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+            }
+            return format!("Awaiting background owner: {queued} queued, {failed} not queued");
+        }
         self.submit_batch_via(resume, |backend, command| {
             backend.send_checked(command).map_err(Into::into)
         })

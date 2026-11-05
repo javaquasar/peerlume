@@ -3,6 +3,10 @@ use peerlume::app::HostedGui;
 fn main() -> eframe::Result<()> {
     peerlume::settings::configure_profile_from_args()
         .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    if std::env::args().any(|argument| argument == "--attach-check") {
+        return peerlume::control::frontend::attach_check(&peerlume::settings::data_directory())
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)));
+    }
     if std::env::args().any(|argument| argument == "--update-blocklist") {
         let settings = peerlume::settings::ClientSettings::load();
         match peerlume::blocklist::download_and_cache(&settings.privacy.blocklist_url) {
@@ -28,9 +32,12 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let outcome = eframe::run_native(
         "PeerLume",
         options,
         Box::new(|_creation_context| Ok(Box::new(HostedGui::start()?))),
-    )
+    );
+    let drained = peerlume::audit_workers::finish_after_close()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))));
+    outcome.and(drained)
 }

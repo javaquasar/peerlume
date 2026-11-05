@@ -31,6 +31,7 @@ fn sample(repetitions: usize, mut operation: impl FnMut(usize)) -> Value {
 
 fn record(index: usize, files: usize) -> TorrentRecord {
     TorrentRecord {
+        files_complete: true,
         resume: ResumeCounters::default(),
         transfer_settings: None,
         repair_policy: Default::default(),

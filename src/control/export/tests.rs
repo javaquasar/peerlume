@@ -155,9 +155,12 @@ fn oversized_journal_fails_without_reading_half_a_gigabyte() {
         );
     }
     file.set_len(512 * 1024 * 1024 + 1).unwrap();
+    let job = start(&journal, "a".into(), output(root.path()), now_ms() + 10_000).unwrap();
     assert_eq!(
-        start(&journal, "a".into(), output(root.path()), now_ms() + 10_000).err(),
-        Some(ErrorCode::TooLarge)
+        job.receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap(),
+        Err(ErrorCode::TooLarge)
     );
 }
 

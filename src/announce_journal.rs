@@ -1,10 +1,16 @@
-//! Bounded live view plus an append-only, flushed JSONL journal of real announces.
+//! Bounded live view and nonblocking admission to one ordered disk writer.
+pub(crate) mod writer;
+pub use writer::{JournalOptions, JournalStatus};
+#[cfg(test)]
+mod async_tests;
 pub use librqbit_tracker_comms::{AnnounceMetrics, AnnounceObservation, AnnounceReply};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -50,7 +56,7 @@ impl JournalEntry {
             a.elapsed_ms
         )
     }
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         let _ = self.summary();
         let a = &self.announce;
         std::mem::size_of::<Self>()
@@ -76,6 +82,7 @@ impl JournalEntry {
             + a.reply.peers.capacity() * std::mem::size_of::<std::net::SocketAddr>()
     }
 }
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JournalPage {
     pub entries: Vec<Arc<JournalEntry>>,
     pub total: usize,
@@ -89,14 +96,18 @@ struct Inner {
     max_entries: usize,
     max_bytes: usize,
     sequence: u64,
-    writer: Option<BufWriter<File>>,
     path: Option<PathBuf>,
     error: Option<String>,
+    remote_run_id: Option<String>,
 }
 #[derive(Clone)]
 pub struct AnnounceJournal {
     run_id: String,
     inner: Arc<Mutex<Inner>>,
+    dispatch: Arc<Mutex<()>>,
+    disk: Option<Arc<writer::DiskWriter>>,
+    restored: Option<Arc<writer::Snapshot>>,
+    frontend: bool,
 }
 static RUN: AtomicU64 = AtomicU64::new(0);
 impl Default for AnnounceJournal {
@@ -123,26 +134,39 @@ impl AnnounceJournal {
                 max_entries: LIVE_CAPACITY,
                 max_bytes: LIVE_BYTE_BUDGET,
                 sequence: 0,
-                writer: None,
                 path: None,
                 error: None,
+                remote_run_id: None,
             })),
+            dispatch: Arc::new(Mutex::new(())),
+            disk: None,
+            restored: None,
+            frontend: false,
         }
     }
     pub fn open(directory: &Path) -> Self {
-        let journal = Self::memory();
-        let path = directory.join(format!("announces-{}.jsonl", journal.run_id));
-        let result = std::fs::create_dir_all(directory)
-            .and_then(|()| OpenOptions::new().create_new(true).write(true).open(&path));
-        let mut inner = journal.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match result {
-            Ok(file) => {
-                inner.writer = Some(BufWriter::new(file));
-                inner.path = Some(path);
+        Self::open_with_options(directory, JournalOptions::default())
+    }
+    pub fn open_with_options(directory: &Path, options: JournalOptions) -> Self {
+        let mut journal = Self::memory();
+        match writer::DiskWriter::start(directory, &journal.run_id, writer::Kind::Announce, options)
+        {
+            Ok(disk) => {
+                journal
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .path = Some(disk.path());
+                journal.disk = Some(disk);
             }
-            Err(e) => inner.error = Some(format!("JSONL logging unavailable: {e}")),
+            Err(error) => {
+                journal
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .error = Some(error)
+            }
         }
-        drop(inner);
         journal
     }
     pub fn observer(&self) -> librqbit_tracker_comms::Observer {
@@ -150,41 +174,196 @@ impl AnnounceJournal {
         Arc::new(move |observation| journal.record(observation))
     }
     pub fn record(&self, announce: AnnounceObservation) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.sequence += 1;
-        let entry = JournalEntry {
+        if self.frontend || self.restored.is_some() {
+            self.inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .error = Some("Read-only journal cannot record observations".into());
+            return;
+        }
+        // Serialize concurrent producers, never readers or disk I/O. This keeps
+        // sequence allocation and bounded admission in exactly the same order.
+        let _dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let sequence = {
+            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(next) = inner.sequence.checked_add(1) else {
+                inner.error = Some("Journal sequence overflow".into());
+                return;
+            };
+            inner.sequence = next;
+            next
+        };
+        let entry = Arc::new(JournalEntry {
             summary_cache: OnceLock::new(),
             schema_version: 1,
             run_id: self.run_id.clone(),
-            sequence: inner.sequence,
+            sequence,
             announce,
-        };
-        if let Some(writer) = &mut inner.writer {
-            let result = serde_json::to_writer(&mut *writer, &entry)
-                .map_err(std::io::Error::other)
-                .and_then(|()| writer.write_all(b"\n"))
-                .and_then(|()| writer.flush());
-            if let Err(error) = result {
-                inner.error = Some(format!(
-                    "JSONL write failed; disk log is incomplete: {error}"
-                ));
-                inner.writer = None;
-            }
-        }
+        });
         let weight = entry.retained_bytes();
-        if weight > inner.max_bytes {
-            inner.skipped_oversize += 1;
-            return;
+        let admission_error = self
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.enqueue(Some(sequence), entry.clone(), weight).err());
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = admission_error {
+            inner.error.get_or_insert(error);
         }
-        while inner.entries.len() >= inner.max_entries
-            || inner.retained_bytes.saturating_add(weight) > inner.max_bytes
+        retain(&mut inner, entry, weight);
+    }
+    pub fn status(&self) -> JournalStatus {
+        let mut status = self.disk.as_ref().map_or_else(
+            || {
+                self.restored.as_ref().map_or_else(
+                    || JournalStatus {
+                        error: self
+                            .inner
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .error
+                            .clone(),
+                        ..Default::default()
+                    },
+                    |snapshot| snapshot.status(),
+                )
+            },
+            |disk| disk.status(),
+        );
+        if status.error.is_none() {
+            status.error = self
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .error
+                .clone();
+        }
+        status
+    }
+    pub fn run_id(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remote_run_id
+            .clone()
+            .unwrap_or_else(|| self.run_id.clone())
+    }
+    pub fn manifest_path(&self) -> Option<PathBuf> {
+        self.disk
+            .as_ref()
+            .map(|disk| disk.manifest_path())
+            .or_else(|| {
+                self.restored
+                    .as_ref()
+                    .map(|snapshot| snapshot.manifest_path())
+            })
+    }
+    /// A barrier includes every record admitted before it; it never holds the live mutex.
+    pub fn flush(&self) -> Result<(), String> {
+        if self.frontend {
+            return Err("Frontend journal exports and flushes belong to its owner".into());
+        }
+        if self.disk.is_none() && self.restored.is_none() {
+            return self.error().map_or(Ok(()), Err);
+        }
+        self.snapshot(None).map(|_| ())
+    }
+    pub fn finish(&self) -> Result<(), String> {
+        if self.frontend {
+            return Err("Frontend journal exports and flushes belong to its owner".into());
+        }
+        let finished = self.disk.as_ref().map_or(Ok(()), |disk| disk.finish());
+        finished.and(self.error().map_or(Ok(()), Err))
+    }
+    pub fn frontend_view() -> Self {
+        let mut journal = Self::memory();
+        journal.frontend = true;
+        journal
+    }
+    pub fn replace_frontend_entries(
+        &self,
+        mut entries: Vec<JournalEntry>,
+        source_path: Option<PathBuf>,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        if !self.frontend {
+            return Err("Only a frontend projection can replace owner observations".into());
+        }
+        if entries.len() > LIVE_CAPACITY {
+            return Err("Frontend journal exceeds its entry bound".into());
+        }
+        entries.sort_by_key(|entry| entry.sequence);
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].sequence == pair[1].sequence)
+            || entries.iter().any(|entry| {
+                entry.schema_version != 1
+                    || entry.sequence == 0
+                    || entry.run_id != entries[0].run_id
+            })
         {
-            if let Some((_, bytes)) = inner.entries.pop_front() {
-                inner.retained_bytes -= bytes;
-            }
+            return Err("Frontend journal identity or sequences are invalid".into());
         }
-        inner.retained_bytes += weight;
-        inner.entries.push_back((Arc::new(entry), weight));
+        let mut retained = 0usize;
+        let mut shared = VecDeque::new();
+        for entry in entries {
+            let weight = entry.retained_bytes();
+            retained = retained.saturating_add(weight);
+            if retained > LIVE_BYTE_BUDGET {
+                return Err("Frontend journal exceeds its byte bound".into());
+            }
+            shared.push_back((Arc::new(entry), weight));
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        inner.remote_run_id = shared.front().map(|(entry, _)| entry.run_id.clone());
+        inner.sequence = shared.back().map_or(0, |(entry, _)| entry.sequence);
+        inner.entries = shared;
+        inner.retained_bytes = retained;
+        inner.skipped_oversize = 0;
+        inner.path = source_path;
+        inner.error = error;
+        Ok(())
+    }
+    pub fn reopen(manifest_path: &Path) -> Result<Self, String> {
+        let snapshot = writer::Snapshot::reopen(manifest_path)?;
+        let mut journal = Self::memory();
+        journal.run_id = snapshot.run_id().to_owned();
+        snapshot.stream(&mut std::io::sink(), None, |entry| {
+            let weight = entry.retained_bytes();
+            let mut inner = journal
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inner.sequence = entry.sequence;
+            retain(&mut inner, Arc::new(entry), weight);
+        })?;
+        journal
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .path = Some(snapshot.first_path());
+        journal.restored = Some(Arc::new(snapshot));
+        Ok(journal)
+    }
+    fn snapshot(&self, limit: Option<u64>) -> Result<writer::Snapshot, String> {
+        if self.frontend {
+            return Err("Frontend journal export must be requested from its owner".into());
+        }
+        if self.error().is_some() {
+            return Err("Disk journal is incomplete".into());
+        }
+        if let Some(disk) = &self.disk {
+            return disk.snapshot(limit);
+        }
+        if let Some(snapshot) = &self.restored {
+            if limit.is_some_and(|limit| snapshot.length().map_or(true, |length| length > limit)) {
+                return Err(writer::EXPORT_TOO_LARGE.into());
+            }
+            return Ok((**snapshot).clone());
+        }
+        Err("No disk journal is available".into())
     }
     pub fn entries(&self, hash: Option<&str>) -> Vec<Arc<JournalEntry>> {
         self.inner
@@ -243,33 +422,16 @@ impl AnnounceJournal {
             .unwrap_or_else(|e| e.into_inner())
             .error
             .clone()
+            .or_else(|| self.disk.as_ref().and_then(|disk| disk.status().error))
     }
     /// Streams the complete disk journal, not just the in-memory tail. Never overwrites a file.
     pub(crate) fn disk_snapshot(&self) -> Result<(File, u64), String> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.error.is_some() {
-            return Err("Disk journal is incomplete".into());
-        }
-        let path = inner.path.as_ref().ok_or("No disk journal is available")?;
-        let file = File::open(path).map_err(|_| "Disk journal is unavailable")?;
-        let length = file
-            .metadata()
-            .map_err(|_| "Disk journal is unavailable")?
-            .len();
-        Ok((file, length))
+        self.snapshot(Some(512 * 1024 * 1024))?
+            .file(512 * 1024 * 1024)
     }
 
     pub fn export(&self, destination: &Path, hash: Option<&str>) -> Result<u64, String> {
-        let (path, length, error) = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let path = inner.path.clone().ok_or("No disk journal is available")?;
-            let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-            (path, length, inner.error.clone())
-        };
-        if let Some(error) = error {
-            return Err(error);
-        }
-        let source = BufReader::new(File::open(path).map_err(|e| e.to_string())?.take(length));
+        let snapshot = self.snapshot(None)?;
         let mut out = BufWriter::new(
             OpenOptions::new()
                 .create_new(true)
@@ -277,18 +439,31 @@ impl AnnounceJournal {
                 .open(destination)
                 .map_err(|e| e.to_string())?,
         );
-        let mut count = 0;
-        for line in source.lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            let entry: JournalEntry = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-            if hash.is_none_or(|h| entry.announce.info_hash == h) {
-                writeln!(out, "{line}").map_err(|e| e.to_string())?;
-                count += 1;
-            }
-        }
+        let count = snapshot.stream(&mut out, hash, |_| {})?;
         out.flush().map_err(|e| e.to_string())?;
+        out.get_ref()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
         Ok(count)
     }
+}
+
+fn retain(inner: &mut Inner, entry: Arc<JournalEntry>, weight: usize) {
+    if weight > inner.max_bytes {
+        inner.skipped_oversize += 1;
+        return;
+    }
+    while inner.entries.len() >= inner.max_entries
+        || inner.retained_bytes.saturating_add(weight) > inner.max_bytes
+    {
+        if let Some((_, bytes)) = inner.entries.pop_front() {
+            inner.retained_bytes -= bytes;
+        } else {
+            break;
+        }
+    }
+    inner.retained_bytes += weight;
+    inner.entries.push_back((entry, weight));
 }
 
 pub fn torrent_hash(hashes: &[String]) -> Option<&str> {

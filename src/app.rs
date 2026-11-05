@@ -130,6 +130,22 @@ enum TrackerAuditWorkerEvent {
     Cancelled,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuditSaveSnapshot {
+    profile: StoredTrackerAuditProfile,
+    trackers: Vec<String>,
+    revision: Option<u64>,
+}
+
+#[derive(Default)]
+struct AuditDraftState {
+    dirty: bool,
+    trackers: Option<Vec<String>>,
+    inflight: Option<AuditSaveSnapshot>,
+    await_revision: Option<u64>,
+    failed: Option<String>,
+}
+
 struct TorrentTrackerAudit {
     tracker_url: String,
     allowed_host: String,
@@ -140,6 +156,9 @@ struct TorrentTrackerAudit {
     exchanges: crate::live_history::LiveHistory<TrackerAuditExchange>,
     status: String,
     run: Option<TrackerAuditRun>,
+    pending_save: Option<Instant>,
+    draft: AuditDraftState,
+    start_when_registered: bool,
 }
 
 impl TorrentTrackerAudit {
@@ -160,6 +179,9 @@ impl TorrentTrackerAudit {
             exchanges: Default::default(),
             status: String::new(),
             run: None,
+            pending_save: None,
+            draft: Default::default(),
+            start_when_registered: false,
         }
     }
 
@@ -202,6 +224,9 @@ impl TorrentTrackerAudit {
             exchanges: Default::default(),
             status: String::new(),
             run: None,
+            pending_save: None,
+            draft: Default::default(),
+            start_when_registered: false,
         }
     }
 
@@ -222,6 +247,102 @@ impl TorrentTrackerAudit {
                     event: step.event.map(audit_event_storage).map(str::to_owned),
                 })
                 .collect(),
+        }
+    }
+
+    fn mark_draft_changed(&mut self, trackers: Vec<String>, now: Instant) {
+        self.draft.dirty = true;
+        self.draft.trackers = Some(trackers);
+        self.draft.failed = None;
+        self.pending_save = Some(now + Duration::from_millis(500));
+    }
+    fn can_replace_authoritative(&self, revision: Option<u64>) -> bool {
+        !self.draft.dirty
+            && self.draft.inflight.is_none()
+            && self.run.is_none()
+            && !self.start_when_registered
+            && self
+                .draft
+                .await_revision
+                .is_none_or(|previous| revision.is_some_and(|current| current != previous))
+    }
+    fn save_snapshot(&self, revision: Option<u64>) -> AuditSaveSnapshot {
+        AuditSaveSnapshot {
+            profile: self.to_stored(),
+            trackers: self.draft.trackers.clone().unwrap_or_else(|| {
+                let url = self.tracker_url.trim();
+                (!url.is_empty())
+                    .then(|| url.to_owned())
+                    .into_iter()
+                    .collect()
+            }),
+            revision,
+        }
+    }
+    fn draft_ready(&self, now: Instant, revision: Option<u64>) -> bool {
+        self.draft.dirty
+            && self.draft.inflight.is_none()
+            && self.draft.failed.is_none()
+            && self.pending_save.is_some_and(|due| now >= due)
+            && self
+                .draft
+                .await_revision
+                .is_none_or(|previous| revision.is_some_and(|current| current != previous))
+    }
+    fn exit_snapshot(
+        &self,
+        revision: Option<u64>,
+        authoritative_ready: bool,
+    ) -> Option<AuditSaveSnapshot> {
+        (self.draft.dirty
+            && self.draft.failed.is_none()
+            && self.draft.inflight.is_none()
+            && authoritative_ready
+            && self
+                .draft
+                .await_revision
+                .is_none_or(|previous| revision.is_some_and(|current| current != previous)))
+        .then(|| self.save_snapshot(revision))
+    }
+    fn submitted_draft(&mut self, snapshot: AuditSaveSnapshot) {
+        self.draft.inflight = Some(snapshot);
+        self.pending_save = None;
+        self.status = "Awaiting durable background owner tracker save".into();
+    }
+    fn failed_draft(&mut self, error: &str) {
+        self.draft.inflight = None;
+        self.draft.dirty = true;
+        self.draft.failed = Some(error.to_owned());
+        self.pending_save = None;
+        self.status = format!("Unsaved tracker draft retained: {error}");
+    }
+    fn confirmed_draft(
+        &mut self,
+        profile: Option<&StoredTrackerAuditProfile>,
+        trackers: Option<&Vec<String>>,
+        now: Instant,
+    ) {
+        let Some(inflight) = self.draft.inflight.as_ref() else {
+            return;
+        };
+        if profile != Some(&inflight.profile) || trackers != Some(&inflight.trackers) {
+            return;
+        }
+        let inflight = self.draft.inflight.take().expect("matching inflight save");
+        self.draft.failed = None;
+        if self.save_snapshot(inflight.revision).profile == inflight.profile
+            && self.draft.trackers.as_ref() == Some(&inflight.trackers)
+        {
+            self.draft.dirty = false;
+            self.draft.trackers = None;
+            self.draft.await_revision = inflight.revision;
+            self.pending_save = None;
+            self.status = "Tracker settings saved by background owner".into();
+        } else {
+            self.draft.dirty = true;
+            self.draft.await_revision = inflight.revision;
+            self.pending_save = Some(now);
+            self.status = "Earlier tracker draft saved; newer edits remain unsaved".into();
         }
     }
 }
@@ -287,6 +408,9 @@ impl AddTrackerAudit {
             exchanges: self.exchanges.clone(),
             status: String::new(),
             run: None,
+            pending_save: None,
+            draft: Default::default(),
+            start_when_registered: false,
         }
     }
 
@@ -407,22 +531,23 @@ pub struct PeerLumeApp {
     behavior_catalog: Result<BehaviorCatalog, String>,
     trash_confirmation: Option<TrashRequest>,
     pending_trash: Option<TrashRequest>,
+    native_trash_plan: Option<crate::control::frontend::TrashPlan>,
 }
 
 /// Synchronizes frontend transactions with the independent controller owner pump.
 /// The transfer engine and canonical models are never cloned for an adapter.
 pub struct HostedGui {
-    host: crate::control::host::Host,
-    owner: Arc<std::sync::Mutex<PeerLumeApp>>,
+    app: PeerLumeApp,
     access: crate::control::frontends::AccessPanel,
-    _instance: crate::control::host::InstanceLock,
 }
 
 impl HostedGui {
     pub fn start() -> std::io::Result<Self> {
         let directory = crate::settings::data_directory();
-        let instance = crate::control::host::InstanceLock::acquire(&directory)?;
         let mut app = PeerLumeApp::default();
+        if app.control.backend.attached_client().is_none() {
+            return Err(std::io::Error::other(app.add_status.clone()));
+        }
         app.pending_torrent_paths
             .extend(crate::settings::open_torrent_arguments(
                 &std::env::args().skip(1).collect::<Vec<_>>(),
@@ -435,41 +560,72 @@ impl HostedGui {
                 std::io::Error::other(format!("Agent control initialization failed: {e:?}"))
             })?;
         let _ = app.control.set_agent_settings(&app.settings);
-        let owner = Arc::new(std::sync::Mutex::new(app));
-        let host =
-            crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
         Ok(Self {
-            host,
-            owner,
+            app,
             access: Default::default(),
-            _instance: instance,
         })
     }
 }
 
 impl eframe::App for HostedGui {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Ok(mut app) = self.owner.lock()
-            && let Err(error) = app.control.shutdown()
-        {
+        if let Some(client) = self.app.control.backend.attached_client() {
+            for (id, audit) in &self.app.tracker_audits {
+                if let Some(snapshot) =
+                    audit.exit_snapshot(client.cached_revision(id), client.audit_ready(id))
+                {
+                    if let Err(error) =
+                        client.save_editable(id, &snapshot.trackers, Some(&snapshot.profile))
+                    {
+                        eprintln!("Unsaved tracker settings draft: {error}");
+                    }
+                } else if audit.draft.dirty
+                    && audit.draft.failed.is_none()
+                    && audit.draft.inflight.is_none()
+                {
+                    eprintln!(
+                        "Unsaved newer tracker draft for {id}: the previous owner save has not refreshed; it was not replayed against an old revision"
+                    );
+                } else if audit.draft.dirty
+                    && audit.draft.inflight.as_ref().is_some_and(|inflight| {
+                        audit.save_snapshot(inflight.revision).profile != inflight.profile
+                            || audit.draft.trackers.as_ref() != Some(&inflight.trackers)
+                    })
+                {
+                    eprintln!(
+                        "Unsaved newer tracker draft for {id}: an earlier save is still in progress; reconnect and inspect before editing again"
+                    );
+                }
+            }
+        }
+        if let Err(error) = self.app.control.shutdown() {
             eprintln!("PeerLume shutdown: {error}");
         }
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let owner = Arc::clone(&self.owner);
-        let mut app = owner.lock().unwrap_or_else(|e| e.into_inner());
-        self.access.show(&mut app.control, ctx);
-        if let Some(error) = *self.host.error.lock().unwrap_or_else(|e| e.into_inner()) {
-            self.access.status = format!("IPC unavailable: {error:?}");
+        if let Some(client) = self.app.control.backend.attached_client() {
+            let context = ctx.clone();
+            client.set_ui_waker(Arc::new(move || context.request_repaint()));
         }
-        app.update(ctx, frame);
+        self.access.show(&mut self.app.control, ctx);
+        self.app.update(ctx, frame);
     }
 }
 
 impl Default for PeerLumeApp {
     fn default() -> Self {
         let loaded = ClientSettings::load_checked();
-        let settings = loaded.as_ref().cloned().unwrap_or_default();
+        let backend = match &loaded {
+            Ok(_) => ClientBackend::attach(&crate::settings::data_directory())
+                .unwrap_or_else(ClientBackend::blocked),
+            Err(error) => ClientBackend::blocked(format!(
+                "Cannot read settings; background owner not contacted: {error}"
+            )),
+        };
+        let settings = backend
+            .attached_client()
+            .map(|client| client.settings())
+            .unwrap_or_else(|| loaded.as_ref().cloned().unwrap_or_default());
         let saved_settings = settings.clone();
         let settings_draft = settings.clone();
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
@@ -487,12 +643,6 @@ impl Default for PeerLumeApp {
         let auto_update =
             settings.privacy.blocklist_enabled && settings.privacy.blocklist_auto_update;
         let update_url = settings.privacy.blocklist_url.clone();
-        let backend = match loaded {
-            Ok(_) => ClientBackend::start(&settings),
-            Err(error) => {
-                ClientBackend::blocked(format!("Cannot read settings; engine not started: {error}"))
-            }
-        };
         let (restored_records, restore_status) = backend.restore_for_frontend();
         let tracker_audits = restored_records
             .iter()
@@ -552,11 +702,17 @@ impl Default for PeerLumeApp {
             behavior_catalog: BehaviorCatalog::load(),
             trash_confirmation: None,
             pending_trash: None,
+            native_trash_plan: None,
         };
         if auto_update {
             app.start_blocklist_update(update_url);
         }
-        for torrent in &app.control.torrents {
+        for torrent in app
+            .control
+            .torrents
+            .iter()
+            .filter(|_| app.control.backend.attached_client().is_none())
+        {
             let _ = app
                 .control
                 .backend
@@ -567,7 +723,87 @@ impl Default for PeerLumeApp {
 }
 
 impl PeerLumeApp {
+    fn apply_audit_save_receipt(
+        &mut self,
+        receipt: &crate::control::frontend::Receipt,
+        now: Instant,
+    ) {
+        if !matches!(receipt.label, "Tracker settings" | "Tracker audit") {
+            return;
+        }
+        let Some(audit) = self.tracker_audits.get_mut(&receipt.id) else {
+            return;
+        };
+        if let Some(error) = &receipt.error {
+            if audit.draft.inflight.is_some() {
+                audit.failed_draft(error);
+            }
+        } else if let Some((id, profile)) = &receipt.audit_saved
+            && id == &receipt.id
+        {
+            audit.confirmed_draft(profile.as_ref(), receipt.trackers_saved.as_ref(), now);
+        }
+    }
     fn poll_session_events(&mut self) {
+        let mut authoritative_audits = Vec::new();
+        if let Some(client) = self.control.backend.attached_client().cloned() {
+            for receipt in client.take_receipts() {
+                self.apply_audit_save_receipt(&receipt, Instant::now());
+                if receipt.label == "Agent view" {
+                    continue;
+                }
+                self.add_status = receipt.message;
+                if let Some(plan) = receipt.trash_plan {
+                    let scope = match plan.scope {
+                        crate::control::frontend::TrashScope::DownloadedFiles => {
+                            TrashScope::DownloadedFiles
+                        }
+                        crate::control::frontend::TrashScope::TorrentFile => {
+                            TrashScope::TorrentFile
+                        }
+                        crate::control::frontend::TrashScope::Everything => TrashScope::Everything,
+                    };
+                    let name = self
+                        .control
+                        .torrents
+                        .iter()
+                        .find(|item| item.info_hashes.join(";") == plan.id)
+                        .map(|item| item.name.clone())
+                        .unwrap_or_else(|| plan.id.clone());
+                    self.trash_confirmation = Some(TrashRequest {
+                        torrent_id: plan.id.clone(),
+                        torrent_name: name,
+                        scope,
+                        paths: plan.preview.iter().map(PathBuf::from).collect(),
+                    });
+                    self.native_trash_plan = Some(plan);
+                }
+                if let Some(settings) = receipt.settings {
+                    self.settings = settings.clone();
+                    if receipt.label == "Preferences" {
+                        self.saved_settings = settings.clone();
+                    }
+                    self.settings_draft = settings;
+                    self.settings_status = self.add_status.clone();
+                }
+            }
+            authoritative_audits = client.take_audits();
+            for (id, audit) in &mut self.tracker_audits {
+                if audit.draft_ready(Instant::now(), client.cached_revision(id))
+                    && client.audit_ready(id)
+                {
+                    let snapshot = audit.save_snapshot(client.cached_revision(id));
+                    match client.save_editable(id, &snapshot.trackers, Some(&snapshot.profile)) {
+                        Ok(()) => {
+                            audit.submitted_draft(snapshot);
+                        }
+                        Err(error) => {
+                            audit.failed_draft(&error);
+                        }
+                    }
+                }
+            }
+        }
         let started = Instant::now();
         for _ in 0..256 {
             if started.elapsed() >= Duration::from_millis(4) {
@@ -593,6 +829,9 @@ impl PeerLumeApp {
                     self.add_status = "Transfer engine started the torrent".into();
                 }
                 SessionNotice::Error { id, message } => {
+                    if let Some(audit) = self.tracker_audits.get_mut(&id) {
+                        audit.start_when_registered = false;
+                    }
                     if self
                         .pending_trash
                         .as_ref()
@@ -623,6 +862,60 @@ impl PeerLumeApp {
                     self.add_status = "Transfer engine stopped".into();
                 }
                 SessionNotice::None => {}
+            }
+        }
+        // Apply metadata after importing the matching owner snapshot, so its URL
+        // cannot be read from the previous presentation frame. Queued stale
+        // metadata is fenced against the client's current authoritative cache.
+        if let Some(client) = self.control.backend.attached_client() {
+            for (id, profile) in authoritative_audits {
+                if !client.audit_ready(&id)
+                    || client.audit_profile(&id) != profile
+                    || self.tracker_audits.get(&id).is_some_and(|audit| {
+                        !audit.can_replace_authoritative(client.cached_revision(&id))
+                    })
+                {
+                    continue;
+                }
+                if let Some(profile) = profile {
+                    if let Some(item) = self
+                        .control
+                        .torrents
+                        .iter()
+                        .find(|item| item.info_hashes.join(";") == id)
+                    {
+                        self.tracker_audits.insert(
+                            id,
+                            TorrentTrackerAudit::from_stored(
+                                item.trackers.first().cloned().unwrap_or_default(),
+                                item.selected_size(),
+                                self.settings.connection.listen_port,
+                                Some(&profile),
+                            ),
+                        );
+                    }
+                } else {
+                    self.tracker_audits.remove(&id);
+                }
+            }
+        }
+        for (id, audit) in &mut self.tracker_audits {
+            if audit.start_when_registered
+                && let Some(torrent) = self.control.torrents.iter().find(|torrent| {
+                    torrent.info_hashes.join(";") == *id && torrent.runtime.registered
+                })
+            {
+                audit.start_when_registered = false;
+                let step = TrackerAuditStep {
+                    delay_seconds: 0,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: torrent.files.total_size(),
+                    event: Some(AnnounceEvent::Started),
+                };
+                let seconds = audit.observation_seconds;
+                let _ = start_torrent_tracker_audit(torrent, audit, vec![(0, step)], seconds);
+                self.details_tab = DetailsTab::Trackers;
             }
         }
         self.control.publish();
@@ -750,6 +1043,23 @@ impl PeerLumeApp {
     }
 
     fn prepare_trash_request(&mut self, id: &str, scope: TrashScope) {
+        if let Some(client) = self.control.backend.attached_client() {
+            let scope = match scope {
+                TrashScope::DownloadedFiles => {
+                    crate::control::frontend::TrashScope::DownloadedFiles
+                }
+                TrashScope::TorrentFile => crate::control::frontend::TrashScope::TorrentFile,
+                TrashScope::Everything => crate::control::frontend::TrashScope::Everything,
+            };
+            self.native_trash_plan = None;
+            self.add_status = client
+                .prepare_trash(id, scope)
+                .map(|()| {
+                    "Awaiting background owner to prepare exact paths; nothing deleted".into()
+                })
+                .unwrap_or_else(|error| error);
+            return;
+        }
         if self.pending_trash.is_some() {
             self.add_status = "Another Recycle Bin operation is still running".into();
             return;
@@ -791,7 +1101,9 @@ impl PeerLumeApp {
             ));
             ui.label(format!(
                 "{} existing item(s) will be moved.",
-                request.paths.len()
+                self.native_trash_plan
+                    .as_ref()
+                    .map_or(request.paths.len(), |plan| plan.count)
             ));
             ui.label("The torrent will also be removed from the download list.");
             if !request.scope.includes_source() {
@@ -816,6 +1128,7 @@ impl PeerLumeApp {
         });
         if cancel {
             self.trash_confirmation = None;
+            self.native_trash_plan = None;
             return;
         }
         if !confirm {
@@ -825,6 +1138,16 @@ impl PeerLumeApp {
             .trash_confirmation
             .take()
             .expect("trash confirmation exists");
+        if let Some(client) = self.control.backend.attached_client() {
+            self.add_status = match self.native_trash_plan.take() {
+                Some(plan) => client
+                    .commit_trash(&plan)
+                    .map(|()| "Awaiting owner validation and Recycle Bin completion".into())
+                    .unwrap_or_else(|error| error),
+                None => "Exact owner path plan expired; prepare again. Nothing deleted".into(),
+            };
+            return;
+        }
         if !self.control.backend.session_available() {
             self.add_status = "Transfer engine is unavailable; nothing was deleted".into();
             return;
@@ -963,11 +1286,9 @@ impl PeerLumeApp {
                 {
                     let index = visible_selection.expect("enabled for a visible selection");
                     let id = self.control.torrents[index].info_hashes.join(";");
-                    self.add_status = self
-                        .control
-                        .remove(&id)
-                        .map(|_| "Removal queued; data will be kept".into())
-                        .unwrap_or_else(|error| error.to_string());
+                    if let Some(client)=self.control.backend.attached_client(){
+                        self.add_status=client.enqueue_submit(&id,TorrentCommand::Remove,self.control.command_revision(&id).ok()).map(|()|"Awaiting background owner removal; data kept".into()).unwrap_or_else(|error|error);
+                    }else{self.add_status=self.control.remove(&id).map(|_|"Removal queued; data will be kept".into()).unwrap_or_else(|error|error.to_string());}
                 }
                 if !self.add_status.is_empty() {
                     ui.label(&self.add_status);
@@ -1013,11 +1334,15 @@ impl PeerLumeApp {
                 }
                 ui.add(egui::TextEdit::singleline(&mut self.settings.ui.category_filter).hint_text("Category (empty = all)").desired_width(130.0));
                 if ui.button("Save view").on_hover_text("Save search, categories, labels, split and Name width without saving preference drafts").clicked() {
+                    if let Some(client)=self.control.backend.attached_client(){
+                        self.add_status=client.save_view(&self.settings.ui).map(|()|"Awaiting owner to save view".into()).unwrap_or_else(|error|error);
+                    }else{
                     let path = crate::settings::data_directory().join("settings.toml");
                     let current = match ClientSettings::load_from(&path) {
                         Ok(settings)=>Ok(settings), Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(ClientSettings::default()), Err(error)=>Err(error),
                     };
                     self.add_status = match current.and_then(|mut settings| {settings.ui=self.settings.ui.clone();settings.save_to(&path)}) { Ok(())=>"View saved".into(),Err(error)=>format!("Could not save view: {error}") };
+                    }
                 }
             });
             });
@@ -1354,6 +1679,11 @@ impl PeerLumeApp {
                     self.add_status = error;
                     return;
                 }
+                if self.control.backend.attached_client().is_some() {
+                    self.add_status = format!("Awaiting owner registration of {name}");
+                    self.magnet_input.clear();
+                    return;
+                }
                 self.selected_torrent = self.control.torrents.len() - 1;
                 if let Some(torrent) = self.control.torrents.last() {
                     self.tracker_audits.insert(
@@ -1667,7 +1997,14 @@ impl PeerLumeApp {
             self.add_status = error;
             return;
         }
-        self.tracker_audits.insert(id, tracker_audit);
+        self.tracker_audits.insert(id.clone(), tracker_audit);
+        if self.control.backend.attached_client().is_some() {
+            if start_observation && let Some(audit) = self.tracker_audits.get_mut(&id) {
+                audit.start_when_registered = true;
+            }
+            self.add_status = "Awaiting background owner registration".into();
+            return;
+        }
         self.selected_torrent = self.control.torrents.len() - 1;
         if start_observation {
             let torrent = self
@@ -1677,12 +2014,7 @@ impl PeerLumeApp {
                 .expect("just added torrent exists");
             let id = torrent.info_hashes.join(";");
             if let Some(audit) = self.tracker_audits.get_mut(&id) {
-                let full_size = torrent
-                    .files
-                    .files()
-                    .iter()
-                    .map(|file| file.size_bytes)
-                    .sum();
+                let full_size = torrent.files.total_size();
                 let step = TrackerAuditStep {
                     delay_seconds: 0,
                     uploaded: 0,
@@ -1929,22 +2261,66 @@ impl PeerLumeApp {
             }
             DetailsTab::Trackers => {
                 let id = torrent.info_hashes.join(";");
+                if self
+                    .control
+                    .backend
+                    .attached_client()
+                    .is_some_and(|client| !client.audit_ready(&id))
+                {
+                    ui.spinner();
+                    ui.label("Loading authoritative tracker audit settings");
+                    return;
+                }
+                let profile = self
+                    .control
+                    .backend
+                    .attached_client()
+                    .and_then(|client| client.audit_profile(&id));
                 let audit = self.tracker_audits.entry(id.clone()).or_insert_with(|| {
-                    TorrentTrackerAudit::new(
+                    TorrentTrackerAudit::from_stored(
                         torrent.trackers.first().cloned().unwrap_or_default(),
                         torrent.selected_size(),
                         self.settings.connection.listen_port,
+                        profile.as_ref(),
                     )
                 });
                 let changed =
                     show_torrent_tracker_audit(ui, torrent, audit, &mut self.behavior_catalog);
-                if changed
+                if changed && self.control.backend.attached_client().is_some() {
+                    let trackers = if torrent
+                        .trackers
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        == audit.tracker_url.trim()
+                    {
+                        torrent.trackers.clone()
+                    } else {
+                        let url = audit.tracker_url.trim();
+                        (!url.is_empty())
+                            .then(|| url.to_owned())
+                            .into_iter()
+                            .collect()
+                    };
+                    audit.mark_draft_changed(trackers, Instant::now());
+                    audit.status = "Audit draft changed; waiting to save after typing".into();
+                } else if changed
                     && let Err(error) = self
                         .control
                         .backend
-                        .save_torrent(&torrent_record(torrent, Some(audit)))
+                        .save_tracker_audit(&id, Some(&audit.to_stored()))
                 {
                     audit.status = format!("Could not save tracker settings: {error}");
+                }
+                if audit.draft.failed.is_some()
+                    && ui.button("Retry saving retained tracker draft").clicked()
+                {
+                    audit.draft.failed = None;
+                    audit.draft.await_revision = None;
+                    audit.pending_save = Some(Instant::now());
+                    audit.status =
+                        "Retrying the retained tracker draft against the current owner revision"
+                            .into();
                 }
             }
             DetailsTab::Pieces => {
@@ -1980,11 +2356,23 @@ impl PeerLumeApp {
                                     .set_file_name("announce-export.jsonl")
                                     .save_file()
                             {
-                                self.add_status = match journal.export(&path, filter) {
-                                    Ok(count) => {
-                                        format!("Exported {count} announces to {}", path.display())
+                                self.add_status = if let Some(client) =
+                                    self.control.backend.attached_client()
+                                {
+                                    client
+                                        .export(filter.map(|_| torrent.info_hashes.join(";")), path)
+                                        .map(|()| "Awaiting owner journal export".into())
+                                        .unwrap_or_else(|error| error)
+                                } else {
+                                    match journal.export(&path, filter) {
+                                        Ok(count) => {
+                                            format!(
+                                                "Exported {count} announces to {}",
+                                                path.display()
+                                            )
+                                        }
+                                        Err(e) => e,
                                     }
-                                    Err(e) => e,
                                 };
                             }
                         }
@@ -2176,6 +2564,23 @@ impl PeerLumeApp {
         id: &str,
         commands: Vec<TorrentCommand>,
     ) -> Option<String> {
+        if let Some(client) = control.backend.attached_client().cloned() {
+            let mut queued = 0;
+            for command in commands {
+                let feedback = command.feedback_action();
+                if let Err(error) = client.enqueue_submit(id, command, None) {
+                    return Some(error);
+                }
+                if let Some(action) = feedback
+                    && let Some(index) = control.torrent_index(id)
+                {
+                    control.torrents[index].runtime.command.begin(action);
+                }
+                queued += 1;
+            }
+            return (queued > 0)
+                .then(|| "Awaiting background owner; transfer state is not confirmed yet".into());
+        }
         let mut first_error = None;
         let mut accepted = 0;
         let mut rejected = 0;
@@ -2209,6 +2614,12 @@ impl PeerLumeApp {
     }
 
     fn show_file_tree(ui: &mut egui::Ui, torrent: &TorrentItem) -> FileTreeActions {
+        if !torrent.files.details_loaded() {
+            ui.label(format!("Files/ ({} files)", torrent.files.file_count()));
+            ui.spinner();
+            ui.label("Loading authoritative file details. Pending or failed requests are reported in the status line.");
+            return (None, None, None);
+        }
         let visible_width = name_column::viewport_width(ui);
         let mut select_all = None;
         let mut changes = std::collections::BTreeMap::new();
@@ -2752,6 +3163,16 @@ impl PeerLumeApp {
             self.settings_status = "Settings were not applied".into();
             return;
         }
+        if let Some(client) = self.control.backend.attached_client() {
+            self.settings_status = (if persist {
+                client.save_settings(&self.settings_draft)
+            } else {
+                client.apply_settings(&self.settings_draft)
+            })
+            .map(|()| "Awaiting background owner preferences response; draft retained".into())
+            .unwrap_or_else(|error| error);
+            return;
+        }
         let diff = self.engine.apply_settings(&self.settings_draft);
         self.settings = self.settings_draft.clone();
         let _ = self.control.set_agent_settings(&self.settings);
@@ -2821,15 +3242,27 @@ impl eframe::App for PeerLumeApp {
         } else {
             None
         };
-        self.control
-            .set_detail_interest(interest.filter(|(_, detail)| detail.files || detail.peers));
+        self.control.set_detail_interest(
+            interest
+                .clone()
+                .filter(|(_, detail)| detail.files || detail.peers),
+        );
+        if let Some(client) = self.control.backend.attached_client() {
+            client.set_journal_active(
+                self.page == MainPage::Torrents
+                    && self.details_tab == DetailsTab::Log
+                    && !minimized,
+            );
+            client.set_visible_torrent(interest.map(|(id, _)| id));
+        }
         let pending = self.metainfo_loader.is_loading()
             || self.blocklist_update.is_some()
             || self.file_navigation.is_busy()
-            || self
-                .tracker_audits
-                .values()
-                .any(|audit| audit.run.is_some());
+            || self.tracker_audits.values().any(|audit| {
+                audit.run.is_some()
+                    || audit.pending_save.is_some()
+                    || audit.draft.inflight.is_some()
+            });
         ctx.request_repaint_after(crate::torrent_view::refresh_interval(
             &self.control.torrents,
             pending,
@@ -3255,10 +3688,20 @@ fn start_tracker_audit(dialog: &mut AddTorrentDialog) {
     dialog.tracker_audit.status = "Sending controlled announce...".into();
     dialog.tracker_audit.peers.clear();
     dialog.tracker_audit.pending = Some(receiver);
-    std::thread::spawn(move || {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let mut history = dialog.tracker_audit.exchanges.producer();
+    if let Err(error) = crate::audit_workers::spawn("peerlume-add-audit", cancel, move || {
+        if worker_cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let exchange = execute_tracker_audit(&tracker_url, &allow_hosts, request, 0);
+        history.push(exchange.clone());
         let _ = sender.send(exchange);
-    });
+    }) {
+        dialog.tracker_audit.pending = None;
+        dialog.tracker_audit.status = format!("Could not start audit worker: {error}");
+    }
 }
 
 fn poll_tracker_audit(dialog: &mut AddTorrentDialog) {
@@ -3290,7 +3733,7 @@ fn poll_tracker_audit(dialog: &mut AddTorrentDialog) {
                 );
             }
             dialog.tracker_audit.peers.clone_from(&exchange.peers);
-            dialog.tracker_audit.exchanges.push(exchange);
+            dialog.tracker_audit.exchanges.push_view(exchange);
         }
         Err(error) => {
             dialog.tracker_audit.status = format!("Audit announce failed: {error}");
@@ -3342,12 +3785,7 @@ fn show_torrent_tracker_audit(
     let mut profile_changed = false;
     ui.heading("Per-torrent tracker audit");
     ui.add_enabled_ui(audit.run.is_none(), |ui| {
-        let full_size = torrent
-            .files
-            .files()
-            .iter()
-            .map(|file| file.size_bytes)
-            .sum();
+        let full_size = torrent.files.total_size();
         if let Some(profile) = show_behavior_picker(
             ui,
             "torrent_behavior_profile",
@@ -3357,6 +3795,8 @@ fn show_torrent_tracker_audit(
             audit.port,
         ) {
             let exchanges = std::mem::take(&mut audit.exchanges);
+            let draft = std::mem::take(&mut audit.draft);
+            let pending_save = audit.pending_save;
             *audit = TorrentTrackerAudit::from_stored(
                 audit.tracker_url.clone(),
                 full_size,
@@ -3364,6 +3804,8 @@ fn show_torrent_tracker_audit(
                 Some(&profile),
             );
             audit.exchanges = exchanges;
+            audit.draft = draft;
+            audit.pending_save = pending_save;
             audit.status = "External profile applied; saved as a per-torrent snapshot".into();
             profile_changed = true;
         }
@@ -3586,12 +4028,7 @@ fn show_torrent_tracker_audit(
     }
     if run_all {
         let (steps, observation_seconds) = if audit.started_only {
-            let full_size = torrent
-                .files
-                .files()
-                .iter()
-                .map(|file| file.size_bytes)
-                .sum();
+            let full_size = torrent.files.total_size();
             (
                 vec![(
                     0,
@@ -3723,45 +4160,55 @@ fn start_torrent_tracker_audit(
         )
     };
     audit.run = Some(TrackerAuditRun { receiver, cancel });
-    std::thread::spawn(move || {
-        for (step_index, step) in steps {
-            if !wait_for_audit_delay(step.delay_seconds, &worker_cancel) {
-                let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
-                return;
+    let mut history = audit.exchanges.producer();
+    if let Err(error) =
+        crate::audit_workers::spawn("peerlume-torrent-audit", worker_cancel.clone(), move || {
+            for (step_index, step) in steps {
+                if !wait_for_audit_delay(step.delay_seconds, &worker_cancel) {
+                    let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
+                    return;
+                }
+                let request = AnnounceRequest {
+                    info_hash,
+                    peer_id,
+                    port,
+                    uploaded: step.uploaded,
+                    downloaded: step.downloaded,
+                    left: step.left,
+                    event: step.event,
+                };
+                let exchange =
+                    execute_tracker_audit(&tracker_url, &allow_hosts, request, step_index);
+                history.push(exchange.clone());
+                if sender
+                    .send(TrackerAuditWorkerEvent::Exchange(exchange))
+                    .is_err()
+                {
+                    return;
+                }
             }
-            let request = AnnounceRequest {
-                info_hash,
-                peer_id,
-                port,
-                uploaded: step.uploaded,
-                downloaded: step.downloaded,
-                left: step.left,
-                event: step.event,
-            };
-            let exchange = execute_tracker_audit(&tracker_url, &allow_hosts, request, step_index);
-            if sender
-                .send(TrackerAuditWorkerEvent::Exchange(exchange))
-                .is_err()
-            {
-                return;
+            if observation_seconds > 0 {
+                if sender
+                    .send(TrackerAuditWorkerEvent::ObservationStarted(
+                        observation_seconds,
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                if !wait_for_audit_delay(observation_seconds, &worker_cancel) {
+                    let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
+                    return;
+                }
             }
-        }
-        if observation_seconds > 0 {
-            if sender
-                .send(TrackerAuditWorkerEvent::ObservationStarted(
-                    observation_seconds,
-                ))
-                .is_err()
-            {
-                return;
-            }
-            if !wait_for_audit_delay(observation_seconds, &worker_cancel) {
-                let _ = sender.send(TrackerAuditWorkerEvent::Cancelled);
-                return;
-            }
-        }
-        let _ = sender.send(TrackerAuditWorkerEvent::Finished);
-    });
+            let _ = sender.send(TrackerAuditWorkerEvent::Finished);
+        })
+    {
+        audit.run = None;
+        let message = format!("Could not start audit worker: {error}");
+        audit.status = message.clone();
+        return Err(message);
+    }
     Ok(())
 }
 
@@ -3771,7 +4218,7 @@ fn poll_torrent_tracker_audit(audit: &mut TorrentTrackerAudit) {
         loop {
             match run.receiver.try_recv() {
                 Ok(TrackerAuditWorkerEvent::Exchange(exchange)) => {
-                    audit.exchanges.push(exchange);
+                    audit.exchanges.push_view(exchange);
                     audit.status =
                         format!("Completed {} audit step(s)", audit.exchanges.recorded());
                 }
@@ -4024,6 +4471,97 @@ fn show_runtime_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_tracker_draft_survives_older_ack_and_waits_for_the_new_owner_revision() {
+        let now = Instant::now();
+        let mut audit = TorrentTrackerAudit::new("https://old.test/announce".into(), 100, 51413);
+        audit.allowed_host = "first.synthetic.test".into();
+        audit.mark_draft_changed(vec![audit.tracker_url.clone()], now);
+        let first = audit.save_snapshot(Some(7));
+        audit.submitted_draft(first.clone());
+        assert!(audit.draft.dirty && audit.pending_save.is_none());
+        assert!(!audit.can_replace_authoritative(Some(7)));
+        audit.allowed_host = "newer.synthetic.test".into();
+        audit.tracker_url = "https://newer.test/announce".into();
+        audit.mark_draft_changed(vec![audit.tracker_url.clone()], now);
+        audit.confirmed_draft(Some(&first.profile), Some(&first.trackers), now);
+        assert!(audit.draft.dirty && audit.draft.inflight.is_none());
+        assert_eq!(audit.allowed_host, "newer.synthetic.test");
+        assert_eq!(audit.tracker_url, "https://newer.test/announce");
+        assert!(
+            !audit.draft_ready(now, Some(7)),
+            "an older ACK cannot reuse its old CAS revision"
+        );
+        assert!(audit.draft_ready(now, Some(8)));
+        let second = audit.save_snapshot(Some(8));
+        audit.submitted_draft(second.clone());
+        audit.confirmed_draft(Some(&first.profile), Some(&first.trackers), now);
+        assert!(
+            audit.draft.inflight.is_some(),
+            "unrelated old receipts cannot acknowledge the new draft"
+        );
+        audit.confirmed_draft(Some(&second.profile), Some(&second.trackers), now);
+        assert!(!audit.draft.dirty);
+        assert!(
+            !audit.can_replace_authoritative(Some(8)),
+            "wait for fresh authoritative metadata"
+        );
+        assert!(audit.can_replace_authoritative(Some(9)));
+    }
+
+    #[test]
+    fn stale_tracker_save_retains_exact_url_and_profile_until_explicit_retry() {
+        let now = Instant::now();
+        let mut audit = TorrentTrackerAudit::new("https://draft.test/announce".into(), 100, 51413);
+        audit.allowed_host = "draft.synthetic.test".into();
+        audit.mark_draft_changed(vec![audit.tracker_url.clone()], now);
+        let original = audit.save_snapshot(Some(2));
+        audit.submitted_draft(original.clone());
+        audit.failed_draft("Background owner changed; stale revision");
+        assert!(audit.draft.dirty && audit.draft.inflight.is_none());
+        assert!(!audit.can_replace_authoritative(Some(3)));
+        assert!(!audit.draft_ready(now + Duration::from_secs(100), Some(3)));
+        assert!(
+            audit.exit_snapshot(Some(3), true).is_none(),
+            "close must not blindly replay a stale failed draft"
+        );
+        assert_eq!(audit.save_snapshot(Some(2)), original);
+        audit.draft.failed = None; // The explicit Retry button.
+        audit.draft.await_revision = None;
+        audit.pending_save = Some(now);
+        assert!(audit.draft_ready(now, Some(3)));
+        let retried = audit.save_snapshot(Some(3));
+        assert_eq!(retried.trackers, original.trackers);
+        assert_eq!(retried.profile, original.profile);
+        audit.submitted_draft(retried.clone());
+        audit.confirmed_draft(Some(&retried.profile), Some(&retried.trackers), now);
+        assert!(!audit.draft.dirty);
+    }
+
+    #[test]
+    fn close_flush_contains_atomic_tracker_urls_and_profile_without_double_queueing_inflight() {
+        let now = Instant::now();
+        let mut audit =
+            TorrentTrackerAudit::new("https://updated.test/announce".into(), 100, 51413);
+        audit.mark_draft_changed(
+            vec![
+                audit.tracker_url.clone(),
+                "https://backup.test/announce".into(),
+            ],
+            now,
+        );
+        assert!(audit.exit_snapshot(Some(4), false).is_none());
+        let snapshot = audit.exit_snapshot(Some(4), true).unwrap();
+        assert_eq!(snapshot.trackers.len(), 2);
+        assert_eq!(snapshot.trackers[0], "https://updated.test/announce");
+        assert_eq!(snapshot.profile, audit.to_stored());
+        audit.submitted_draft(snapshot);
+        assert!(
+            audit.exit_snapshot(Some(4), true).is_none(),
+            "the queued write already retains the client"
+        );
+    }
 
     #[test]
     fn file_context_menu_requests_only_navigation_not_a_selection_or_transfer_change() {

@@ -1,9 +1,17 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
+mod deferred_files;
+mod persistence;
+pub use deferred_files::{DeferredRecord, FilePage};
+pub use persistence::{PersistenceIntent, ScalarUpdate};
+mod file_loader;
+pub use file_loader::{FileDetailLoader, FileDetailReply};
+#[cfg(test)]
+mod optimization_tests;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredFile {
     pub index: u32,
     pub path: String,
@@ -13,7 +21,7 @@ pub struct StoredFile {
     pub priority: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTrackerAuditStep {
     pub delay_seconds: u64,
     pub uploaded: u64,
@@ -22,7 +30,7 @@ pub struct StoredTrackerAuditStep {
     pub event: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredTrackerAuditProfile {
     pub allowed_host: String,
     pub port: u16,
@@ -31,8 +39,10 @@ pub struct StoredTrackerAuditProfile {
     pub steps: Vec<StoredTrackerAuditStep>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TorrentRecord {
+    #[serde(default = "complete_file_tree")]
+    pub files_complete: bool,
     pub resume: crate::resume::ResumeCounters,
     pub transfer_settings: Option<crate::transfer_settings::TransferSettings>,
     pub repair_policy: crate::runtime_status::RepairPolicy,
@@ -56,6 +66,9 @@ pub struct TorrentRecord {
     pub uploaded_bytes: u64,
     pub tracker_audit: Option<StoredTrackerAuditProfile>,
 }
+fn complete_file_tree() -> bool {
+    true
+}
 
 pub struct StateStore {
     connection: Connection,
@@ -65,11 +78,15 @@ pub struct StateStore {
     resume_checkpoints:
         std::cell::RefCell<std::collections::HashMap<String, (crate::resume::ResumeCounters, u64)>>,
     tracker_fingerprints: std::cell::RefCell<std::collections::HashMap<String, Vec<[u8; 32]>>>,
+    audit_fingerprints: std::cell::RefCell<std::collections::HashMap<String, Option<[u8; 32]>>>,
 }
 
 impl StateStore {
     /// Remove completed intents only AFTER the controller durably saved this path.
     pub(crate) fn acknowledge_storage_move(&self, torrent: &TorrentRecord) -> Result<(), String> {
+        self.acknowledge_storage_location(&torrent.id, torrent.download_directory.as_deref())
+    }
+    fn acknowledge_storage_location(&self, id: &str, folder: Option<&str>) -> Result<(), String> {
         let Some(database) = self.connection.path().filter(|path| !path.is_empty()) else {
             return Ok(());
         };
@@ -82,12 +99,12 @@ impl StateStore {
         let plans = crate::storage::move_plan::pending(profile)
             .map_err(|_| "Cannot read move acknowledgement journals")?
             .into_iter()
-            .filter(|(_, plan)| plan.id == torrent.id)
+            .filter(|(_, plan)| plan.id == id)
             .collect::<Vec<_>>();
         if plans.is_empty() {
             return Ok(());
         }
-        let Some(folder) = torrent.download_directory.as_deref() else {
+        let Some(folder) = folder else {
             return Ok(());
         };
         let key = crate::storage::move_plan::root_key(Path::new(folder));
@@ -344,6 +361,7 @@ impl StateStore {
             secrets,
             resume_checkpoints: Default::default(),
             tracker_fingerprints: Default::default(),
+            audit_fingerprints: Default::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -514,6 +532,9 @@ impl StateStore {
     }
 
     pub fn save_torrent(&mut self, torrent: &TorrentRecord) -> rusqlite::Result<()> {
+        if !torrent.files_complete {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         if let Some(settings) = torrent.transfer_settings {
             settings
                 .validate()
@@ -687,6 +708,14 @@ impl StateStore {
         self.tracker_fingerprints
             .borrow_mut()
             .insert(torrent.id.clone(), desired_trackers);
+        self.audit_fingerprints.borrow_mut().insert(
+            torrent.id.clone(),
+            torrent
+                .tracker_audit
+                .as_ref()
+                .map(audit_fingerprint)
+                .transpose()?,
+        );
         Ok(())
     }
 
@@ -758,6 +787,9 @@ impl StateStore {
         )?;
         insert_tracker_audit(&transaction, torrent_id, audit)?;
         transaction.commit()?;
+        self.audit_fingerprints
+            .borrow_mut()
+            .insert(torrent_id.to_owned(), Some(audit_fingerprint(audit)?));
         Ok(true)
     }
 
@@ -802,6 +834,14 @@ impl StateStore {
         id: &str,
         include_trackers: bool,
     ) -> rusqlite::Result<Option<TorrentRecord>> {
+        self.load_torrent_parts(id, include_trackers, true)
+    }
+    fn load_torrent_parts(
+        &self,
+        id: &str,
+        include_trackers: bool,
+        include_files: bool,
+    ) -> rusqlite::Result<Option<TorrentRecord>> {
         let mut torrent = self
             .connection
             .query_row(
@@ -811,6 +851,7 @@ impl StateStore {
                 [id],
                 |row| {
                     Ok(TorrentRecord {
+                        files_complete: include_files,
                         resume: Default::default(),
                         transfer_settings: None,
                         upload_ratio: crate::download_mode::UploadRatioRange { min_milli: row.get(15)?, max_milli: row.get(16)? },
@@ -888,28 +929,30 @@ impl StateStore {
                 .borrow_mut()
                 .insert(id.to_owned(), tracker_fingerprints(&torrent.trackers));
         }
-        let mut file_statement = self.connection.prepare(
-            "SELECT file_index, path, size_bytes, downloaded_bytes, selected, priority
+        if include_files {
+            let mut file_statement = self.connection.prepare(
+                "SELECT file_index, path, size_bytes, downloaded_bytes, selected, priority
              FROM files WHERE torrent_id=?1 ORDER BY file_index",
-        )?;
-        torrent.files = file_statement
-            .query_map([id], |row| {
-                Ok(StoredFile {
-                    index: row.get(0)?,
-                    path: row.get(1)?,
-                    size_bytes: from_sql_u64(row.get(2)?)?,
-                    downloaded_bytes: from_sql_u64(row.get(3)?)?,
-                    selected: row.get(4)?,
-                    priority: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut piece_statement = self.connection.prepare(
-            "SELECT piece_index FROM verified_pieces WHERE torrent_id=?1 ORDER BY piece_index",
-        )?;
-        torrent.verified_pieces = piece_statement
-            .query_map([id], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+            )?;
+            torrent.files = file_statement
+                .query_map([id], |row| {
+                    Ok(StoredFile {
+                        index: row.get(0)?,
+                        path: row.get(1)?,
+                        size_bytes: from_sql_u64(row.get(2)?)?,
+                        downloaded_bytes: from_sql_u64(row.get(3)?)?,
+                        selected: row.get(4)?,
+                        priority: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut piece_statement = self.connection.prepare(
+                "SELECT piece_index FROM verified_pieces WHERE torrent_id=?1 ORDER BY piece_index",
+            )?;
+            torrent.verified_pieces = piece_statement
+                .query_map([id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
         torrent.tracker_audit = self.load_tracker_audit(id)?;
         Ok(Some(torrent))
     }
@@ -941,7 +984,7 @@ impl StateStore {
             .collect()
     }
 
-    fn load_tracker_audit(
+    pub fn load_tracker_audit(
         &self,
         torrent_id: &str,
     ) -> rusqlite::Result<Option<StoredTrackerAuditProfile>> {
@@ -971,6 +1014,9 @@ impl StateStore {
             )
             .optional()?;
         let Some(profile) = profile.as_mut() else {
+            self.audit_fingerprints
+                .borrow_mut()
+                .insert(torrent_id.to_owned(), None);
             return Ok(None);
         };
         let mut statement = self.connection.prepare(
@@ -988,6 +1034,9 @@ impl StateStore {
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        self.audit_fingerprints
+            .borrow_mut()
+            .insert(torrent_id.to_owned(), Some(audit_fingerprint(profile)?));
         Ok(Some(profile.clone()))
     }
 
@@ -998,6 +1047,7 @@ impl StateStore {
             > 0;
         self.resume_checkpoints.borrow_mut().remove(id);
         self.tracker_fingerprints.borrow_mut().remove(id);
+        self.audit_fingerprints.borrow_mut().remove(id);
         Ok(removed)
     }
 
@@ -1033,6 +1083,11 @@ fn tracker_fingerprints(trackers: &[String]) -> Vec<[u8; 32]> {
         .iter()
         .map(|tracker| Sha256::digest(tracker.as_bytes()).into())
         .collect()
+}
+
+fn audit_fingerprint(audit: &StoredTrackerAuditProfile) -> rusqlite::Result<[u8; 32]> {
+    let bytes = serde_json::to_vec(audit).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn insert_tracker_audit(
@@ -1495,8 +1550,9 @@ mod tests {
         assert_eq!(restored.upload_ratio.max_milli, 2500);
     }
 
-    fn record() -> TorrentRecord {
+    pub(super) fn record() -> TorrentRecord {
         TorrentRecord {
+            files_complete: true,
             resume: Default::default(),
             transfer_settings: None,
             repair_policy: Default::default(),

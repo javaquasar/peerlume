@@ -11,6 +11,155 @@ fn controller() -> Controller {
     Controller::new(ClientBackend::offline(), vec![torrent()])
 }
 
+#[test]
+fn unchanged_summary_telemetry_does_not_refresh_native_snapshots_but_rate_changes_do() {
+    let mut control = controller();
+    let event = |rate| SessionEvent::Stats {
+        id: "v1: abc".into(),
+        downloaded_bytes: 20,
+        uploaded_bytes: 5,
+        download_rate: rate,
+        upload_rate: 0,
+        file_progress: vec![],
+        peers: 0,
+        finished: false,
+        paused: false,
+    };
+    emit(&mut control, event(10));
+    let native_revision = control.frontend_revision();
+    let public_revision = page(&control.read_handle()).revision;
+    for _ in 0..100 {
+        emit(&mut control, event(10));
+    }
+    assert_eq!(control.frontend_revision(), native_revision);
+    emit(&mut control, event(25));
+    assert!(control.frontend_revision() > native_revision);
+    assert_eq!(
+        page(&control.read_handle()).revision,
+        public_revision,
+        "rate-only native refresh must not manufacture public transfer acknowledgements"
+    );
+}
+
+#[test]
+fn durable_removal_retries_only_after_detachment_and_preserves_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("state.sqlite3");
+    let payload = root.path().join("keep.bin");
+    std::fs::write(&payload, b"synthetic payload remains").unwrap();
+    let mut backend =
+        ClientBackend::with_state_store(crate::state::StateStore::open(&database).unwrap());
+    let item = torrent();
+    backend
+        .save_torrent(&crate::client::torrent_to_record(&item, None))
+        .unwrap();
+    let faults = rusqlite::Connection::open(&database).unwrap();
+    faults.execute_batch("CREATE TRIGGER blocked_delete BEFORE DELETE ON torrents BEGIN SELECT RAISE(ABORT, 'synthetic delete failure'); END;").unwrap();
+    let mut control = Controller::new(backend, vec![item]);
+    control.pending_removals.insert("v1: abc".into());
+    control.tick();
+    assert_eq!(
+        control.torrents.len(),
+        1,
+        "queued remove is not a detachment ACK"
+    );
+    control.apply(SessionEvent::Removed {
+        id: "v1: abc".into(),
+    });
+    assert_eq!(control.torrents.len(), 1);
+    assert!(control.is_busy("v1: abc"));
+    assert_eq!(control.backend.load_torrents().unwrap().len(), 1);
+    faults
+        .execute_batch("DROP TRIGGER blocked_delete;")
+        .unwrap();
+    control.tick();
+    assert!(control.torrents.is_empty());
+    assert!(control.backend.load_torrents().unwrap().is_empty());
+    assert!(control.pending_removals.is_empty());
+    assert_eq!(
+        std::fs::read(payload).unwrap(),
+        b"synthetic payload remains"
+    );
+}
+
+#[test]
+fn indexed_alias_events_follow_structural_removal_and_do_not_touch_neighbors() {
+    let items = (0..5_000)
+        .map(|index| {
+            let mut item = torrent();
+            item.info_hashes = vec![format!("v1: {index}"), format!("v2: {index}")];
+            item
+        })
+        .collect();
+    let mut control = Controller::new(ClientBackend::offline(), items);
+    control.torrents.remove(8);
+    control.apply(SessionEvent::NetworkTotals {
+        id: "v2: 4999".into(),
+        uploaded: 123,
+        downloaded: 456,
+        seeded_seconds: 7,
+    });
+    assert_eq!(control.torrents[4_998].runtime.network_downloaded, 456);
+    assert_eq!(control.torrents[4_997].runtime.network_downloaded, 0);
+    assert!(!control.observed.contains_key("v1: 8;v2: 8"));
+    let mut replacement = torrent();
+    replacement.info_hashes = vec!["v1: replacement".into()];
+    control.torrents[4_998] = replacement;
+    control.invalidate_torrent_index();
+    control.apply(SessionEvent::NetworkTotals {
+        id: "v1: replacement".into(),
+        uploaded: 321,
+        downloaded: 654,
+        seeded_seconds: 9,
+    });
+    assert_eq!(control.torrents[4_998].runtime.network_downloaded, 654);
+    assert!(!control.observed.contains_key("v1: 4999;v2: 4999"));
+    control.apply(SessionEvent::Stopped);
+    assert!(
+        control
+            .observed
+            .values()
+            .all(|row| row.state == ObservedState::Stopped)
+    );
+}
+
+#[test]
+#[ignore = "Release-only synthetic controller timing; no engine or user profile"]
+fn release_indexed_controller_measurement() {
+    for count in [100, 1_000, 5_000, 10_000, 100_000] {
+        let items = (0..count)
+            .map(|index| {
+                let mut item = torrent();
+                item.info_hashes = vec![format!("v1: {index}")];
+                item
+            })
+            .collect();
+        let mut control = Controller::new(ClientBackend::offline(), items);
+        let start = std::time::Instant::now();
+        for index in 0..20_000 {
+            control.apply(SessionEvent::NetworkTotals {
+                id: format!("v1: {}", index % count),
+                uploaded: index as u64,
+                downloaded: index as u64,
+                seeded_seconds: 0,
+            });
+        }
+        let event_micros = start.elapsed().as_micros();
+        // No projection changed between these publications: structural work
+        // must remain independent of the number of registered torrents.
+        control.publish();
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            control.publish();
+        }
+        let publish_micros = start.elapsed().as_micros();
+        println!(
+            "{{\"kind\":\"indexed_controller\",\"torrents\":{count},\"events\":20000,\"event_total_us\":{event_micros},\"unchanged_publish_total_us\":{publish_micros}}}"
+        );
+        std::hint::black_box(control);
+    }
+}
+
 fn page(reader: &ReadHandle) -> ReadPage {
     reader.page(0, MAX_PAGE_SIZE, None, None).unwrap()
 }
@@ -498,6 +647,108 @@ fn controller_shutdown_is_visible_to_surviving_read_handles() {
     assert!(!after.controller_available);
     assert_eq!(after.revision, before.revision + 1);
     assert_eq!(after.torrents, before.torrents);
+}
+
+fn controller_with_shutdown_journal(
+    directory: &std::path::Path,
+    journal: crate::announce_journal::AnnounceJournal,
+) -> Controller {
+    let runtime = crate::session::SessionRuntime::start_test_with_journal(
+        64,
+        directory.to_owned(),
+        librqbit::SessionOptions {
+            dht: None,
+            listen: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            ..Default::default()
+        },
+        journal,
+    )
+    .unwrap();
+    Controller::new(ClientBackend::with_session(runtime), Vec::new())
+}
+
+#[test]
+fn owner_shutdown_seals_and_syncs_journal_while_observer_clone_survives_runtime() {
+    let temporary = tempfile::tempdir().unwrap();
+    let retained =
+        crate::announce_journal::AnnounceJournal::open(&temporary.path().join("journal"));
+    let manifest = retained.manifest_path().unwrap();
+    let mut owner = controller_with_shutdown_journal(temporary.path(), retained.clone());
+    for _ in 0..16 {
+        retained.record(crate::announce_journal::tests::observation(
+            "synthetic-owner-shutdown",
+        ));
+    }
+    owner.shutdown().unwrap();
+    assert!(!owner.backend.session_available());
+    let status = retained.status();
+    assert!(status.closed && status.error.is_none());
+    assert_eq!(
+        (
+            status.accepted_sequence,
+            status.written_sequence,
+            status.durable_sequence
+        ),
+        (16, 16, 16)
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(saved["clean_shutdown"], true);
+    assert_eq!(saved["incomplete"], false);
+    let path = retained.path().unwrap();
+    let length = std::fs::metadata(&path).unwrap().len();
+    retained.record(crate::announce_journal::tests::observation(
+        "rejected-after-owner-shutdown",
+    ));
+    let after = retained.status();
+    assert_eq!(
+        after.accepted_sequence, 16,
+        "a surviving observer cannot reopen admission after shutdown"
+    );
+    assert_eq!(after.rejected_records, status.rejected_records + 1);
+    assert_eq!(std::fs::metadata(path).unwrap().len(), length);
+    let reopened = crate::announce_journal::AnnounceJournal::reopen(&manifest).unwrap();
+    assert_eq!(reopened.status().durable_sequence, 16);
+}
+
+#[test]
+fn owner_shutdown_surfaces_manifest_seal_failure_and_still_joins_runtime() {
+    let temporary = tempfile::tempdir().unwrap();
+    let retained =
+        crate::announce_journal::AnnounceJournal::open(&temporary.path().join("journal"));
+    retained.record(crate::announce_journal::tests::observation(
+        "synthetic-seal-failure",
+    ));
+    retained.flush().unwrap();
+    let manifest = retained.manifest_path().unwrap();
+    std::fs::remove_file(&manifest).unwrap(); // Only the disposable test manifest.
+    std::fs::create_dir(&manifest).unwrap(); // Actual filesystem rename failure.
+    let mut owner = controller_with_shutdown_journal(temporary.path(), retained.clone());
+    let error = owner.shutdown().unwrap_err();
+    assert!(error.contains("journal manifest"), "{error}");
+    assert!(
+        !owner.backend.session_available(),
+        "journal failure must not leave the engine running"
+    );
+    assert!(retained.status().closed);
+    assert!(retained.error().is_some());
+}
+
+#[test]
+fn owner_shutdown_surfaces_initial_journal_open_failure_with_a_retained_clone() {
+    let temporary = tempfile::tempdir().unwrap();
+    let blocker = temporary.path().join("journal-is-a-file");
+    std::fs::write(&blocker, b"synthetic directory blocker").unwrap();
+    let retained = crate::announce_journal::AnnounceJournal::open(&blocker);
+    let initial_error = retained
+        .error()
+        .expect("filesystem open failure must be visible");
+    let mut owner = controller_with_shutdown_journal(temporary.path(), retained.clone());
+    assert_eq!(owner.shutdown().unwrap_err(), initial_error);
+    assert!(!owner.backend.session_available());
+    assert_eq!(retained.error(), Some(initial_error));
 }
 
 #[test]

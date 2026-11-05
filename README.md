@@ -1,8 +1,10 @@
 # PeerLume
 
 Versioned implementation plans and validation evidence are indexed in
-[Release documentation](docs/releases/README.md). The current performance and
-responsiveness plan targets [0.2.0](docs/releases/0.2.0/release-plan.md).
+[Release documentation](docs/releases/README.md). The current scalability and
+background ownership plan targets [0.3.0](docs/releases/0.3.0/release-plan.md).
+See [native frontends and the background owner](docs/native-frontends.md) for
+startup, shutdown, compatibility and trusted local access.
 
 Experimental BitTorrent client in Rust with configurable peer discovery, scheduling, rate limits, and protocol behavior.
 

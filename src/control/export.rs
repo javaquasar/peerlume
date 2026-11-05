@@ -19,26 +19,37 @@ pub(crate) fn start(
     output: File,
     deadline: u64,
 ) -> Result<ExportJob, ErrorCode> {
-    let (input, length) = journal
-        .disk_snapshot()
-        .map_err(|_| ErrorCode::PersistenceUnavailable)?;
-    if length > 512 * 1024 * 1024 {
-        return Err(ErrorCode::TooLarge);
+    if journal.path().is_none() || journal.error().is_some() {
+        return Err(ErrorCode::PersistenceUnavailable);
     }
+    let journal = journal.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     let entries = Arc::new(AtomicU64::new(0));
     let count = entries.clone();
     std::thread::Builder::new()
         .name("peerlume-agent-export".into())
         .spawn(move || {
-            let result = stream(
-                input,
-                output,
-                length,
-                &hash,
-                deadline.min(now_ms() + 300_000),
-                &count,
-            );
+            // A flush barrier and full segmented snapshot can perform disk I/O.
+            // Keep both outside the controller/renderer ownership lock.
+            let result = journal
+                .disk_snapshot()
+                .map_err(|error| {
+                    if error == crate::announce_journal::writer::EXPORT_TOO_LARGE {
+                        ErrorCode::TooLarge
+                    } else {
+                        ErrorCode::PersistenceUnavailable
+                    }
+                })
+                .and_then(|(input, length)| {
+                    stream(
+                        input,
+                        output,
+                        length,
+                        &hash,
+                        deadline.min(now_ms() + 300_000),
+                        &count,
+                    )
+                });
             let _ = sender.send(result);
         })
         .map_err(|_| ErrorCode::Busy)?;

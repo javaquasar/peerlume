@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source_file_set_sha256": "6d35f25ec85a63b5f207053ec9b0aab079898578b3a3c517c355f6bd27c3ec61",
+  "comparison": "optimized_only_no_baseline",
+  "measurements": [
+    {
+      "kind": "indexed_controller",
+      "torrents": 100,
+      "events": 20000,
+      "event_total_us": 9202,
+      "unchanged_publish_total_us": 52
+    },
+    {
+      "kind": "indexed_controller",
+      "torrents": 1000,
+      "events": 20000,
+      "event_total_us": 10359,
+      "unchanged_publish_total_us": 52
+    },
+    {
+      "kind": "indexed_controller",
+      "torrents": 5000,
+      "events": 20000,
+      "event_total_us": 10619,
+      "unchanged_publish_total_us": 52
+    },
+    {
+      "kind": "indexed_controller",
+      "torrents": 10000,
+      "events": 20000,
+      "event_total_us": 11892,
+      "unchanged_publish_total_us": 52
+    },
+    {
+      "kind": "indexed_controller",
+      "torrents": 100000,
+      "events": 20000,
+      "event_total_us": 16698,
+      "unchanged_publish_total_us": 52
+    }
+  ]
+}

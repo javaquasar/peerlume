@@ -1,0 +1,484 @@
+{
+  "schema_version": 1,
+  "workload": "cold_model_resources_0_3_0",
+  "source_label": "0.3.0-integrated-release",
+  "executable_file_name": "optimization-workload.exe",
+  "executable_sha256": "af46755e5ffdc79da84dad25d98d5a46decd943a27de317d05efce28409be417",
+  "identity": {
+    "architecture": "x86_64",
+    "compiled_inputs_sha256": {
+      "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+      "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+      "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+      "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+      "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+      "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+      "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+    },
+    "debug_assertions": false,
+    "os": "windows"
+  },
+  "completed": true,
+  "samples_per_phase": 20,
+  "requested_sample_interval_ms": 10,
+  "cases": [
+    {
+      "files": 1000,
+      "phases": [
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 48000,
+            "path_capacity_bytes": 32000,
+            "priority_capacity_bytes": 125,
+            "total_bytes": 113412,
+            "tree_capacity_bytes": 33280,
+            "view_capacity_bytes": 7
+          },
+          "details_loaded": true,
+          "files": 1000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "loaded",
+          "selected_count": 1000,
+          "selected_downloaded": 0,
+          "selected_size": 262144000,
+          "total_size": 262144000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 34600,
+            "last_sample_offset_ns": 200119600,
+            "max_successful_sample_gap_ns": 11058200,
+            "unsampled_start_ns": 34600,
+            "unsampled_tail_ns": 10107900,
+            "sampled_rss_peak_bytes": 4325376,
+            "sampled_rss_peak_offset_ns": 34600,
+            "os_high_water_mark_observed_bytes": 4329472
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 16125,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 125,
+            "total_bytes": 16250,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 1000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "owner_cold",
+          "selected_count": 1000,
+          "selected_downloaded": 0,
+          "selected_size": 262144000,
+          "total_size": 262144000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 13900,
+            "last_sample_offset_ns": 201492600,
+            "max_successful_sample_gap_ns": 11041200,
+            "unsampled_start_ns": 13900,
+            "unsampled_tail_ns": 10245500,
+            "sampled_rss_peak_bytes": 4259840,
+            "sampled_rss_peak_offset_ns": 13900,
+            "os_high_water_mark_observed_bytes": 4345856
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 0,
+            "total_bytes": 0,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 1000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "summary_mirror",
+          "selected_count": 1000,
+          "selected_downloaded": 0,
+          "selected_size": 262144000,
+          "total_size": 262144000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 10600,
+            "last_sample_offset_ns": 202725900,
+            "max_successful_sample_gap_ns": 11061900,
+            "unsampled_start_ns": 10600,
+            "unsampled_tail_ns": 10069300,
+            "sampled_rss_peak_bytes": 4243456,
+            "sampled_rss_peak_offset_ns": 10600,
+            "os_high_water_mark_observed_bytes": 4345856
+          }
+        }
+      ],
+      "completed": true,
+      "child_exit_code": 0,
+      "cpu_user_time_ns": 15625000,
+      "cpu_kernel_time_ns": 15625000,
+      "cpu_time_ns": 31250000,
+      "cpu_measurement": "Windows GetProcessTimes (completed child handle)",
+      "process_wall_ns": 674794200
+    },
+    {
+      "files": 10000,
+      "phases": [
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 480000,
+            "path_capacity_bytes": 320000,
+            "priority_capacity_bytes": 1250,
+            "total_bytes": 1122537,
+            "tree_capacity_bytes": 321280,
+            "view_capacity_bytes": 7
+          },
+          "details_loaded": true,
+          "files": 10000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "loaded",
+          "selected_count": 10000,
+          "selected_downloaded": 0,
+          "selected_size": 2621440000,
+          "total_size": 2621440000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 19300,
+            "last_sample_offset_ns": 200696900,
+            "max_successful_sample_gap_ns": 11111200,
+            "unsampled_start_ns": 19300,
+            "unsampled_tail_ns": 10203500,
+            "sampled_rss_peak_bytes": 5783552,
+            "sampled_rss_peak_offset_ns": 19300,
+            "os_high_water_mark_observed_bytes": 5787648
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 161250,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 1250,
+            "total_bytes": 162500,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 10000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "owner_cold",
+          "selected_count": 10000,
+          "selected_downloaded": 0,
+          "selected_size": 2621440000,
+          "total_size": 2621440000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 14500,
+            "last_sample_offset_ns": 200480800,
+            "max_successful_sample_gap_ns": 11021800,
+            "unsampled_start_ns": 14500,
+            "unsampled_tail_ns": 10113300,
+            "sampled_rss_peak_bytes": 5533696,
+            "sampled_rss_peak_offset_ns": 14500,
+            "os_high_water_mark_observed_bytes": 5853184
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 0,
+            "total_bytes": 0,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 10000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "summary_mirror",
+          "selected_count": 10000,
+          "selected_downloaded": 0,
+          "selected_size": 2621440000,
+          "total_size": 2621440000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 16900,
+            "last_sample_offset_ns": 198481000,
+            "max_successful_sample_gap_ns": 11041000,
+            "unsampled_start_ns": 16900,
+            "unsampled_tail_ns": 10976300,
+            "sampled_rss_peak_bytes": 4579328,
+            "sampled_rss_peak_offset_ns": 16900,
+            "os_high_water_mark_observed_bytes": 5853184
+          }
+        }
+      ],
+      "completed": true,
+      "child_exit_code": 0,
+      "cpu_user_time_ns": 15625000,
+      "cpu_kernel_time_ns": 15625000,
+      "cpu_time_ns": 31250000,
+      "cpu_measurement": "Windows GetProcessTimes (completed child handle)",
+      "process_wall_ns": 673616400
+    },
+    {
+      "files": 100000,
+      "phases": [
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 4800000,
+            "path_capacity_bytes": 3200000,
+            "priority_capacity_bytes": 12500,
+            "total_bytes": 11533787,
+            "tree_capacity_bytes": 3201280,
+            "view_capacity_bytes": 320007
+          },
+          "details_loaded": true,
+          "files": 100000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "loaded",
+          "selected_count": 100000,
+          "selected_downloaded": 0,
+          "selected_size": 26214400000,
+          "total_size": 26214400000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 20200,
+            "last_sample_offset_ns": 200723500,
+            "max_successful_sample_gap_ns": 11085200,
+            "unsampled_start_ns": 20200,
+            "unsampled_tail_ns": 10899100,
+            "sampled_rss_peak_bytes": 18239488,
+            "sampled_rss_peak_offset_ns": 20200,
+            "os_high_water_mark_observed_bytes": 18243584
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 1612500,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 12500,
+            "total_bytes": 1625000,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 100000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "owner_cold",
+          "selected_count": 100000,
+          "selected_downloaded": 0,
+          "selected_size": 26214400000,
+          "total_size": 26214400000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 15900,
+            "last_sample_offset_ns": 200482500,
+            "max_successful_sample_gap_ns": 11090000,
+            "unsampled_start_ns": 15900,
+            "unsampled_tail_ns": 11014600,
+            "sampled_rss_peak_bytes": 6520832,
+            "sampled_rss_peak_offset_ns": 15900,
+            "os_high_water_mark_observed_bytes": 18489344
+          }
+        },
+        {
+          "accounted_buffers": {
+            "compact_capacity_bytes": 0,
+            "file_slots_bytes": 0,
+            "path_capacity_bytes": 0,
+            "priority_capacity_bytes": 0,
+            "total_bytes": 0,
+            "tree_capacity_bytes": 0,
+            "view_capacity_bytes": 0
+          },
+          "details_loaded": false,
+          "files": 100000,
+          "identity": {
+            "architecture": "x86_64",
+            "compiled_inputs_sha256": {
+              "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+              "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+              "src/announce_journal.rs": "71294cbf65b18a3556a547c76027b36793961b91bb72d7589575ca09668f8294",
+              "src/announce_journal/writer.rs": "b2a994ea4b08cb4afaab069a954e8febc03f5078aacface38a57be1bb3f37219",
+              "src/file_selection.rs": "0ca4cf47dee8fe77b3175c74592e8c0d1f4bb333b13a33f22cd5edaf04cd74c9",
+              "src/file_selection/deferred.rs": "7f5decfcedccf5db34af06e8ba830da909da1ca1e801786d530beae0ec828169",
+              "src/limits.rs": "e4f17e6534839bb5a33eaa029931a52dc230530f103892431cfeafe11b17cb9d"
+            },
+            "debug_assertions": false,
+            "os": "windows"
+          },
+          "inline_model_bytes": 208,
+          "phase": "summary_mirror",
+          "selected_count": 100000,
+          "selected_downloaded": 0,
+          "selected_size": 26214400000,
+          "total_size": 26214400000,
+          "workload": "cold_model_phase_0_3_0",
+          "memory_sampling": {
+            "successful_samples": 20,
+            "requested_interval_ns": 10000000,
+            "first_sample_offset_ns": 12000,
+            "last_sample_offset_ns": 200793300,
+            "max_successful_sample_gap_ns": 11029700,
+            "unsampled_start_ns": 12000,
+            "unsampled_tail_ns": 10995600,
+            "sampled_rss_peak_bytes": 4890624,
+            "sampled_rss_peak_offset_ns": 12000,
+            "os_high_water_mark_observed_bytes": 18489344
+          }
+        }
+      ],
+      "completed": true,
+      "child_exit_code": 0,
+      "cpu_user_time_ns": 15625000,
+      "cpu_kernel_time_ns": 15625000,
+      "cpu_time_ns": 31250000,
+      "cpu_measurement": "Windows GetProcessTimes (completed child handle)",
+      "process_wall_ns": 702314200
+    }
+  ],
+  "limitations": [
+    "Synthetic file model only; excludes engine metadata, SQLite and native frontend allocations",
+    "Accounted buffers exclude inline object bytes, fixed Arc/Mutex allocations and allocator overhead",
+    "Each phase is held until the sampler acknowledges it; wall time includes deliberate idle holds",
+    "Per-phase sampled RSS is not lifetime RSS peak or private heap; allocator retention can keep RSS high after buffers are freed",
+    "OS high-water marks include earlier phases; do not label them as cold-phase-only peaks",
+    "No user profile, tracker, payload files or running client is sampled"
+  ]
+}

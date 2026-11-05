@@ -25,6 +25,9 @@ class LauncherContract(unittest.TestCase):
         self.assertEqual(release["profile"], "release")
         self.assertIn("--release", release["build_command"])
         self.assertIn("--all-features", release["build_command"])
+        self.assertEqual(release["build_command"].count("--bin"), 2)
+        self.assertIn("peerlume-daemon", release["build_command"])
+        self.assertEqual(Path(release["daemon_executable"]).parent, Path(release["client_command"][0]).parent)
         development = run_client.launch_plan(["--development", "--tui"], self.root)
         self.assertEqual(development["profile"], "debug")
         self.assertNotIn("--release", development["build_command"])
@@ -59,10 +62,24 @@ class LauncherContract(unittest.TestCase):
             executable = Path(plan["client_command"][0])
             executable.parent.mkdir(parents=True)
             executable.touch()
+            Path(plan["daemon_executable"]).touch()
             with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 9)) as execute:
                 self.assertEqual(run_client.main(["--no-build", "--", "--profile", "safe profile"], root=root), 9)
             self.assertEqual(execute.call_args.args[0], [str(executable), "--profile", "safe profile"])
             self.assertEqual(execute.call_args.kwargs, {"cwd": root, "check": False})
+
+    def test_incomplete_existing_package_is_reported_before_starting_a_frontend(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = run_client.launch_plan(["--no-build", "--tui"], root)
+            executable = Path(plan["client_command"][0])
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            output = io.StringIO()
+            with mock.patch.object(subprocess, "run") as execute, contextlib.redirect_stderr(output):
+                self.assertEqual(run_client.main(["--no-build", "--tui"], root=root), 1)
+            execute.assert_not_called()
+            self.assertIn("peerlume-daemon", output.getvalue())
 
 
 if __name__ == "__main__":

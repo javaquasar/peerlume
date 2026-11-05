@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerSnapshot {
     pub address: String,
     pub state: String,
@@ -15,7 +15,7 @@ pub struct PeerSnapshot {
     pub errors: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateSample {
     pub elapsed_ms: u64,
     pub down: u64,

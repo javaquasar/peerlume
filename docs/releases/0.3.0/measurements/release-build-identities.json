@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "kind": "release_build_identity",
+  "base_commit": "3d8242fd0e34347e287e693f224de9873ff97e4f",
+  "candidate_label": "0.3.0-integrated-worktree",
+  "candidate_is_a_new_commit": false,
+  "source_file_set_sha256": "6d35f25ec85a63b5f207053ec9b0aab079898578b3a3c517c355f6bd27c3ec61",
+  "source_before_after_equal": true,
+  "build_command": "cargo +stable build --locked --all-features --release --target x86_64-pc-windows-msvc --bins --example optimization-workload",
+  "rustc": "rustc 1.93.0 (254b59607 2026-01-19)",
+  "binaries": {
+    "peerlume.exe": {
+      "sha256": "990973981ed79092c6ac4b3b1abff7fb9ba623043c75a508b4c445d58669fbd6",
+      "bytes": 15822336
+    },
+    "peerlume-tui.exe": {
+      "sha256": "73f25af69ecb735622f0c05f626bb56e727db2047a59dd6ae69110662d71a854",
+      "bytes": 11186688
+    },
+    "peerlume-daemon.exe": {
+      "sha256": "5383b1f3efc80ef7452990b6b37a15e563e131636d928c9e7c38a00b8be94f8e",
+      "bytes": 19354112
+    },
+    "peerlume-control.exe": {
+      "sha256": "d2c1643d27862119d6a82fbc5d83904f147f6bc91defb2712f392796e0ecd35e",
+      "bytes": 4254208
+    },
+    "peerlume-mcp.exe": {
+      "sha256": "629d770fdc91a790c2f1597ec94b852115db12e87d1acbec74b207f0f1964b1b",
+      "bytes": 4308992
+    },
+    "examples/optimization-workload.exe": {
+      "sha256": "af46755e5ffdc79da84dad25d98d5a46decd943a27de317d05efce28409be417",
+      "bytes": 4450304
+    }
+  },
+  "embedded_example_inputs_match_source_manifest": true,
+  "all_journal_export_runs_verified_128_contiguous_records": true,
+  "measurement_test_binary": {
+    "file_name": "deps/peerlume-10b74acd3146e1c6.exe",
+    "sha256": "eedd139e0d6046bfe42f80112656b4c33863392877bbf693c9b050a2250c466b",
+    "bytes": 31858688,
+    "command_profile": "--locked --all-features --release --target x86_64-pc-windows-msvc --lib --ignored --exact --nocapture --test-threads=1"
+  }
+}

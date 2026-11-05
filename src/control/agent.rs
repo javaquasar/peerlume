@@ -34,6 +34,34 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    pub(super) fn next_wake_delay(&self, maximum: std::time::Duration) -> std::time::Duration {
+        let now = now_ms();
+        let mut delay = maximum;
+        if !self.export_jobs.is_empty() {
+            // Export workers are bounded and only this active operation needs
+            // completion polling; an idle owner has no periodic 20ms timer.
+            delay = delay.min(std::time::Duration::from_millis(100));
+        }
+        for pending in self.pending.values() {
+            delay = delay.min(std::time::Duration::from_millis(
+                if pending.operation.deadline_unix_ms <= now {
+                    100
+                } else {
+                    pending.operation.deadline_unix_ms - now
+                },
+            ));
+            if (!pending.dispatched && !pending.operation.approval_required && self.enabled)
+                || !matches!(
+                    pending.operation.state,
+                    OperationState::Queued | OperationState::Running
+                )
+            {
+                delay = delay.min(std::time::Duration::from_millis(100));
+            }
+        }
+        delay
+    }
+
     pub fn open(directory: &Path, download_root: PathBuf) -> Result<Self, ErrorCode> {
         std::fs::create_dir_all(directory).map_err(|_| ErrorCode::PersistenceUnavailable)?;
         let store = ControlStore::open(&directory.join("control.sqlite3"))?;
@@ -825,7 +853,7 @@ impl AgentService {
                 false
             } else if control
                 .unpersisted_updates
-                .contains(&pending.operation.torrent_id)
+                .contains_key(&pending.operation.torrent_id)
             {
                 control
                     .persist_preserving_audit(&pending.operation.torrent_id)

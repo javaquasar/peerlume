@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::metainfo::MetainfoFile;
+mod deferred;
+#[cfg(test)]
+mod deferred_tests;
+pub use deferred::{CompactFileUpdate, FileMemoryUsage, FileState, FileSummary};
+use deferred::{CompactFiles, DeferredFiles, bit, set_bit};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TorrentFile {
     pub path: String,
     pub size_bytes: u64,
@@ -18,10 +23,12 @@ pub enum FileTreeRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct FileSelectionModel {
-    high_priority: std::collections::BTreeSet<usize>,
+    high_priority: Vec<u8>,
     view_cache: std::sync::Arc<std::sync::Mutex<Option<FileViewCache>>>,
     files: Vec<TorrentFile>,
+    deferred: Option<DeferredFiles>,
     rows: Vec<FileTreeRow>,
+    total_size: u64,
     selected_count: usize,
     selected_size: u64,
     selected_downloaded: u64,
@@ -40,17 +47,25 @@ struct FileViewCache {
 
 impl FileSelectionModel {
     pub fn high_priority(&self) -> Vec<usize> {
-        self.high_priority.iter().copied().collect()
+        self.high_priority
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte != 0)
+            .flat_map(|(index, byte)| {
+                (0..8).filter_map(move |bit| (byte & (1 << bit) != 0).then_some(index * 8 + bit))
+            })
+            .filter(|index| *index < self.file_count())
+            .collect()
     }
     pub fn is_high_priority(&self, index: usize) -> bool {
-        self.high_priority.contains(&index)
+        bit(&self.high_priority, index)
     }
     pub fn set_high_priority(&mut self, indices: &[usize]) {
-        self.high_priority = indices
-            .iter()
-            .copied()
-            .filter(|index| *index < self.files.len())
-            .collect();
+        let count = self.file_count();
+        self.high_priority = vec![0; count.div_ceil(8)];
+        for &index in indices.iter().filter(|index| **index < count) {
+            set_bit(&mut self.high_priority, index, true);
+        }
     }
     pub fn from_files(files: impl IntoIterator<Item = (String, u64)>) -> Self {
         Self::from_torrent_files(files.into_iter().map(|(path, size_bytes)| TorrentFile {
@@ -95,6 +110,281 @@ impl FileSelectionModel {
 
     pub fn files(&self) -> &[TorrentFile] {
         &self.files
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.deferred
+            .as_ref()
+            .map(DeferredFiles::len)
+            .unwrap_or(self.files.len())
+    }
+    pub fn details_loaded(&self) -> bool {
+        self.deferred.is_none()
+    }
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    pub fn checked_total_size(&self) -> Option<u64> {
+        match &self.deferred {
+            Some(DeferredFiles::Summary(summary)) => Some(summary.total_size),
+            Some(DeferredFiles::Compact(files)) => files
+                .sizes
+                .iter()
+                .try_fold(0_u64, |sum, size| sum.checked_add(*size)),
+            None => self
+                .files
+                .iter()
+                .try_fold(0_u64, |sum, file| sum.checked_add(file.size_bytes)),
+        }
+    }
+    pub fn try_from_compact_states<E>(
+        states: impl IntoIterator<Item = Result<FileState, E>>,
+    ) -> Result<Self, E> {
+        let mut compact = CompactFiles::default();
+        let mut priority = Vec::new();
+        for (index, state) in states.into_iter().enumerate() {
+            let state = state?;
+            compact.sizes.push(state.size_bytes);
+            compact
+                .downloaded
+                .push(state.downloaded_bytes.min(state.size_bytes));
+            if index % 8 == 0 {
+                compact.selected.push(0);
+                priority.push(0);
+            }
+            set_bit(&mut compact.selected, index, state.selected);
+            set_bit(&mut priority, index, state.high_priority);
+        }
+        let mut model = Self {
+            high_priority: priority,
+            deferred: Some(DeferredFiles::Compact(compact)),
+            ..Default::default()
+        };
+        model.refresh_selection_totals();
+        Ok(model)
+    }
+    pub fn summary(&self) -> FileSummary {
+        FileSummary {
+            file_count: self.file_count(),
+            total_size: self.total_size,
+            selected_count: self.selected_count,
+            selected_size: self.selected_size,
+            selected_downloaded: self.selected_downloaded(),
+        }
+    }
+    /// A trusted frontend mirror can retain an O(1) header until detail pages arrive.
+    /// This state cannot manufacture a complete selection or a persistence snapshot.
+    pub fn from_summary(summary: FileSummary) -> Self {
+        Self {
+            deferred: Some(DeferredFiles::Summary(summary)),
+            total_size: summary.total_size,
+            selected_count: summary.selected_count,
+            selected_size: summary.selected_size,
+            selected_downloaded: summary.selected_downloaded,
+            selected_downloaded_summary: Some(summary.selected_downloaded),
+            ..Default::default()
+        }
+    }
+    pub fn from_compact_snapshot(
+        files: impl IntoIterator<Item = (u64, u64, bool)>,
+        high: &[usize],
+    ) -> Self {
+        let mut compact = CompactFiles::default();
+        for (index, (size, downloaded, selected)) in files.into_iter().enumerate() {
+            compact.sizes.push(size);
+            compact.downloaded.push(downloaded.min(size));
+            if index % 8 == 0 {
+                compact.selected.push(0);
+            }
+            set_bit(&mut compact.selected, index, selected);
+        }
+        let mut model = Self {
+            deferred: Some(DeferredFiles::Compact(compact)),
+            ..Default::default()
+        };
+        model.refresh_selection_totals();
+        model.set_high_priority(high);
+        model
+    }
+    pub fn file_state(&self, index: usize) -> Option<FileState> {
+        let (size_bytes, downloaded_bytes, selected) = match &self.deferred {
+            Some(DeferredFiles::Compact(files)) => (
+                *files.sizes.get(index)?,
+                *files.downloaded.get(index)?,
+                bit(&files.selected, index),
+            ),
+            Some(DeferredFiles::Summary(_)) => return None,
+            None => {
+                let file = self.files.get(index)?;
+                (file.size_bytes, file.downloaded_bytes, file.selected)
+            }
+        };
+        Some(FileState {
+            size_bytes,
+            downloaded_bytes,
+            selected,
+            high_priority: self.is_high_priority(index),
+        })
+    }
+    pub fn selected_indices(&self) -> Option<Vec<usize>> {
+        if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
+            return None;
+        }
+        Some(
+            (0..self.file_count())
+                .filter(|index| self.file_state(*index).is_some_and(|file| file.selected))
+                .collect(),
+        )
+    }
+    pub fn persistence_snapshot(&self, with_progress: bool) -> Option<CompactFileUpdate> {
+        if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
+            return None;
+        }
+        let count = self.file_count();
+        let mut snapshot = CompactFileUpdate {
+            file_count: count,
+            selected_bits: vec![0; count.div_ceil(8)],
+            priority_bits: vec![0; count.div_ceil(8)],
+            downloaded: if with_progress {
+                Vec::with_capacity(count)
+            } else {
+                Vec::new()
+            },
+        };
+        for index in 0..count {
+            let state = self.file_state(index)?;
+            set_bit(&mut snapshot.selected_bits, index, state.selected);
+            set_bit(&mut snapshot.priority_bits, index, state.high_priority);
+            if with_progress {
+                snapshot.downloaded.push(state.downloaded_bytes);
+            }
+        }
+        Some(snapshot)
+    }
+    pub fn apply_persistence_snapshot(
+        &mut self,
+        snapshot: &CompactFileUpdate,
+    ) -> Result<(), String> {
+        let with_progress = !snapshot.downloaded.is_empty();
+        if !snapshot.valid(with_progress)
+            || snapshot.file_count != self.file_count()
+            || matches!(self.deferred, Some(DeferredFiles::Summary(_)))
+        {
+            return Err("File snapshot requires matching authoritative detail metadata".into());
+        }
+        for index in 0..self.file_count() {
+            self.set_selected(index, snapshot.selected(index));
+            if with_progress {
+                self.set_file_downloaded(index, snapshot.downloaded[index]);
+            }
+        }
+        self.high_priority = snapshot.priority_bits.clone();
+        Ok(())
+    }
+    pub fn apply_summary(&mut self, summary: FileSummary) -> Result<(), String> {
+        if summary.file_count != self.file_count()
+            || summary.total_size != self.total_size
+            || summary.selected_count > summary.file_count
+            || summary.selected_size > summary.total_size
+            || summary.selected_downloaded > summary.selected_size
+        {
+            return Err("File summary identity or bounds changed; reload details".into());
+        }
+        self.selected_count = summary.selected_count;
+        self.selected_size = summary.selected_size;
+        self.selected_downloaded_summary = Some(summary.selected_downloaded);
+        if let Some(DeferredFiles::Summary(saved)) = &mut self.deferred {
+            *saved = summary;
+        }
+        Ok(())
+    }
+    /// Release paths, tree and search results; retain exact selection arithmetic.
+    pub fn defer_details(&mut self) -> bool {
+        if self.deferred.is_some() {
+            return false;
+        }
+        let mut compact = CompactFiles {
+            sizes: Vec::with_capacity(self.files.len()),
+            downloaded: Vec::with_capacity(self.files.len()),
+            selected: vec![0; self.files.len().div_ceil(8)],
+        };
+        for (index, file) in std::mem::take(&mut self.files).into_iter().enumerate() {
+            compact.sizes.push(file.size_bytes);
+            compact.downloaded.push(file.downloaded_bytes);
+            set_bit(&mut compact.selected, index, file.selected);
+        }
+        self.deferred = Some(DeferredFiles::Compact(compact));
+        self.rows = Vec::new();
+        self.view_cache = Default::default();
+        true
+    }
+    /// Paths from a bounded loader are merged with current canonical compact data.
+    /// A caller must reject stale owner/selection generations before this method.
+    pub fn hydrate_paths(&mut self, paths: Vec<String>) -> Result<(), String> {
+        if paths.len() != self.file_count() {
+            return Err("File detail count changed; reload the authoritative snapshot".into());
+        }
+        crate::limits::validate_relative_paths(
+            paths.iter().map(String::as_str),
+            &crate::limits::ResourceLimits::default(),
+        )?;
+        let Some(DeferredFiles::Compact(_)) = &self.deferred else {
+            return if self.details_loaded() {
+                Ok(())
+            } else {
+                Err("Summary-only file details require complete authoritative pages".into())
+            };
+        };
+        let Some(DeferredFiles::Compact(compact)) = self.deferred.take() else {
+            unreachable!()
+        };
+        self.files = paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| TorrentFile {
+                path,
+                size_bytes: compact.sizes[index],
+                downloaded_bytes: compact.downloaded[index],
+                selected: bit(&compact.selected, index),
+            })
+            .collect();
+        self.rows = build_tree_rows(&self.files);
+        self.view_cache = Default::default();
+        Ok(())
+    }
+    pub fn memory_usage(&self) -> FileMemoryUsage {
+        let row_bytes = |rows: &Vec<FileTreeRow>| {
+            rows.capacity() * std::mem::size_of::<FileTreeRow>()
+                + rows
+                    .iter()
+                    .map(|row| match row {
+                        FileTreeRow::Group { name, .. } => name.capacity(),
+                        _ => 0,
+                    })
+                    .sum::<usize>()
+        };
+        let view_capacity_bytes = self
+            .view_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|cache| row_bytes(&cache.rows) + cache.query.capacity())
+            .unwrap_or_default();
+        let compact_capacity_bytes = match &self.deferred {
+            Some(DeferredFiles::Compact(files)) => {
+                (files.sizes.capacity() + files.downloaded.capacity()) * std::mem::size_of::<u64>()
+                    + files.selected.capacity()
+            }
+            _ => 0,
+        };
+        FileMemoryUsage {
+            file_slots_bytes: self.files.capacity() * std::mem::size_of::<TorrentFile>(),
+            path_capacity_bytes: self.files.iter().map(|file| file.path.capacity()).sum(),
+            tree_capacity_bytes: row_bytes(&self.rows),
+            view_capacity_bytes,
+            compact_capacity_bytes,
+            priority_capacity_bytes: self.high_priority.capacity(),
+        }
     }
 
     pub fn rows(&self) -> &[FileTreeRow] {
@@ -152,17 +442,17 @@ impl FileSelectionModel {
         if all.is_none() && edits.is_empty() {
             return None;
         }
+        if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
+            return None;
+        }
         Some(
-            self.files
-                .iter()
-                .enumerate()
-                .filter_map(|(index, file)| {
+            (0..self.file_count())
+                .filter(|&index| {
                     edits
                         .get(&index)
                         .copied()
                         .or(all)
-                        .unwrap_or(file.selected)
-                        .then_some(index)
+                        .unwrap_or_else(|| self.file_state(index).is_some_and(|file| file.selected))
                 })
                 .collect(),
         )
@@ -177,12 +467,34 @@ impl FileSelectionModel {
     }
 
     pub fn select_all(&mut self, selected: bool) {
-        for index in 0..self.files.len() {
+        for index in 0..self.file_count() {
             self.set_selected(index, selected);
         }
     }
 
     pub fn set_selected(&mut self, index: usize, selected: bool) -> bool {
+        if let Some(DeferredFiles::Compact(files)) = &mut self.deferred {
+            let Some(&size) = files.sizes.get(index) else {
+                return false;
+            };
+            let previous = bit(&files.selected, index);
+            if previous == selected {
+                return false;
+            }
+            self.selected_downloaded_summary = None;
+            let downloaded = files.downloaded[index].min(size);
+            if selected {
+                self.selected_count += 1;
+                self.selected_size = self.selected_size.saturating_add(size);
+                self.selected_downloaded = self.selected_downloaded.saturating_add(downloaded);
+            } else {
+                self.selected_count = self.selected_count.saturating_sub(1);
+                self.selected_size = self.selected_size.saturating_sub(size);
+                self.selected_downloaded = self.selected_downloaded.saturating_sub(downloaded);
+            }
+            set_bit(&mut files.selected, index, selected);
+            return true;
+        }
         let Some(file) = self.files.get_mut(index) else {
             return false;
         };
@@ -208,11 +520,29 @@ impl FileSelectionModel {
     }
 
     pub fn refresh_selection_totals(&mut self) {
+        if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
+            return;
+        }
         self.selected_downloaded_summary = None;
         self.selected_count = 0;
         self.selected_size = 0;
         self.selected_downloaded = 0;
+        self.total_size = 0;
+        if let Some(DeferredFiles::Compact(files)) = &self.deferred {
+            for (index, size) in files.sizes.iter().copied().enumerate() {
+                self.total_size = self.total_size.saturating_add(size);
+                if bit(&files.selected, index) {
+                    self.selected_count += 1;
+                    self.selected_size = self.selected_size.saturating_add(size);
+                    self.selected_downloaded = self
+                        .selected_downloaded
+                        .saturating_add(files.downloaded[index].min(size));
+                }
+            }
+            return;
+        }
         for file in &self.files {
+            self.total_size = self.total_size.saturating_add(file.size_bytes);
             if file.selected {
                 self.selected_count += 1;
                 self.selected_size = self.selected_size.saturating_add(file.size_bytes);
@@ -244,6 +574,22 @@ impl FileSelectionModel {
     }
 
     pub fn set_file_downloaded(&mut self, index: usize, downloaded_bytes: u64) -> bool {
+        if let Some(DeferredFiles::Compact(files)) = &mut self.deferred {
+            let Some(&size) = files.sizes.get(index) else {
+                return false;
+            };
+            self.selected_downloaded_summary = None;
+            let old = files.downloaded[index];
+            let new = downloaded_bytes.min(size);
+            files.downloaded[index] = new;
+            if bit(&files.selected, index) {
+                self.selected_downloaded = self
+                    .selected_downloaded
+                    .saturating_sub(old)
+                    .saturating_add(new);
+            }
+            return old != new;
+        }
         let Some(file) = self.files.get_mut(index) else {
             return false;
         };
@@ -262,16 +608,18 @@ impl FileSelectionModel {
 
     pub fn apply_downloaded_bytes(&mut self, mut bytes: u64) -> u64 {
         self.selected_downloaded_summary = None;
-        if bytes == 0 || self.files.is_empty() || self.selected_downloaded >= self.selected_size {
+        if bytes == 0 || self.file_count() == 0 || self.selected_downloaded >= self.selected_size {
             return 0;
         }
         let original = bytes;
         let mut visited = 0;
-        while bytes > 0 && visited < self.files.len() {
-            let index = self.download_cursor % self.files.len();
-            self.download_cursor = (index + 1) % self.files.len();
+        while bytes > 0 && visited < self.file_count() {
+            let index = self.download_cursor % self.file_count();
+            self.download_cursor = (index + 1) % self.file_count();
             visited += 1;
-            let file = &self.files[index];
+            let Some(file) = self.file_state(index) else {
+                break;
+            };
             if !file.selected || file.downloaded_bytes >= file.size_bytes {
                 continue;
             }
@@ -288,7 +636,14 @@ impl FileSelectionModel {
     }
 
     pub fn set_total_downloaded(&mut self, total_downloaded: u64) {
+        if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
+            self.set_selected_downloaded_summary(total_downloaded);
+            return;
+        }
         self.selected_downloaded_summary = None;
+        if let Some(DeferredFiles::Compact(files)) = &mut self.deferred {
+            files.downloaded.fill(0);
+        }
         for file in &mut self.files {
             file.downloaded_bytes = 0;
         }
