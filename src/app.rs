@@ -2155,7 +2155,31 @@ impl PeerLumeApp {
                     .max_height(ui.available_height().max(0.0))
                     .show_rows(ui, 22.0, rows.len(), |ui, rows_range| {
                         let files = torrent.files.files();
-                        for row in &rows[rows_range] {
+                        let visible_rows = &rows[rows_range];
+                        let measure_size = |text: String| {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    text,
+                                    egui::TextStyle::Body.resolve(ui.style()),
+                                    ui.visuals().text_color(),
+                                )
+                                .size()
+                                .x
+                        };
+                        // All rows share one size column, so shorter labels cannot
+                        // shift their progress bars. Measure only visible files;
+                        // the baseline keeps ordinary size labels stable on scroll.
+                        let size_width = visible_rows
+                            .iter()
+                            .filter_map(|row| match row {
+                                FileTreeRow::File { index, .. } => {
+                                    Some(measure_size(format_size(files[*index].size_bytes)))
+                                }
+                                FileTreeRow::Group { .. } => None,
+                            })
+                            .fold(measure_size("1024.0 MiB".into()), f32::max)
+                            .ceil();
+                        for row in visible_rows {
                             match row {
                                 FileTreeRow::Group { name, file_count } => {
                                     ui.strong(format!("{name}/ ({file_count} files)"));
@@ -2176,16 +2200,7 @@ impl PeerLumeApp {
                                             changes.insert(*index, selected);
                                         }
                                         let size = format_size(file.size_bytes);
-                                        let size_width = ui
-                                            .painter()
-                                            .layout_no_wrap(
-                                                size.clone(),
-                                                egui::TextStyle::Body.resolve(ui.style()),
-                                                ui.visuals().text_color(),
-                                            )
-                                            .size()
-                                            .x;
-                                        let name_width = (ui.available_width()
+                                        let name_width = (name_column::viewport_width(ui)
                                             - 80.0
                                             - size_width
                                             - 2.0 * ui.spacing().item_spacing.x)
@@ -2248,7 +2263,21 @@ impl PeerLumeApp {
                                                 .desired_width(80.0)
                                                 .show_percentage(),
                                         );
-                                        ui.label(size);
+                                        let (size_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(size_width, 20.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let mut size_ui = ui.new_child(
+                                            egui::UiBuilder::new().max_rect(size_rect).layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                            ),
+                                        );
+                                        size_ui.set_clip_rect(ui.clip_rect().intersect(size_rect));
+                                        size_ui.add(
+                                            egui::Label::new(size)
+                                                .halign(egui::Align::Min)
+                                                .truncate(),
+                                        );
                                     });
                                 }
                             }
