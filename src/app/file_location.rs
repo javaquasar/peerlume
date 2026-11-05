@@ -40,6 +40,10 @@ pub(super) struct Navigator {
 }
 
 impl Navigator {
+    pub(super) fn is_busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(super) fn reveal(
         &mut self,
         torrent: &TorrentItem,

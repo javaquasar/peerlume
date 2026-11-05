@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredFile {
@@ -59,6 +60,11 @@ pub struct TorrentRecord {
 pub struct StateStore {
     connection: Connection,
     secrets: std::sync::Arc<dyn crate::secrets::TrackerSecrets>,
+    // Only successful commits advance this cache. No file trees or credentials
+    // are duplicated here, and removal invalidates the corresponding entry.
+    resume_checkpoints:
+        std::cell::RefCell<std::collections::HashMap<String, (crate::resume::ResumeCounters, u64)>>,
+    tracker_fingerprints: std::cell::RefCell<std::collections::HashMap<String, Vec<[u8; 32]>>>,
 }
 
 impl StateStore {
@@ -336,6 +342,8 @@ impl StateStore {
         let mut store = Self {
             connection,
             secrets,
+            resume_checkpoints: Default::default(),
+            tracker_fingerprints: Default::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -519,6 +527,23 @@ impl StateStore {
             .repair_policy
             .validate()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        // Scalar acknowledgements need no access to unchanged OS secrets.
+        let existing = self.load_torrent_impl(&torrent.id, false)?;
+        let old = existing.as_ref();
+        let desired_trackers = tracker_fingerprints(&torrent.trackers);
+        let known_trackers = self.tracker_fingerprints.borrow().get(&torrent.id).cloned();
+        let trackers_changed = old.is_none()
+            || match known_trackers {
+                Some(known) => known != desired_trackers,
+                None => self
+                    .load_trackers(&torrent.id)
+                    .map_or(true, |known| known != torrent.trackers),
+            };
+        let indices: std::collections::HashSet<_> =
+            torrent.files.iter().map(|file| file.index).collect();
+        if indices.len() != torrent.files.len() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO torrents (
@@ -558,54 +583,67 @@ impl StateStore {
                 torrent.upload_ratio.max_milli,
             ],
         )?;
-        transaction.execute(
-            "DELETE FROM torrent_transfer_settings WHERE torrent_id=?1",
-            [&torrent.id],
-        )?;
-        if let Some(settings) = torrent.transfer_settings {
-            let json =
-                serde_json::to_string(&settings).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if old.and_then(|record| record.transfer_settings) != torrent.transfer_settings {
             transaction.execute(
-                "INSERT INTO torrent_transfer_settings(torrent_id, settings) VALUES (?1, ?2)",
-                params![torrent.id, json],
+                "DELETE FROM torrent_transfer_settings WHERE torrent_id=?1",
+                [&torrent.id],
             )?;
+            if let Some(settings) = torrent.transfer_settings {
+                let json =
+                    serde_json::to_string(&settings).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                transaction.execute(
+                    "INSERT INTO torrent_transfer_settings(torrent_id, settings) VALUES (?1, ?2)",
+                    params![torrent.id, json],
+                )?;
+            }
         }
-        transaction.execute("DELETE FROM trackers WHERE torrent_id=?1", [&torrent.id])?;
-        transaction.execute("DELETE FROM files WHERE torrent_id=?1", [&torrent.id])?;
-        transaction.execute(
-            "DELETE FROM verified_pieces WHERE torrent_id=?1",
-            [&torrent.id],
-        )?;
-        transaction.execute(
-            "DELETE FROM tracker_audit_steps WHERE torrent_id=?1",
-            [&torrent.id],
-        )?;
-        transaction.execute(
-            "DELETE FROM tracker_audit_profiles WHERE torrent_id=?1",
-            [&torrent.id],
-        )?;
-        for (position, tracker) in torrent.trackers.iter().enumerate() {
-            let persisted_url = crate::identity::redact_tracker_url(tracker);
-            let protected_url =
-                if persisted_url == *tracker {
+        if trackers_changed {
+            transaction.execute("DELETE FROM trackers WHERE torrent_id=?1", [&torrent.id])?;
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO trackers(torrent_id, position, url, secret_ref) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (position, tracker) in torrent.trackers.iter().enumerate() {
+                let persisted_url = crate::identity::redact_tracker_url(tracker);
+                let protected_url = if persisted_url == *tracker {
                     None
                 } else {
                     Some(self.secrets.protect(tracker).map_err(|error| {
                         rusqlite::Error::ToSqlConversionFailure(Box::new(error))
                     })?)
                 };
-            transaction.execute(
-                "INSERT INTO trackers(torrent_id, position, url, secret_ref)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![torrent.id, position as i64, persisted_url, protected_url],
-            )?;
+                insert.execute(params![
+                    torrent.id,
+                    position as i64,
+                    persisted_url,
+                    protected_url
+                ])?;
+            }
         }
-        for file in &torrent.files {
-            transaction.execute(
+        {
+            let old_files: std::collections::HashMap<_, _> = old
+                .into_iter()
+                .flat_map(|record| &record.files)
+                .map(|file| (file.index, file))
+                .collect();
+            let mut remove = transaction
+                .prepare_cached("DELETE FROM files WHERE torrent_id=?1 AND file_index=?2")?;
+            for index in old_files.keys().filter(|index| !indices.contains(index)) {
+                remove.execute(params![torrent.id, index])?;
+            }
+            let mut upsert = transaction.prepare_cached(
                 "INSERT INTO files(
                     torrent_id, file_index, path, size_bytes, downloaded_bytes, selected, priority
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(torrent_id, file_index) DO UPDATE SET
+                 path=excluded.path, size_bytes=excluded.size_bytes,
+                 downloaded_bytes=excluded.downloaded_bytes,
+                 selected=excluded.selected, priority=excluded.priority",
+            )?;
+            for file in &torrent.files {
+                if old_files.get(&file.index).is_some_and(|old| *old == file) {
+                    continue;
+                }
+                upsert.execute(params![
                     torrent.id,
                     file.index,
                     file.path,
@@ -613,20 +651,43 @@ impl StateStore {
                     to_sql_u64(file.downloaded_bytes)?,
                     file.selected,
                     file.priority,
-                ],
-            )?;
+                ])?;
+            }
         }
-        for piece in &torrent.verified_pieces {
+        if old.is_none_or(|record| record.verified_pieces != torrent.verified_pieces) {
             transaction.execute(
-                "INSERT INTO verified_pieces(torrent_id, piece_index) VALUES (?1, ?2)",
-                params![torrent.id, piece],
+                "DELETE FROM verified_pieces WHERE torrent_id=?1",
+                [&torrent.id],
             )?;
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO verified_pieces(torrent_id, piece_index) VALUES (?1, ?2)",
+            )?;
+            for piece in &torrent.verified_pieces {
+                insert.execute(params![torrent.id, piece])?;
+            }
         }
-        if let Some(audit) = &torrent.tracker_audit {
-            insert_tracker_audit(&transaction, &torrent.id, audit)?;
+        if old.and_then(|record| record.tracker_audit.as_ref()) != torrent.tracker_audit.as_ref() {
+            transaction.execute(
+                "DELETE FROM tracker_audit_steps WHERE torrent_id=?1",
+                [&torrent.id],
+            )?;
+            transaction.execute(
+                "DELETE FROM tracker_audit_profiles WHERE torrent_id=?1",
+                [&torrent.id],
+            )?;
+            if let Some(audit) = &torrent.tracker_audit {
+                insert_tracker_audit(&transaction, &torrent.id, audit)?;
+            }
         }
-        transaction.execute("INSERT INTO torrent_resume(torrent_id,snapshot) VALUES(?1,?2) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot", params![torrent.id, serde_json::to_string(&torrent.resume).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
-        transaction.commit()
+        transaction.execute("INSERT INTO torrent_resume(torrent_id,snapshot) VALUES(?1,?2) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot WHERE torrent_resume.snapshot IS NOT excluded.snapshot", params![torrent.id, serde_json::to_string(&torrent.resume).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
+        transaction.commit()?;
+        self.resume_checkpoints
+            .borrow_mut()
+            .insert(torrent.id.clone(), (torrent.resume, torrent.uploaded_bytes));
+        self.tracker_fingerprints
+            .borrow_mut()
+            .insert(torrent.id.clone(), desired_trackers);
+        Ok(())
     }
 
     /// Small periodic transaction: never rewrites tracker secrets or the file tree.
@@ -634,15 +695,43 @@ impl StateStore {
         &mut self,
         rows: impl IntoIterator<Item = (String, crate::resume::ResumeCounters, u64)>,
     ) -> rusqlite::Result<()> {
-        let tx = self.connection.transaction()?;
-        for (id, resume, uploaded) in rows {
-            tx.execute("INSERT INTO torrent_resume(torrent_id,snapshot) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM torrents WHERE id=?1) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot", params![id, serde_json::to_string(&resume).map_err(|_| rusqlite::Error::InvalidQuery)?])?;
-            tx.execute(
-                "UPDATE torrents SET uploaded_bytes=?2 WHERE id=?1",
-                params![id, to_sql_u64(uploaded)?],
-            )?;
+        let latest: std::collections::BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|(id, resume, uploaded)| (id, (resume, uploaded)))
+            .collect();
+        let pending: Vec<_> = latest
+            .into_iter()
+            .filter(|(id, values)| self.resume_checkpoints.borrow().get(id) != Some(values))
+            .map(|(id, (resume, uploaded))| (id, resume, uploaded))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
         }
-        tx.commit()
+        let tx = self.connection.transaction()?;
+        let mut saved = Vec::with_capacity(pending.len());
+        {
+            let mut resume_write = tx.prepare_cached("INSERT INTO torrent_resume(torrent_id,snapshot) SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM torrents WHERE id=?1) ON CONFLICT(torrent_id) DO UPDATE SET snapshot=excluded.snapshot WHERE torrent_resume.snapshot IS NOT excluded.snapshot")?;
+            let mut upload_write = tx.prepare_cached(
+                "UPDATE torrents SET uploaded_bytes=?2 WHERE id=?1 AND uploaded_bytes IS NOT ?2",
+            )?;
+            let mut exists =
+                tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM torrents WHERE id=?1)")?;
+            for (id, resume, uploaded) in pending {
+                let count = resume_write.execute(params![
+                    id,
+                    serde_json::to_string(&resume).map_err(|_| rusqlite::Error::InvalidQuery)?
+                ])? + upload_write.execute(params![id, to_sql_u64(uploaded)?])?;
+                if count > 0 || exists.query_row([&id], |row| row.get::<_, bool>(0))? {
+                    saved.push((id, resume, uploaded));
+                }
+            }
+        }
+        tx.commit()?;
+        let mut cache = self.resume_checkpoints.borrow_mut();
+        for (id, resume, uploaded) in saved {
+            cache.insert(id, (resume, uploaded));
+        }
+        Ok(())
     }
 
     pub fn save_tracker_audit(
@@ -700,10 +789,19 @@ impl StateStore {
             )?;
         }
         transaction.commit()?;
+        self.resume_checkpoints.borrow_mut().remove(id);
         Ok(true)
     }
 
     pub fn load_torrent(&self, id: &str) -> rusqlite::Result<Option<TorrentRecord>> {
+        self.load_torrent_impl(id, true)
+    }
+
+    fn load_torrent_impl(
+        &self,
+        id: &str,
+        include_trackers: bool,
+    ) -> rusqlite::Result<Option<TorrentRecord>> {
         let mut torrent = self
             .connection
             .query_row(
@@ -740,7 +838,7 @@ impl StateStore {
                 },
             )
             .optional()?;
-        let Some(torrent) = torrent.as_mut() else {
+        let Some(mut torrent) = torrent.take() else {
             return Ok(None);
         };
         let resume: Option<String> = self
@@ -784,34 +882,12 @@ impl StateStore {
             .repair_policy
             .validate()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let mut tracker_statement = self.connection.prepare(
-            "SELECT url, secret_ref FROM trackers WHERE torrent_id=?1 ORDER BY position",
-        )?;
-        let stored_trackers: Vec<(String, Option<Vec<u8>>)> = tracker_statement
-            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        torrent.trackers = stored_trackers
-            .into_iter()
-            .map(|(redacted_url, protected_url)| {
-                if let Some(reference) = protected_url {
-                    self.secrets.restore(&reference).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Blob,
-                            Box::new(error),
-                        )
-                    })
-                } else if redacted_url.contains("REDACTED") {
-                    Err(rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Null,
-                        Box::new(crate::secrets::SecretUnavailable),
-                    ))
-                } else {
-                    Ok(redacted_url)
-                }
-            })
-            .collect::<rusqlite::Result<_>>()?;
+        if include_trackers {
+            torrent.trackers = self.load_trackers(id)?;
+            self.tracker_fingerprints
+                .borrow_mut()
+                .insert(id.to_owned(), tracker_fingerprints(&torrent.trackers));
+        }
         let mut file_statement = self.connection.prepare(
             "SELECT file_index, path, size_bytes, downloaded_bytes, selected, priority
              FROM files WHERE torrent_id=?1 ORDER BY file_index",
@@ -835,7 +911,34 @@ impl StateStore {
             .query_map([id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         torrent.tracker_audit = self.load_tracker_audit(id)?;
-        Ok(Some(torrent.clone()))
+        Ok(Some(torrent))
+    }
+
+    fn load_trackers(&self, id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT url, secret_ref FROM trackers WHERE torrent_id=?1 ORDER BY position",
+        )?;
+        let stored: Vec<(String, Option<Vec<u8>>)> = statement
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        stored
+            .into_iter()
+            .map(|(url, reference)| match reference {
+                Some(reference) => self.secrets.restore(&reference).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                }),
+                None if url.contains("REDACTED") => Err(rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Null,
+                    Box::new(crate::secrets::SecretUnavailable),
+                )),
+                None => Ok(url),
+            })
+            .collect()
     }
 
     fn load_tracker_audit(
@@ -889,10 +992,13 @@ impl StateStore {
     }
 
     pub fn remove_torrent(&self, id: &str) -> rusqlite::Result<bool> {
-        Ok(self
+        let removed = self
             .connection
             .execute("DELETE FROM torrents WHERE id=?1", [id])?
-            > 0)
+            > 0;
+        self.resume_checkpoints.borrow_mut().remove(id);
+        self.tracker_fingerprints.borrow_mut().remove(id);
+        Ok(removed)
     }
 
     pub fn load_all_torrents(&self) -> rusqlite::Result<Vec<TorrentRecord>> {
@@ -920,6 +1026,13 @@ impl StateStore {
                 from_sql_u64(count)
             })
     }
+}
+
+fn tracker_fingerprints(trackers: &[String]) -> Vec<[u8; 32]> {
+    trackers
+        .iter()
+        .map(|tracker| Sha256::digest(tracker.as_bytes()).into())
+        .collect()
 }
 
 fn insert_tracker_audit(
@@ -1063,6 +1176,207 @@ fn from_sql_u64(value: i64) -> rusqlite::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_saves_do_not_reopen_secrets_and_changed_urls_can_repair_lost_references() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        #[derive(Default)]
+        struct Provider {
+            inner: crate::secrets::MemorySecrets,
+            deny_restore: AtomicBool,
+            deny_protect: AtomicBool,
+        }
+        impl crate::secrets::TrackerSecrets for Provider {
+            fn protect(&self, value: &str) -> Result<Vec<u8>, crate::secrets::SecretUnavailable> {
+                if self.deny_protect.load(Ordering::Relaxed) {
+                    return Err(crate::secrets::SecretUnavailable);
+                }
+                self.inner.protect(value)
+            }
+            fn restore(
+                &self,
+                reference: &[u8],
+            ) -> Result<String, crate::secrets::SecretUnavailable> {
+                if self.deny_restore.load(Ordering::Relaxed) {
+                    return Err(crate::secrets::SecretUnavailable);
+                }
+                self.inner.restore(reference)
+            }
+        }
+        let provider = Arc::new(Provider::default());
+        let mut store = StateStore::in_memory_with_secrets(provider.clone()).unwrap();
+        let mut item = record();
+        item.trackers = vec!["https://tracker.test/announce?passkey=SYNTHETIC_OLD".into()];
+        store.save_torrent(&item).unwrap();
+        provider.deny_restore.store(true, Ordering::Relaxed);
+        provider.deny_protect.store(true, Ordering::Relaxed);
+        item.state = "downloading".into();
+        store.save_torrent(&item).unwrap();
+        assert!(
+            store.load_torrent(&item.id).is_err(),
+            "ordinary restore still fails closed"
+        );
+        store.tracker_fingerprints.borrow_mut().clear();
+        provider.deny_protect.store(false, Ordering::Relaxed);
+        item.trackers = vec!["https://tracker.test/announce?passkey=SYNTHETIC_NEW".into()];
+        store.save_torrent(&item).unwrap();
+        provider.deny_restore.store(false, Ordering::Relaxed);
+        assert_eq!(store.load_torrent(&item.id).unwrap().unwrap(), item);
+        store.remove_torrent(&item.id).unwrap();
+        assert!(store.tracker_fingerprints.borrow().is_empty());
+    }
+
+    #[test]
+    fn unchanged_resume_checkpoints_do_not_write_and_removal_invalidates_cache() {
+        let mut store = StateStore::in_memory().unwrap();
+        let item = record();
+        store.save_torrent(&item).unwrap();
+        let changes = store.connection.total_changes();
+        for _ in 0..10 {
+            store
+                .checkpoint_resumes([(item.id.clone(), item.resume, item.uploaded_bytes)])
+                .unwrap();
+        }
+        assert_eq!(store.connection.total_changes(), changes);
+        store.remove_torrent(&item.id).unwrap();
+        assert!(store.resume_checkpoints.borrow().is_empty());
+        store
+            .checkpoint_resumes([(item.id.clone(), item.resume, 999)])
+            .unwrap();
+        assert!(
+            store.resume_checkpoints.borrow().is_empty(),
+            "missing rows must not occupy the cache"
+        );
+        store.save_torrent(&item).unwrap();
+        let mut resume = item.resume;
+        resume.downloaded = 123;
+        store
+            .checkpoint_resumes([(item.id.clone(), resume, 999)])
+            .unwrap();
+        assert_eq!(
+            store.load_torrent(&item.id).unwrap().unwrap().resume,
+            resume
+        );
+    }
+
+    #[test]
+    fn failed_dirty_checkpoint_rolls_back_all_rows_and_can_be_retried() {
+        let mut store = StateStore::in_memory().unwrap();
+        let first = record();
+        let mut second = first.clone();
+        second.id = "v1:xyz".into();
+        store.save_torrent(&first).unwrap();
+        store.save_torrent(&second).unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_second BEFORE UPDATE ON torrent_resume WHEN OLD.torrent_id='v1:xyz' BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint failure'); END;").unwrap();
+        let changed = crate::resume::ResumeCounters {
+            downloaded: 50,
+            uploaded: 25,
+            seeded_seconds: 10,
+        };
+        let updates = || {
+            [
+                (first.id.clone(), changed, 25),
+                (second.id.clone(), changed, 25),
+            ]
+        };
+        assert!(store.checkpoint_resumes(updates()).is_err());
+        assert_eq!(
+            store.load_torrent(&first.id).unwrap().unwrap().resume,
+            first.resume
+        );
+        assert_eq!(
+            store.resume_checkpoints.borrow()[&first.id],
+            (first.resume, first.uploaded_bytes)
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_second;")
+            .unwrap();
+        store.checkpoint_resumes(updates()).unwrap();
+        assert_eq!(
+            store.load_torrent(&first.id).unwrap().unwrap().resume,
+            changed
+        );
+        assert_eq!(
+            store.load_torrent(&second.id).unwrap().unwrap().resume,
+            changed
+        );
+        let changes = store.connection.total_changes();
+        store.checkpoint_resumes(updates()).unwrap();
+        assert_eq!(store.connection.total_changes(), changes);
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value::<i64, _>(None, "synchronous", |row| row.get(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn checkpoint_last_value_wins_and_other_checkpoint_paths_invalidate_cache() {
+        let mut store = StateStore::in_memory().unwrap();
+        let item = record();
+        store.save_torrent(&item).unwrap();
+        let changed = crate::resume::ResumeCounters {
+            downloaded: 1,
+            ..item.resume
+        };
+        store
+            .checkpoint_resumes([
+                (item.id.clone(), changed, 99),
+                (item.id.clone(), item.resume, item.uploaded_bytes),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.load_torrent(&item.id).unwrap().unwrap().resume,
+            item.resume
+        );
+        store
+            .checkpoint_torrent(&item.id, "paused", 50, 99, &item.verified_pieces)
+            .unwrap();
+        store
+            .checkpoint_resumes([(item.id.clone(), item.resume, item.uploaded_bytes)])
+            .unwrap();
+        assert_eq!(
+            store
+                .load_torrent(&item.id)
+                .unwrap()
+                .unwrap()
+                .uploaded_bytes,
+            item.uploaded_bytes
+        );
+    }
+
+    #[test]
+    fn scalar_save_preserves_child_rows_and_file_edits_update_only_changed_rows() {
+        let mut store = StateStore::in_memory().unwrap();
+        let mut item = record();
+        let mut second = item.files[0].clone();
+        second.index = 1;
+        second.path = "second.bin".into();
+        item.files.push(second);
+        store.save_torrent(&item).unwrap();
+        store.connection.execute_batch("CREATE TRIGGER no_file_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT, 'unchanged files must be retained'); END;
+            CREATE TRIGGER no_file_zero_update BEFORE UPDATE ON files WHEN OLD.file_index=0 BEGIN SELECT RAISE(ABORT, 'unchanged file must not be updated'); END;
+            CREATE TRIGGER no_tracker_delete BEFORE DELETE ON trackers BEGIN SELECT RAISE(ABORT, 'unchanged trackers must be retained'); END;
+            CREATE TRIGGER no_piece_delete BEFORE DELETE ON verified_pieces BEGIN SELECT RAISE(ABORT, 'unchanged pieces must be retained'); END;
+            CREATE TRIGGER no_audit_delete BEFORE DELETE ON tracker_audit_profiles BEGIN SELECT RAISE(ABORT, 'unchanged audit profile must be retained'); END;").unwrap();
+        item.state = "downloading".into();
+        item.verify_after_download = !item.verify_after_download;
+        store.save_torrent(&item).unwrap();
+        item.files[1].selected = false;
+        item.files[1].downloaded_bytes = 75;
+        store.save_torrent(&item).unwrap();
+        assert_eq!(store.load_torrent(&item.id).unwrap().unwrap(), item);
+        let before = item.clone();
+        item.files.push(item.files[0].clone());
+        assert!(store.save_torrent(&item).is_err());
+        assert_eq!(store.load_torrent(&item.id).unwrap().unwrap(), before);
+    }
     #[test]
     fn migration_backup_includes_live_wal_and_is_unique_and_readable() {
         let root = tempfile::tempdir().unwrap();

@@ -111,6 +111,21 @@ These local peer addresses are not added to the redacted public observation API.
 bounded sampled rates, counters and observed activity without names, paths, URLs,
 peer addresses or free-form errors. Existing reports are never overwritten.
 
+## Removing a torrent and its data
+
+In egui, **Remove torrent and move downloaded files to Recycle Bin** removes the
+downloaded files and the torrent's list entry in one confirmed operation. The
+source `.torrent` is retained. The source-only and combined Recycle Bin actions
+also remove the list entry after success; source-only keeps downloaded payload.
+
+The engine first acknowledges detaching the torrent, and the stopped intent is
+saved before files are moved. The list entry is removed only after both recycling
+and database deletion succeed. On an error, the entry and its metadata remain,
+with a visible error and no automatic re-add or counter reset. Recycling may have
+moved some files before reporting a failure; the retained entry is not proof that
+every file is still at its original path. Already missing payload can still be
+removed from the list through the same confirmation.
+
 ## Showing a file in its folder
 
 In egui, right-click a file in **Files** and choose **Show in folder**, or

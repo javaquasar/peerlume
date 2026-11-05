@@ -305,12 +305,19 @@ impl ManagedTorrent {
     pub fn verified_pieces(&self) -> anyhow::Result<Vec<u8>> {
         self.with_chunk_tracker(|chunks| chunks.get_have_pieces().as_bytes().to_vec())
     }
-    pub fn high_priority_files(&self) -> Vec<usize> { self.shared.high_priority_files.read().clone() }
+    pub fn high_priority_files(&self) -> Vec<usize> {
+        self.shared.high_priority_files.read().clone()
+    }
     pub fn set_high_priority_files(&self, files: &[usize]) -> anyhow::Result<()> {
-        let count = self.with_metadata(|metadata|metadata.file_infos.len())?;
-        anyhow::ensure!(files.len() <= count && files.iter().all(|index| *index<count), "Invalid file priority indices");
+        let count = self.with_metadata(|metadata| metadata.file_infos.len())?;
+        anyhow::ensure!(
+            files.len() <= count && files.iter().all(|index| *index < count),
+            "Invalid file priority indices"
+        );
         *self.shared.high_priority_files.write() = files.to_vec();
-        if let Some(live) = self.live() { live.update_file_priorities(files); }
+        if let Some(live) = self.live() {
+            live.update_file_priorities(files);
+        }
         Ok(())
     }
 
@@ -562,6 +569,11 @@ impl ManagedTorrent {
 
     /// Get stats.
     pub fn stats(&self) -> TorrentStats {
+        self.stats_with_file_progress(true)
+    }
+
+    /// Summary polling does not allocate a vector proportional to the file tree.
+    pub fn stats_with_file_progress(&self, include_files: bool) -> TorrentStats {
         use stats::TorrentStatsState as S;
         let mut resp = TorrentStats {
             total_bytes: self
@@ -592,7 +604,9 @@ impl ManagedTorrent {
                     resp.total_bytes = hns.total();
                     resp.progress_bytes = hns.progress();
                     resp.finished = hns.finished();
-                    resp.file_progress = p.chunk_tracker.per_file_have_bytes().to_owned();
+                    if include_files {
+                        resp.file_progress = p.chunk_tracker.per_file_have_bytes().to_owned();
+                    }
                 }
                 ManagedTorrentState::Live(l) => {
                     resp.state = S::Live;
@@ -602,12 +616,14 @@ impl ManagedTorrent {
                     resp.progress_bytes = hns.progress();
                     resp.finished = hns.finished();
                     resp.uploaded_bytes = l.get_uploaded_bytes();
-                    resp.file_progress = l
-                        .lock_read("file_progress")
-                        .get_chunks()
-                        .ok()
-                        .map(|c| c.per_file_have_bytes().to_owned())
-                        .unwrap_or_default();
+                    if include_files {
+                        resp.file_progress = l
+                            .lock_read("file_progress")
+                            .get_chunks()
+                            .ok()
+                            .map(|c| c.per_file_have_bytes().to_owned())
+                            .unwrap_or_default();
+                    }
                     resp.live = Some(live_stats);
                 }
                 ManagedTorrentState::Error(e) => {
@@ -622,6 +638,31 @@ impl ManagedTorrent {
         }
 
         resp
+    }
+
+    /// O(1) exact frontend progress; piece-rounded selection is not a file total.
+    pub fn selected_file_progress(&self) -> Option<u64> {
+        match &self.locked.read().state {
+            ManagedTorrentState::Paused(paused) => {
+                Some(paused.chunk_tracker.selected_file_have_bytes())
+            }
+            ManagedTorrentState::Live(live) => live
+                .lock_read("selected_file_progress")
+                .get_chunks()
+                .ok()
+                .map(|chunks| chunks.selected_file_have_bytes()),
+            ManagedTorrentState::Initializing(_) => Some(0),
+            _ => None,
+        }
+    }
+
+    pub fn verified_bytes(&self) -> Option<u64> {
+        match &self.locked.read().state {
+            ManagedTorrentState::Paused(paused) => Some(paused.hns().have_bytes),
+            ManagedTorrentState::Live(live) => live.get_hns().map(|hns| hns.have_bytes),
+            ManagedTorrentState::Initializing(_) => Some(0),
+            _ => None,
+        }
     }
 
     #[inline(never)]

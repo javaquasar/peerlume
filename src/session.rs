@@ -16,6 +16,8 @@ use librqbit::storage::StorageFactoryExt;
 use verification::{CheckRun, restart_for_check};
 mod controls;
 mod events;
+mod interest;
+pub use interest::DetailInterest;
 
 /// One validated metainfo snapshot and the authorized output directory identity.
 #[derive(Clone, PartialEq, Eq)]
@@ -145,6 +147,11 @@ pub enum SessionCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
+    /// Ordered actual file counts used as a barrier before a selection acknowledgement.
+    FileSnapshot {
+        id: String,
+        progress: Vec<u64>,
+    },
     FilePrioritiesApplied {
         id: String,
         high: Vec<usize>,
@@ -267,6 +274,9 @@ pub struct SessionRuntime {
     commands: tokio_mpsc::Sender<SessionCommand>,
     events: events::Receiver,
     thread: Option<thread::JoinHandle<()>>,
+    detail_interest: interest::Shared,
+    #[cfg(test)]
+    test_bulk_budget: Arc<crate::storage::relocation::BulkBudget>,
     #[cfg(test)]
     test_engine: Arc<std::sync::Mutex<std::sync::Weak<Session>>>,
 }
@@ -285,6 +295,10 @@ impl SessionRuntime {
             options,
             AnnounceJournal::open(&crate::settings::data_directory().join("announce-logs")),
             Some(cache),
+            (
+                settings.storage.max_active_bulk_jobs,
+                settings.storage.bulk_io_limit_kib,
+            ),
         )
     }
     pub fn start(
@@ -323,7 +337,14 @@ impl SessionRuntime {
         options: SessionOptions,
         journal: AnnounceJournal,
     ) -> Result<Self, String> {
-        Self::start_with_cache(capacity, default_output_folder, options, journal, None)
+        Self::start_with_cache(
+            capacity,
+            default_output_folder,
+            options,
+            journal,
+            None,
+            (1, 32768),
+        )
     }
 
     fn start_with_cache(
@@ -332,6 +353,7 @@ impl SessionRuntime {
         mut options: SessionOptions,
         journal: AnnounceJournal,
         mut resume_cache: Option<crate::resume::Cache>,
+        bulk_config: (usize, u64),
     ) -> Result<Self, String> {
         if capacity == 0 {
             return Err("channel capacity must be greater than zero".into());
@@ -339,6 +361,11 @@ impl SessionRuntime {
         let (commands, mut command_rx) = tokio_mpsc::channel(capacity);
         let (event_tx, events) = events::channel(capacity);
         let (ready, initialized) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let detail_interest = interest::Shared::default();
+        let interests = detail_interest.clone();
+        let bulk_budget = crate::storage::relocation::BulkBudget::new(bulk_config.0, bulk_config.1);
+        #[cfg(test)]
+        let test_bulk_budget = bulk_budget.clone();
         let thread_journal = journal.clone();
         #[cfg(test)]
         let test_engine = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
@@ -386,10 +413,7 @@ impl SessionRuntime {
                     let counters = Arc::new(std::sync::Mutex::new(HashMap::<[u8;20], TransferCounter>::new()));
                     let observed_counters = counters.clone();
                     let transfers: librqbit_tracker_comms::TransferMetricsProvider = Arc::new(move |hash| {
-                        let handle = weak_session.upgrade().and_then(|s| s.with_torrents(|ts| {
-                            for (_, t) in ts { if t.info_hash().0 == hash { return Some(t.clone()); } }
-                            None
-                        }));
+                        let handle = weak_session.upgrade().and_then(|s| s.get(librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::new(hash))));
                         let mut counters = observed_counters.lock().unwrap_or_else(|e| e.into_inner());
                         let counter = counters.entry(hash).or_default();
                         let mut snapshot = librqbit_tracker_comms::TransferSnapshot::default();
@@ -401,8 +425,7 @@ impl SessionRuntime {
                             let live: Arc<dyn Send + Sync> = live;
                             counter.sample(Arc::downgrade(&live), stats.fetched_bytes, stats.uploaded_bytes);
                             } else {
-                                let state = handle.stats();
-                                snapshot.verified_bytes = Some(if matches!(state.state, TorrentStatsState::Initializing { .. }) { 0 } else { state.file_progress.iter().sum() });
+                                snapshot.verified_bytes = handle.verified_bytes();
                             }
                         }
                         snapshot.downloaded = counter.total.0;
@@ -465,6 +488,7 @@ impl SessionRuntime {
                                 for (id,(root,directory)) in std::mem::take(&mut pending_storage) {
                                     let Some(handle)=torrents.get(&id).cloned() else {continue;};
                                     let Some(mut next)=added_commands.get(&id).cloned() else {continue;};
+                                    root.set_bulk_budget(bulk_budget.clone());
                                     let previous=next.clone();
                                     let previous_root=storage_roots.get(&id).cloned();
                                     let previous_bytes=handle.with_metadata(|metadata|metadata.torrent_bytes.to_vec()).ok();
@@ -494,7 +518,7 @@ impl SessionRuntime {
                                 let torrent_ids: Vec<_> = torrents.keys().cloned().collect();
                                 for id in torrent_ids {
                                     let Some(handle) = torrents.get(&id).cloned() else { continue; };
-                                    if !matches!(handle.stats().state,TorrentStatsState::Initializing{..}) && handle.with_metadata(|_|()).is_ok() && let Some(high)=pending_file_priorities.remove(&id) {
+                                    if pending_file_priorities.contains_key(&id) && !matches!(handle.stats_with_file_progress(false).state,TorrentStatsState::Initializing{..}) && handle.with_metadata(|_|()).is_ok() && let Some(high)=pending_file_priorities.remove(&id) {
                                         match handle.set_high_priority_files(&high) {
                                             Ok(())=>{let _=event_tx.send(SessionEvent::FilePrioritiesApplied{id:id.clone(),high});},
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id:id.clone(),message:"Invalid deferred file priorities".into()});}
@@ -503,7 +527,8 @@ impl SessionRuntime {
                                     if check_failed.contains(&id) && !pending_modes.contains_key(&id) { continue; }
                                     let transfer_snapshot = transfers(handle.info_hash().0);
                                     let _ = event_tx.send(SessionEvent::NetworkTotals { id: id.clone(), uploaded: transfer_snapshot.uploaded, downloaded: transfer_snapshot.downloaded, seeded_seconds: seeding_clocks.get_mut(&id).map(|clock| clock.sample(std::time::Instant::now(), false).as_secs()).unwrap_or(0) });
-                                    let mut stats = handle.stats();
+                                    let detail = interests.for_torrent(&id, std::time::Instant::now());
+                                    let mut stats = handle.stats_with_file_progress(detail.files);
                                     if let Some(message) = stats.error.clone() {
                                         if checks.remove(&id).is_some() {
                                             manual_repairs.remove(&id);
@@ -529,7 +554,7 @@ impl SessionRuntime {
                                                     emit_state_result(&event_tx, id.clone(), result, "downloading");
                                                 }
                                                 if let Some(message) = resume_error { let _ = event_tx.send(SessionEvent::Error { id: id.clone(), message }); }
-                                                stats = handle.stats();
+                                                stats = handle.stats_with_file_progress(detail.files);
                                             }
                                             Err(message) => { let _ = event_tx.send(SessionEvent::Mode { id: id.clone(), application: ModeApplication::Failed { requested: config, active: active_modes.get(&id).copied(), message } }); }
                                         }
@@ -563,7 +588,7 @@ impl SessionRuntime {
                                                 let _ = event_tx.send(SessionEvent::Error { id, message: "Integrity check succeeded, but the torrent could not resume".into() });
                                                 continue;
                                             }
-                                            stats = handle.stats();
+                                            stats = handle.stats_with_file_progress(detail.files);
                                         }
                                         let _ = event_tx.send(SessionEvent::StateChanged { id: id.clone(), state: if run.resume { "downloading" } else { "paused" } });
                                     } else if initializing.remove(&id) {
@@ -612,15 +637,19 @@ impl SessionRuntime {
                                             )
                                         })
                                         .unwrap_or_default();
-                                    let mut peer_details = handle.live().map(|live| live.per_peer_stats_snapshot(Default::default()).peers.into_iter().map(|(address, peer)| crate::diagnostics::PeerSnapshot {
+                                    if detail.peers {
+                                    let mut peer_details = handle.live().map(|live| live.per_peer_stats_snapshot_limited(Default::default(), 128).peers.into_iter().map(|(address, peer)| crate::diagnostics::PeerSnapshot {
                                         address, state: peer.state.into(), client: peer.client_name.unwrap_or_default().chars().filter(|c| !c.is_control()).take(80).collect(),
                                         downloaded: peer.counters.fetched_bytes, uploaded: peer.counters.uploaded_bytes, errors: peer.counters.errors,
                                     }).collect::<Vec<_>>()).unwrap_or_default();
                                     peer_details.sort_by(|a,b| a.address.cmp(&b.address)); peer_details.truncate(128);
                                     let _ = event_tx.send(SessionEvent::Peers { id: id.clone(), peers: peer_details, queue_waiting: !stats.finished && !paused && !handle.download_admitted() });
+                                    } else {
+                                        let _ = event_tx.send(SessionEvent::Peers { id: id.clone(), peers: Vec::new(), queue_waiting: !stats.finished && !paused && !handle.download_admitted() });
+                                    }
                                     let _ = event_tx.send(SessionEvent::Stats {
                                         id: id.clone(),
-                                        downloaded_bytes: stats.progress_bytes,
+                                        downloaded_bytes: handle.selected_file_progress().unwrap_or(stats.progress_bytes),
                                         uploaded_bytes: transfer_snapshot.uploaded,
                                         download_rate,
                                         upload_rate,
@@ -708,7 +737,7 @@ impl SessionRuntime {
                                             let (source,files)=cleanup_sources.get(&id).ok_or("No originals from a copy in this session; nothing removed")?.clone();
                                             let target=storage_roots.get(&id).ok_or("Destination unavailable")?.clone();
                                             let Some(SessionCommand::AddTorrent{output_folder,..})=added_commands.get(&id) else {return Err("Destination unavailable".into())};
-                                            let job=crate::storage::relocation::CopyJob::cleanup(source,target,output_folder.clone(),files).map_err(|_|"Cannot start cleanup worker")?;
+                                            let job=crate::storage::relocation::CopyJob::cleanup(source,target,output_folder.clone(),files,bulk_budget.clone()).map_err(|_|"Cannot queue cleanup worker")?;
                                             copy_jobs.insert(id.clone(),job);
                                             Ok(())
                                         })();
@@ -732,7 +761,7 @@ impl SessionRuntime {
                                             if copy {
                                                 let source=storage_roots.get(&id).ok_or("Pinned source directory unavailable")?.clone();
                                                 let files=handle.with_metadata(|metadata|metadata.file_infos.iter().filter(|file|!file.attrs.padding).map(|file|(file.relative_filename.clone(),file.len)).collect()).map_err(|_|"Torrent metadata unavailable")?;
-                                                let job=crate::storage::relocation::CopyJob::start(source,path,files).map_err(|error|error.to_string())?;
+                                                let job=crate::storage::relocation::CopyJob::start(source,path,files,bulk_budget.clone()).map_err(|error|error.to_string())?;
                                                 copy_jobs.insert(id.clone(),job);
                                             }else{
                                                 cleanup_sources.remove(&id);
@@ -815,6 +844,7 @@ impl SessionRuntime {
                                             Ok(root)=>root,
                                             Err(_)=>{let _=event_tx.send(SessionEvent::Error{id,message:"Could not pin download directory".into()});continue;}
                                         };
+                                        root.set_bulk_budget(bulk_budget.clone());
                                         if let Some(bits) = resume_cache.as_mut().and_then(|cache|cache.take(&id,&output_folder,&root)) { root.supply_resume(bits); }
                                         let registration = match register_download_mode_with_threshold(&id, session_peer_id.0, download_mode, full_size, freeze_after_bytes, upload_ratio) {
                                             Ok(registration) => registration,
@@ -922,12 +952,7 @@ impl SessionRuntime {
                                         let info_hash = torrents.get(&id).map(|handle| handle.info_hash().0)
                                             .or_else(|| id.split(';').find_map(|part| part.strip_prefix("v1: "))
                                                 .and_then(|hash| crate::tracker::parse_info_hash_hex(hash).ok()));
-                                        let handle = info_hash.and_then(|hash| session.with_torrents(|registered| {
-                                            for (_, handle) in registered {
-                                                if handle.info_hash().0 == hash { return Some(handle.clone()); }
-                                            }
-                                            None
-                                        }));
+                                        let handle = info_hash.and_then(|hash| session.get(librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::new(hash))));
                                         let result = if let Some(handle) = handle {
                                             let final_sample = final_transfer_sampler(&handle, &counters);
                                             librqbit_tracker_comms::stop_torrent_announces(handle.info_hash().0, session_peer_id.0).await;
@@ -1016,6 +1041,12 @@ impl SessionRuntime {
                                                 Ok(()) => {
                                                     checked_after_download.remove(&id);
                                                     if let Some(SessionCommand::AddTorrent { only_files: saved, .. }) = added_commands.get_mut(&id) { *saved = Some(only_files.clone()); }
+                                                    let mut progress = handle.stats().file_progress;
+                                                    // Error states have no current verified chunks. Clear stale
+                                                    // per-file observations before acknowledging a new selection.
+                                                    let count = handle.with_metadata(|metadata|metadata.file_infos.len()).unwrap_or(0);
+                                                    progress.resize(count, 0);
+                                                    let _ = event_tx.send(SessionEvent::FileSnapshot { id: id.clone(), progress });
                                                     let _ = event_tx.send(SessionEvent::FilesApplied { id, only_files });
                                                 },
                                                 Err(error) => { let _ = event_tx.send(SessionEvent::Error { id, message: format!("File selection update failed: {error:#}") }); }
@@ -1036,6 +1067,9 @@ impl SessionRuntime {
             commands,
             events,
             thread: Some(thread),
+            detail_interest,
+            #[cfg(test)]
+            test_bulk_budget,
             #[cfg(test)]
             test_engine,
         };
@@ -1074,6 +1108,12 @@ impl SessionRuntime {
 
     pub fn try_recv(&self) -> Option<SessionEvent> {
         self.events.try_recv().ok()
+    }
+
+    /// A frontend lease, separate from acknowledged transfer command traffic.
+    pub fn set_detail_interest(&self, interest: Option<(String, DetailInterest)>) {
+        self.detail_interest
+            .set(interest, std::time::Instant::now());
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<SessionEvent, String> {
@@ -1940,6 +1980,13 @@ mod tests {
                 break;
             }
         }
+        runtime.set_detail_interest(Some((
+            id.clone(),
+            DetailInterest {
+                files: true,
+                peers: false,
+            },
+        )));
         runtime.try_send(SessionCommand::Recheck { id }).unwrap();
         wait_added();
         loop {

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap, VecDeque},
     fs,
     net::IpAddr,
@@ -9,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
@@ -31,6 +32,8 @@ mod status_filter;
 mod torrent_menu_tests;
 mod torrent_panes;
 mod transfer_feedback;
+#[cfg(test)]
+mod trash_tests;
 mod upload_ratio;
 use transfer_feedback::HeaderAction;
 
@@ -44,6 +47,7 @@ use crate::{
     engine::EngineRuntime,
     file_selection::{FileSelectionModel, FileTreeRow},
     metainfo::{self, TorrentMetainfo},
+    metainfo_loader::MetainfoLoader,
     preferences::{self, PreferencesActions, PreferencesTab, PrivacyRuntime},
     session::SessionCommand,
     settings::ClientSettings,
@@ -85,10 +89,6 @@ impl TrashScope {
     }
 
     fn includes_source(self) -> bool {
-        matches!(self, Self::TorrentFile | Self::Everything)
-    }
-
-    fn removes_torrent(self) -> bool {
         matches!(self, Self::TorrentFile | Self::Everything)
     }
 }
@@ -383,6 +383,8 @@ pub struct PeerLumeApp {
     selected_torrent: usize,
     status_filter: crate::torrent_filter::StatusFilter,
     name_column: name_column::NameColumn,
+    view_cache: RefCell<crate::torrent_view::ViewCache>,
+    metainfo_loader: MetainfoLoader,
     settings: ClientSettings,
     saved_settings: ClientSettings,
     settings_draft: ClientSettings,
@@ -526,6 +528,8 @@ impl Default for PeerLumeApp {
             selected_torrent: 0,
             status_filter: Default::default(),
             name_column: name_column::NameColumn::from_gap(settings.ui.name_gap_pixels),
+            view_cache: Default::default(),
+            metainfo_loader: Default::default(),
             settings,
             saved_settings,
             settings_draft,
@@ -564,7 +568,14 @@ impl Default for PeerLumeApp {
 
 impl PeerLumeApp {
     fn poll_session_events(&mut self) {
-        while let Some(notice) = self.control.poll_next() {
+        let started = Instant::now();
+        for _ in 0..256 {
+            if started.elapsed() >= Duration::from_millis(4) {
+                break;
+            }
+            let Some(notice) = self.control.poll_next() else {
+                break;
+            };
             match notice {
                 SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
                     if !self.control.has_confirmed_update(&id) {
@@ -618,62 +629,124 @@ impl PeerLumeApp {
     }
 
     fn complete_trash_request(&mut self) {
+        self.complete_trash_request_with(|paths| {
+            trash::delete_all(paths).map_err(|error| error.to_string())
+        });
+    }
+
+    fn complete_trash_request_with(
+        &mut self,
+        recycle: impl FnOnce(&[PathBuf]) -> Result<(), String>,
+    ) {
         let Some(request) = self.pending_trash.take() else {
             return;
         };
-        if let Err(error) = trash::delete_all(&request.paths) {
-            self.add_status = format!("Could not move items to the Recycle Bin: {error}");
+        // The engine has acknowledged detach. Persist that stopped intent before
+        // moving files, so a later database failure cannot restart a deleted payload.
+        let Some(torrent) = self
+            .control
+            .torrents
+            .iter_mut()
+            .find(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
+        else {
+            self.add_status = "Torrent no longer exists; no files were moved".into();
+            return;
+        };
+        torrent.runtime.registered = false;
+        torrent.state = TorrentState::Paused;
+        torrent.download_rate = 0;
+        torrent.upload_rate = 0;
+        torrent.peers = 0;
+        torrent.seeds = 0;
+        torrent.completion = crate::completion::CompletionStatus::Pending;
+        let record = torrent_record(torrent, self.tracker_audits.get(&request.torrent_id));
+        if !self.control.backend.persistence_available() {
+            self.trash_failed(
+                &request,
+                "Persistent state is unavailable; no files were moved".into(),
+            );
             return;
         }
-
-        if request.scope.removes_torrent() {
-            if let Some(index) = self
-                .control
-                .torrents
-                .iter()
-                .position(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
-            {
-                self.control.torrents.remove(index);
-                self.tracker_audits.remove(&request.torrent_id);
-                self.selected_torrent = self
-                    .selected_torrent
-                    .min(self.control.torrents.len().saturating_sub(1));
-            }
-            let _ = self.control.backend.remove_torrent(&request.torrent_id);
-        } else if let Some(index) = self
+        if let Err(error) = self.control.backend.save_torrent(&record) {
+            self.trash_failed(
+                &request,
+                format!("Could not save stopped torrent; no files were moved: {error}"),
+            );
+            return;
+        }
+        let current_paths = self
             .control
             .torrents
             .iter()
-            .position(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
+            .find(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
+            .map(|torrent| trash_paths(torrent, &self.settings, request.scope));
+        if current_paths.as_ref() != Some(&request.paths) {
+            self.trash_failed(&request, "File locations changed after confirmation; no files were moved. Review the torrent and try again.".into());
+            return;
+        }
+        if !request.paths.is_empty()
+            && let Err(error) = recycle(&request.paths)
         {
-            let command = {
-                let torrent = &mut self.control.torrents[index];
-                for file_index in 0..torrent.files.files().len() {
-                    torrent.files.set_file_downloaded(file_index, 0);
-                }
-                torrent.downloaded_bytes = 0;
-                torrent.uploaded_bytes = 0;
-                torrent.download_rate = 0;
-                torrent.upload_rate = 0;
-                torrent.peers = 0;
-                torrent.seeds = 0;
-                torrent.state = TorrentState::Paused;
-                add_torrent_command(torrent, &self.settings)
-            };
-            let _ = self.control.backend.send(command);
-            if let Some(torrent) = self.control.torrents.get(index) {
-                let audit = self.tracker_audits.get(&request.torrent_id);
-                let _ = self
-                    .control
-                    .backend
-                    .save_torrent(&torrent_record(torrent, audit));
+            self.trash_failed(&request, format!("Could not move all items to the Recycle Bin; some may already have moved. Torrent retained: {error}"));
+            return;
+        }
+        // Keep the row visible until deletion of its durable record succeeds.
+        if let Err(error) = self.control.backend.remove_torrent(&request.torrent_id) {
+            self.trash_failed(&request, format!("Files moved, but the saved torrent could not be removed. Torrent retained: {error}"));
+            return;
+        }
+        let selected_id = self
+            .control
+            .torrents
+            .get(self.selected_torrent)
+            .map(|torrent| torrent.info_hashes.join(";"));
+        self.control
+            .torrents
+            .retain(|torrent| torrent.info_hashes.join(";") != request.torrent_id);
+        self.tracker_audits.remove(&request.torrent_id);
+        self.selected_torrent = selected_id
+            .and_then(|selected| {
+                self.control
+                    .torrents
+                    .iter()
+                    .position(|torrent| torrent.info_hashes.join(";") == selected)
+            })
+            .unwrap_or_else(|| {
+                self.selected_torrent
+                    .min(self.control.torrents.len().saturating_sub(1))
+            });
+        self.control.publish();
+        self.add_status = if request.paths.is_empty() {
+            format!(
+                "Removed {} from the list; no downloaded files were on disk",
+                request.torrent_name
+            )
+        } else {
+            format!(
+                "Moved {} for {} to the Recycle Bin and removed the torrent from the list",
+                request.scope.label(),
+                request.torrent_name
+            )
+        };
+    }
+
+    fn trash_failed(&mut self, request: &TrashRequest, mut message: String) {
+        if let Some(torrent) = self
+            .control
+            .torrents
+            .iter_mut()
+            .find(|torrent| torrent.info_hashes.join(";") == request.torrent_id)
+        {
+            torrent.runtime.registered = false;
+            torrent.state = TorrentState::Error;
+            torrent.runtime.record_error(&message);
+            let record = torrent_record(torrent, self.tracker_audits.get(&request.torrent_id));
+            if let Err(error) = self.control.backend.save_torrent(&record) {
+                message.push_str(&format!("; could not save error state: {error}"));
             }
         }
-        self.add_status = format!(
-            "Moved {} for {} to the Recycle Bin",
-            request.scope.label(),
-            request.torrent_name
-        );
+        self.control.publish();
+        self.add_status = message;
     }
 
     fn prepare_trash_request(&mut self, id: &str, scope: TrashScope) {
@@ -691,7 +764,7 @@ impl PeerLumeApp {
             return;
         };
         let paths = trash_paths(torrent, &self.settings, scope);
-        if paths.is_empty() {
+        if paths.is_empty() && !scope.includes_data() {
             self.add_status = format!("No existing {} were found", scope.label());
             return;
         }
@@ -720,6 +793,10 @@ impl PeerLumeApp {
                 "{} existing item(s) will be moved.",
                 request.paths.len()
             ));
+            ui.label("The torrent will also be removed from the download list.");
+            if !request.scope.includes_source() {
+                ui.label("The source .torrent file will be kept.");
+            }
             ui.separator();
             for path in request.paths.iter().take(8) {
                 ui.label(path.display().to_string());
@@ -752,10 +829,12 @@ impl PeerLumeApp {
             self.add_status = "Transfer engine is unavailable; nothing was deleted".into();
             return;
         }
-        match self.control.backend.send(SessionCommand::Remove {
-            id: request.torrent_id.clone(),
-        }) {
-            Ok(()) => {
+        match self.control.submit(
+            &request.torrent_id,
+            crate::control::TorrentCommand::Remove,
+            None,
+        ) {
+            Ok(_) => {
                 self.add_status = format!(
                     "Stopping {} before moving items to the Recycle Bin...",
                     request.torrent_name
@@ -829,12 +908,16 @@ impl PeerLumeApp {
         });
     }
 
-    fn show_torrents(&mut self, ctx: &egui::Context) {
-        let visible = crate::torrent_view::indices(
+    fn presentation_indices(&self) -> Arc<Vec<usize>> {
+        self.view_cache.borrow_mut().indices(
             &self.control.torrents,
             self.status_filter,
             &self.settings.ui,
-        );
+        )
+    }
+
+    fn show_torrents(&mut self, ctx: &egui::Context) {
+        let visible = self.presentation_indices();
         let visible_selection = visible
             .iter()
             .copied()
@@ -938,6 +1021,11 @@ impl PeerLumeApp {
                 }
             });
             });
+            let visible = self.presentation_indices();
+            let visible_selection = visible.iter().copied()
+                .find(|index| *index == self.selected_torrent)
+                .or_else(|| visible.first().copied());
+            if let Some(index) = visible_selection { self.selected_torrent = index; }
             // A long toolbar may expand the parent's virtual rectangle. Create
             // both panes within the original visible content bounds instead.
             let panes_rect = egui::Rect::from_min_max(
@@ -952,8 +1040,8 @@ impl PeerLumeApp {
                 let mut source_to_reveal = None;
                 let mut trash_action = None;
                 let mut recheck_action = None;
-                let other_columns_width =
-                    name_column::reserved_width(ui, &self.control.torrents, self.status_filter);
+                let column_widths = self.name_column.cached_widths(ui, &self.control.torrents, self.status_filter);
+                let other_columns_width = name_column::reserved_for_widths(ui, column_widths);
                 let feedback_height = visible_selection.map(|index| transfer_feedback::extra_details_height(&self.control.torrents[index])).unwrap_or(0.0);
                 let pane = torrent_panes::table_with_percent(ui, self.settings.ui.torrent_pane_percent, feedback_height, |ui| {
                     ui.scope(|ui| {
@@ -969,12 +1057,33 @@ impl PeerLumeApp {
                                     viewport.width(),
                                     other_columns_width,
                                 );
-                                let table = egui::Grid::new("torrent_table")
+                                let row_height = 20.0_f32.max(ui.text_style_height(&egui::TextStyle::Body))
+                                    .max(ui.spacing().interact_size.y);
+                                let row_step = row_height + ui.spacing().item_spacing.y;
+                                let total_rows = visible.len() + 1;
+                                let table_origin = ui.max_rect().min;
+                                let table_width = name_layout.width + other_columns_width;
+                                let table_height = (row_step * total_rows as f32 - ui.spacing().item_spacing.y).max(0.0);
+                                ui.set_min_width(table_width);
+                                ui.set_height(table_height);
+                                let first_row = (viewport.min.y / row_step).floor().max(0.0) as usize;
+                                let end_row = ((viewport.max.y / row_step).ceil() as usize + 1).min(total_rows);
+                                let first_row = first_row.min(end_row);
+                                let rows_rect = egui::Rect::from_min_max(
+                                    egui::pos2(table_origin.x, table_origin.y + first_row as f32 * row_step),
+                                    egui::pos2(table_origin.x + table_width, table_origin.y + end_row as f32 * row_step),
+                                );
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(rows_rect), |ui| {
+                                egui::Grid::new("torrent_table")
                                     .striped(true)
                                     .min_col_width(72.0)
+                                    .min_row_height(row_height)
+                                    .start_row(first_row)
                                     .show(ui, |ui| {
-                                        name_column::headers(ui, name_layout.width);
-                                        for index in crate::torrent_view::indices(&self.control.torrents,self.status_filter,&self.settings.ui) {
+                                        if first_row == 0 {
+                                            name_column::headers_with_widths(ui, name_layout.width, column_widths);
+                                        }
+                                        for &index in &visible[first_row.saturating_sub(1)..end_row.saturating_sub(1)] {
                                             let torrent = &self.control.torrents[index];
                                             let response = ui.push_id(&torrent.info_hashes, |ui| Self::show_torrent_name(
                                                 ui,
@@ -1011,7 +1120,7 @@ impl PeerLumeApp {
                                                 }
                                                 ui.separator();
                                                 if ui
-                                                    .button("Move downloaded files to Recycle Bin")
+                                                    .button("Remove torrent and move downloaded files to Recycle Bin")
                                                     .clicked()
                                                 {
                                                     trash_action = Some((
@@ -1073,13 +1182,14 @@ impl PeerLumeApp {
                                                         ui.visuals().selection.bg_fill
                                                     }),
                                             );
-                                            for text in name_column::metrics(torrent) {
-                                                ui.label(text);
+                                            for (text, width) in name_column::metrics(torrent).into_iter().zip(column_widths) {
+                                                ui.add_sized([width, row_height], egui::Label::new(text).truncate());
                                             }
                                             ui.end_row();
                                         }
                                     });
-                                name_layout.paint_divider(ui, table.response.rect);
+                                });
+                                name_layout.paint_divider(ui, egui::Rect::from_min_size(table_origin, egui::vec2(table_width, table_height)));
                             });
                     });
                 });
@@ -1126,21 +1236,55 @@ impl PeerLumeApp {
             self.add_status = "Only files with the .torrent extension can be added".into();
             return;
         }
-        match TorrentMetainfo::load(&path) {
-            Ok(metainfo) => {
-                let download_directory = self
-                    .last_download_directory
-                    .clone()
-                    .unwrap_or_else(|| self.settings.download.download_directory.clone());
-                self.add_dialog = Some(AddTorrentDialog::new(
-                    path,
-                    metainfo,
-                    &self.settings,
-                    download_directory,
-                ));
-                self.add_status.clear();
+        self.add_dialog = None;
+        self.add_status = match self.metainfo_loader.start(path) {
+            Ok(()) => "Reading torrent metadata...".into(),
+            Err(error) => format!("Could not open torrent: {error}"),
+        };
+    }
+
+    fn poll_metainfo_import(&mut self) {
+        if let Some(loaded) = self.metainfo_loader.poll() {
+            match loaded.result {
+                Ok(metainfo) => {
+                    let download_directory = self
+                        .last_download_directory
+                        .clone()
+                        .unwrap_or_else(|| self.settings.download.download_directory.clone());
+                    self.add_dialog = Some(AddTorrentDialog::new(
+                        loaded.path,
+                        metainfo,
+                        &self.settings,
+                        download_directory,
+                    ));
+                    self.add_status.clear();
+                }
+                Err(error) => self.add_status = format!("Could not open torrent: {error}"),
             }
-            Err(error) => self.add_status = format!("Could not open torrent: {error}"),
+        }
+        self.open_next_queued_torrent();
+    }
+
+    fn show_import_status(&mut self, ctx: &egui::Context) {
+        if !self.metainfo_loader.is_loading() {
+            return;
+        }
+        let mut cancel = false;
+        egui::Window::new("Reading torrent metadata")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.spinner();
+                if let Some(path) = self.metainfo_loader.active_path() {
+                    ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                }
+                ui.label("Reading and validating in the background. Review will open when ready.");
+                cancel = ui.button("Cancel import").clicked();
+            });
+        if cancel {
+            self.metainfo_loader.cancel();
+            self.add_status = "Import cancelled".into();
+            self.open_next_queued_torrent();
         }
     }
 
@@ -1151,6 +1295,10 @@ impl PeerLumeApp {
         match torrent_drop_candidates(dropped_count, &paths) {
             Ok(paths) => {
                 let added = paths.len();
+                if self.pending_torrent_paths.len().saturating_add(added) > 64 {
+                    self.add_status = "At most 64 torrent files can wait for review".into();
+                    return;
+                }
                 self.pending_torrent_paths.extend(paths);
                 self.add_status = format!("Queued {added} torrent file(s) for preview");
                 self.open_next_queued_torrent();
@@ -1160,12 +1308,17 @@ impl PeerLumeApp {
     }
 
     fn open_next_queued_torrent(&mut self) {
-        if self.add_dialog.is_some() {
+        if self.add_dialog.is_some() || self.metainfo_loader.is_loading() {
+            return;
+        }
+        if self.pending_torrent_paths.len() > 64 {
+            self.pending_torrent_paths.clear();
+            self.add_status = "At most 64 torrent files can wait for review".into();
             return;
         }
         while let Some(path) = self.pending_torrent_paths.pop_front() {
             self.load_torrent_path(path);
-            if self.add_dialog.is_some() {
+            if self.metainfo_loader.is_loading() {
                 break;
             }
         }
@@ -1564,11 +1717,7 @@ impl PeerLumeApp {
             ui.label("No torrents");
             return;
         }
-        let visible = crate::torrent_view::indices(
-            &self.control.torrents,
-            self.status_filter,
-            &self.settings.ui,
-        );
+        let visible = self.presentation_indices();
         let Some(index) = visible
             .iter()
             .copied()
@@ -2634,6 +2783,7 @@ impl eframe::App for PeerLumeApp {
             )
         });
         self.handle_dropped_files(dropped_count, dropped_paths);
+        self.poll_metainfo_import();
         self.poll_session_events();
         self.poll_blocklist_update();
         if let Some(status) = self.file_navigation.poll() {
@@ -2645,11 +2795,46 @@ impl eframe::App for PeerLumeApp {
             MainPage::Preferences => self.show_settings(ctx),
         }
         self.show_add_torrent_dialog(ctx);
+        self.show_import_status(ctx);
         self.show_trash_confirmation(ctx);
         if self.add_dialog.is_none() {
             show_file_drop_overlay(ctx);
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        let interest = if self.page == MainPage::Torrents && !minimized {
+            self.control
+                .torrents
+                .get(self.selected_torrent)
+                .filter(|_| self.presentation_indices().contains(&self.selected_torrent))
+                .map(|torrent| {
+                    (
+                        torrent.info_hashes.join(";"),
+                        crate::session::DetailInterest {
+                            files: matches!(
+                                self.details_tab,
+                                DetailsTab::Files | DetailsTab::Pieces
+                            ),
+                            peers: self.details_tab == DetailsTab::Peers,
+                        },
+                    )
+                })
+        } else {
+            None
+        };
+        self.control
+            .set_detail_interest(interest.filter(|(_, detail)| detail.files || detail.peers));
+        let pending = self.metainfo_loader.is_loading()
+            || self.blocklist_update.is_some()
+            || self.file_navigation.is_busy()
+            || self
+                .tracker_audits
+                .values()
+                .any(|audit| audit.run.is_some());
+        ctx.request_repaint_after(crate::torrent_view::refresh_interval(
+            &self.control.torrents,
+            pending,
+            minimized,
+        ));
     }
 }
 
@@ -2670,14 +2855,17 @@ fn trash_paths(
             EffectiveTorrentSettings::resolve(settings, &torrent.overrides, torrent.is_private);
         let root = absolute_path(Path::new(&effective.download_directory));
         if let Ok(canonical_root) = root.canonicalize() {
-            let multifile = torrent.files.files().len() > 1;
             for file in torrent.files.files() {
-                let file_path = PathBuf::from(&file.path);
-                let relative = if multifile {
-                    PathBuf::from(&torrent.name).join(file_path)
-                } else {
-                    file_path
-                };
+                if !is_safe_relative_path(Path::new(&file.path))
+                    || crate::limits::validate_relative_paths(
+                        [file.path.as_str()],
+                        &crate::limits::ResourceLimits::default(),
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let relative: PathBuf = file.path.split(['/', '\\']).collect();
                 if !is_safe_relative_path(&relative) {
                     continue;
                 }
@@ -4266,14 +4454,10 @@ mod tests {
 
     #[test]
     fn recycle_bin_data_paths_are_existing_and_contained_by_download_root() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("peerlume-trash-paths-{nonce}"));
-        let movie = root.join("Movie");
-        fs::create_dir_all(&movie).unwrap();
-        let expected = movie.join("video.mkv");
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("downloads");
+        fs::create_dir_all(&root).unwrap();
+        let expected = root.join("video.mkv");
         fs::write(&expected, b"data").unwrap();
         let outside = root.parent().unwrap().join("outside.mkv");
         fs::write(&outside, b"keep").unwrap();
@@ -4308,7 +4492,5 @@ mod tests {
             vec![expected]
         );
         assert!(outside.exists());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_file(outside).unwrap();
     }
 }

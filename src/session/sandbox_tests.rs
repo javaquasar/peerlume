@@ -13,6 +13,199 @@ fn metadata() -> (Vec<u8>, String) {
     (bytes, id)
 }
 #[test]
+fn hidden_file_summary_and_selection_ack_exclude_unselected_boundary_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = vec![b'a'; 4000];
+    let second = vec![b'b'; 12384];
+    let mut piece = first.clone();
+    piece.extend(&second);
+    let mut info = b"d5:filesld6:lengthi4000e4:pathl5:a.bineed6:lengthi12384e4:pathl5:b.bineee4:name8:boundary12:piece lengthi16384e6:pieces20:".to_vec();
+    info.extend(Sha1::digest(&piece));
+    info.extend(b"7:privatei1ee");
+    let id = format!("v1: {:x}", Sha1::digest(&info));
+    let mut bytes = b"d4:info".to_vec();
+    bytes.extend(info);
+    bytes.push(b'e');
+    let source = temp.path().join("boundary.torrent");
+    std::fs::write(&source, bytes).unwrap();
+    std::fs::write(temp.path().join("a.bin"), first).unwrap();
+    std::fs::write(temp.path().join("b.bin"), second).unwrap();
+    let mut command = add(&id, &source, temp.path());
+    if let SessionCommand::AddTorrent {
+        full_size,
+        only_files,
+        ..
+    } = &mut command
+    {
+        *full_size = 16384;
+        *only_files = Some(vec![0]);
+    }
+    let runtime = runtime(temp.path());
+    runtime.try_send(command).unwrap();
+    wait(
+        &runtime,
+        |event| matches!(event, SessionEvent::Stats { downloaded_bytes: 4000, finished: true, file_progress, .. } if file_progress.is_empty()),
+    );
+    runtime
+        .try_send(SessionCommand::SetFiles {
+            id: id.clone(),
+            only_files: vec![1],
+        })
+        .unwrap();
+    let mut snapshot_seen = false;
+    wait(&runtime, |event| match event {
+        SessionEvent::FileSnapshot {
+            id: actual,
+            progress,
+        } => {
+            assert_eq!(actual, &id);
+            assert_eq!(progress, &[4000, 12384]);
+            snapshot_seen = true;
+            false
+        }
+        SessionEvent::FilesApplied { only_files, .. } => {
+            assert!(
+                snapshot_seen,
+                "actual counts must precede a durable selection acknowledgement"
+            );
+            assert_eq!(only_files, &[1]);
+            true
+        }
+        _ => false,
+    });
+    wait(
+        &runtime,
+        |event| matches!(event, SessionEvent::Stats { downloaded_bytes: 12384, finished: true, file_progress, .. } if file_progress.is_empty()),
+    );
+    runtime.shutdown().unwrap();
+}
+#[test]
+fn real_integrity_checks_wait_for_bulk_admission_and_shutdown_cancels_a_queued_check() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bytes, id) = metadata();
+    std::fs::write(temp.path().join("payload.bin"), b"verified").unwrap();
+    let root = crate::storage::sandbox::Directory::open(temp.path()).unwrap();
+    let runtime = runtime(temp.path());
+    let budget = runtime.test_bulk_budget.clone();
+    let blocker = budget.register(vec![]).unwrap();
+    let permit = blocker.try_enter().unwrap();
+    runtime
+        .try_send(SessionCommand::PreparedAdd {
+            command: Box::new(add(&id, &temp.path().join("unused.torrent"), temp.path())),
+            prepared: PreparedTorrent {
+                bytes: bytes.into(),
+                directory: root.clone(),
+            },
+        })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Added { .. })
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(root.read_calls(), 0, "queued check must not read payloads");
+    drop(permit);
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Stats { finished: true, .. })
+    });
+    assert!(root.read_calls() > 0);
+    let blocker = budget.register(vec![]).unwrap();
+    let _permit = blocker.try_enter().unwrap();
+    let before = root.read_calls();
+    runtime.try_send(SessionCommand::Recheck { id }).unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Added { .. })
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(root.read_calls(), before);
+    let start = Instant::now();
+    runtime.shutdown().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        std::fs::read(temp.path().join("payload.bin")).unwrap(),
+        b"verified"
+    );
+}
+
+#[test]
+fn indexed_handle_replacement_and_detail_leases_keep_real_summary_and_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let (bytes, id) = metadata();
+    let source = root.path().join("source.torrent");
+    std::fs::write(&source, bytes).unwrap();
+    std::fs::write(root.path().join("payload.bin"), b"verified").unwrap();
+    let runtime = runtime(root.path());
+    runtime.try_send(add(&id, &source, root.path())).unwrap();
+    wait(
+        &runtime,
+        |event| matches!(event, SessionEvent::Stats { finished: true, downloaded_bytes: 8, file_progress, .. } if file_progress.is_empty()),
+    );
+    let engine = runtime.test_engine().unwrap();
+    let hash = librqbit::dht::Id20::new(
+        crate::tracker::parse_info_hash_hex(id.strip_prefix("v1: ").unwrap()).unwrap(),
+    );
+    let lookup = || engine.get(librqbit::api::TorrentIdOrHash::Hash(hash));
+    let original = lookup().unwrap();
+    assert!(
+        original
+            .stats_with_file_progress(false)
+            .file_progress
+            .is_empty()
+    );
+    assert_eq!(original.stats().file_progress, vec![8]);
+    assert_eq!(original.selected_file_progress(), Some(8));
+    runtime.set_detail_interest(Some((
+        id.clone(),
+        DetailInterest {
+            files: true,
+            peers: false,
+        },
+    )));
+    wait(
+        &runtime,
+        |event| matches!(event, SessionEvent::Stats { file_progress, downloaded_bytes: 8, .. } if file_progress == &[8]),
+    );
+    runtime.set_detail_interest(None);
+    wait(
+        &runtime,
+        |event| matches!(event, SessionEvent::Stats { file_progress, downloaded_bytes: 8, .. } if file_progress.is_empty()),
+    );
+    runtime
+        .try_send(SessionCommand::Recheck { id: id.clone() })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(
+            event,
+            SessionEvent::Verification {
+                status: CompletionStatus::Verified,
+                ..
+            }
+        )
+    });
+    let replacement = lookup().unwrap();
+    assert!(!Arc::ptr_eq(&original, &replacement));
+    assert_eq!(replacement.selected_file_progress(), Some(8));
+    runtime
+        .try_send(SessionCommand::Remove { id: id.clone() })
+        .unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Removed { .. })
+    });
+    assert!(lookup().is_none());
+    assert!(engine.get(original.id().into()).is_none());
+    runtime.try_send(add(&id, &source, root.path())).unwrap();
+    wait(&runtime, |event| {
+        matches!(event, SessionEvent::Stats { finished: true, .. })
+    });
+    let readded = lookup().unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &readded));
+    assert_eq!(readded.selected_file_progress(), Some(8));
+    assert_eq!(
+        std::fs::read(root.path().join("payload.bin")).unwrap(),
+        b"verified"
+    );
+    runtime.shutdown().unwrap();
+}
+#[test]
 fn cached_pieces_reduce_initial_reads_but_forced_check_hashes_every_piece_and_keeps_file_priority()
 {
     let temp = tempfile::tempdir().unwrap();

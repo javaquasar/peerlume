@@ -65,6 +65,10 @@ pub trait StorageFactory: Send + Sync + Any {
 }
 
 pub type BoxStorageFactory = Box<dyn StorageFactory<Storage = Box<dyn TorrentStorage>>>;
+/// Optional asynchronous disk admission, held until initialization has finished.
+pub type CheckGuard = Box<dyn Send>;
+pub type CheckAdmission<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<CheckGuard>> + Send + 'a>>;
 
 pub trait StorageFactoryExt {
     fn boxed(self) -> BoxStorageFactory;
@@ -118,8 +122,16 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 }
 
 pub trait TorrentStorage: Send + Sync {
+    fn check_admission<'a>(
+        &'a self,
+        _cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> CheckAdmission<'a> {
+        Box::pin(async { Ok(Box::new(()) as CheckGuard) })
+    }
     /// One-shot pieces from a host clean-stop cache. Default: full check.
-    fn initial_verified_pieces(&self) -> Option<Vec<u8>> { None }
+    fn initial_verified_pieces(&self) -> Option<Vec<u8>> {
+        None
+    }
     // Create/open files etc.
     fn init(
         &mut self,
@@ -173,7 +185,15 @@ pub trait TorrentStorage: Send + Sync {
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
-    fn initial_verified_pieces(&self) -> Option<Vec<u8>> { (**self).initial_verified_pieces() }
+    fn check_admission<'a>(
+        &'a self,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> CheckAdmission<'a> {
+        (**self).check_admission(cancel)
+    }
+    fn initial_verified_pieces(&self) -> Option<Vec<u8>> {
+        (**self).initial_verified_pieces()
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         (**self).pread_exact(file_id, offset, buf)
     }

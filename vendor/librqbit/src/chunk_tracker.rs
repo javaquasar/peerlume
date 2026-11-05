@@ -36,6 +36,8 @@ pub struct ChunkTracker {
 
     // How many bytes do we have per each file.
     per_file_bytes: Vec<u64>,
+    selected_file_flags: Vec<bool>,
+    selected_file_bytes: u64,
 
     lengths: Lengths,
 
@@ -178,8 +180,11 @@ impl ChunkTracker {
             have: have_pieces,
             hns: HaveNeededSelected::default(),
             per_file_bytes: vec![0; file_infos.len()],
+            selected_file_flags: vec![true; file_infos.len()],
+            selected_file_bytes: 0,
         };
         ct.recalculate_per_file_bytes(file_infos);
+        ct.refresh_selected_file_bytes();
         ct.hns = ct.calc_hns();
         Ok(ct)
     }
@@ -325,6 +330,7 @@ impl ChunkTracker {
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<HaveNeededSelected> {
+        self.configure_selected_files(file_infos, Some(new_only_files));
         let selected = compute_selected_pieces(
             &self.lengths,
             |idx| new_only_files.contains(&idx),
@@ -386,6 +392,33 @@ impl ChunkTracker {
         &self.per_file_bytes
     }
 
+    /// Exact selected-file bytes, excluding unselected sides of boundary pieces.
+    pub fn selected_file_have_bytes(&self) -> u64 {
+        self.selected_file_bytes
+    }
+
+    pub(crate) fn configure_selected_files(
+        &mut self,
+        file_infos: &FileInfos,
+        selected: Option<&HashSet<usize>>,
+    ) {
+        self.selected_file_flags = file_infos
+            .iter()
+            .enumerate()
+            .map(|(index, _)| selected.is_none_or(|s| s.contains(&index)))
+            .collect();
+        self.refresh_selected_file_bytes();
+    }
+
+    fn refresh_selected_file_bytes(&mut self) {
+        self.selected_file_bytes = self
+            .per_file_bytes
+            .iter()
+            .zip(&self.selected_file_flags)
+            .filter_map(|(bytes, selected)| selected.then_some(*bytes))
+            .sum();
+    }
+
     // Returns remaining bytes
     pub fn update_file_have_on_piece_completed(
         &mut self,
@@ -399,6 +432,14 @@ impl ChunkTracker {
             file_info.len,
         );
         self.per_file_bytes[file_id] += diff_have;
+        if self
+            .selected_file_flags
+            .get(file_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            self.selected_file_bytes += diff_have;
+        }
         file_info.len.saturating_sub(self.per_file_bytes[file_id])
     }
 }
@@ -413,6 +454,49 @@ mod tests {
     };
 
     use super::{ChunkTracker, compute_chunk_have_status};
+
+    #[test]
+    fn selected_file_aggregate_excludes_unselected_boundary_bytes_and_tracks_reselection() {
+        let piece_len = CHUNK_SIZE;
+        let lengths = Lengths::new(piece_len as u64, piece_len).unwrap();
+        let files = vec![
+            FileInfo {
+                relative_filename: "first".into(),
+                offset_in_torrent: 0,
+                piece_range: 0..1,
+                len: 4000,
+                attrs: Default::default(),
+            },
+            FileInfo {
+                relative_filename: "second".into(),
+                offset_in_torrent: 4000,
+                piece_range: 0..1,
+                len: piece_len as u64 - 4000,
+                attrs: Default::default(),
+            },
+        ];
+        let have = BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice());
+        let mut selected = have.clone();
+        selected.set(0, true);
+        let mut chunks = ChunkTracker::new(have.into_dyn(), selected, lengths, &files).unwrap();
+        chunks.configure_selected_files(&files, Some(&HashSet::from([0])));
+        let piece = lengths.validate_piece_index(0).unwrap();
+        chunks.mark_piece_downloaded(piece);
+        chunks.update_file_have_on_piece_completed(piece, 0, &files[0]);
+        chunks.update_file_have_on_piece_completed(piece, 1, &files[1]);
+        assert_eq!(chunks.get_hns().progress(), piece_len as u64);
+        assert_eq!(chunks.selected_file_have_bytes(), 4000);
+        chunks
+            .update_only_files(&files, &HashSet::from([1]))
+            .unwrap();
+        assert_eq!(chunks.selected_file_have_bytes(), piece_len as u64 - 4000);
+        chunks.update_only_files(&files, &HashSet::new()).unwrap();
+        assert_eq!(chunks.selected_file_have_bytes(), 0);
+        assert_eq!(
+            chunks.per_file_have_bytes(),
+            &[4000, piece_len as u64 - 4000]
+        );
+    }
 
     #[test]
     fn test_compute_chunk_status() {

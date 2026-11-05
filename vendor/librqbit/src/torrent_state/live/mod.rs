@@ -216,10 +216,14 @@ pub struct TorrentStateLive {
 
 impl TorrentStateLive {
     pub(crate) fn update_file_priorities(&self, high: &[usize]) {
-        self.lock_write("file_priorities").file_priorities.sort_by_key(|index| (
-            !high.contains(index),
-            self.metadata.file_infos[*index].relative_filename.clone()
-        ));
+        self.lock_write("file_priorities")
+            .file_priorities
+            .sort_by_key(|index| {
+                (
+                    !high.contains(index),
+                    self.metadata.file_infos[*index].relative_filename.clone(),
+                )
+            });
     }
     pub(crate) fn new(
         paused: TorrentStatePaused,
@@ -250,7 +254,7 @@ impl TorrentStateLive {
                     .get(*id)
                     .map(|fi| fi.relative_filename.as_path())
             });
-            let high=paused.shared.high_priority_files.read().clone();
+            let high = paused.shared.high_priority_files.read().clone();
             pri.sort_by_key(|id| !high.contains(id));
             pri
         };
@@ -750,12 +754,22 @@ impl TorrentStateLive {
     }
 
     pub fn per_peer_stats_snapshot(&self, filter: PeerStatsFilter) -> PeerStatsSnapshot {
+        self.per_peer_stats_snapshot_limited(filter, usize::MAX)
+    }
+
+    /// Bound materialization before allocating addresses and peer metadata.
+    pub fn per_peer_stats_snapshot_limited(
+        &self,
+        filter: PeerStatsFilter,
+        limit: usize,
+    ) -> PeerStatsSnapshot {
         PeerStatsSnapshot {
             peers: self
                 .peers
                 .states
                 .iter()
                 .filter(|e| filter.state.matches(e.value().get_state()))
+                .take(limit)
                 .map(|e| (e.key().to_string(), e.value().into()))
                 .collect(),
         }

@@ -306,6 +306,8 @@ impl Default for PrivacySettings {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageSettings {
+    pub max_active_bulk_jobs: usize,
+    pub bulk_io_limit_kib: u64,
     pub cache_size_mib: u64,
     pub max_queued_write_mib: u64,
     pub resume_save_interval_seconds: u64,
@@ -320,6 +322,8 @@ pub struct StorageSettings {
 impl Default for StorageSettings {
     fn default() -> Self {
         Self {
+            max_active_bulk_jobs: 1,
+            bulk_io_limit_kib: 32768,
             cache_size_mib: 64,
             max_queued_write_mib: 32,
             resume_save_interval_seconds: 180,
@@ -531,8 +535,17 @@ impl ClientSettings {
                 "must be at least 1 when queueing is enabled",
             );
         }
-        if self.queue.max_active_checks == 0 {
-            push("queue.max_active_checks", "must be at least 1");
+        if !(1..=32).contains(&self.queue.max_active_checks) {
+            push("queue.max_active_checks", "must be 1..32");
+        }
+        if !(1..=32).contains(&self.storage.max_active_bulk_jobs) {
+            push("storage.max_active_bulk_jobs", "must be 1..32");
+        }
+        if self.storage.bulk_io_limit_kib > u64::from(u32::MAX / 1024) {
+            push(
+                "storage.bulk_io_limit_kib",
+                "must be 0..4194303 KiB/s; 0 disables bulk I/O throttling",
+            );
         }
         if self.speed.schedule_begin_minutes >= 1440 || self.speed.schedule_end_minutes >= 1440 {
             push("speed.schedule", "schedule times must fall within one day");
@@ -786,6 +799,32 @@ fn settings_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bulk_disk_and_check_budgets_are_bounded_and_legacy_settings_get_safe_defaults() {
+        let defaults = ClientSettings::from_toml("").unwrap();
+        assert_eq!(defaults.storage.max_active_bulk_jobs, 1);
+        assert_eq!(defaults.storage.bulk_io_limit_kib, 32768);
+        let mut settings = defaults;
+        settings.storage.max_active_bulk_jobs = 33;
+        settings.storage.bulk_io_limit_kib = u64::MAX;
+        settings.queue.max_active_checks = 33;
+        let fields = settings
+            .validate()
+            .into_iter()
+            .map(|issue| issue.field)
+            .collect::<Vec<_>>();
+        for field in [
+            "storage.max_active_bulk_jobs",
+            "storage.bulk_io_limit_kib",
+            "queue.max_active_checks",
+        ] {
+            assert!(fields.contains(&field));
+        }
+        settings.storage.max_active_bulk_jobs = 1;
+        settings.storage.bulk_io_limit_kib = 0;
+        settings.queue.max_active_checks = 32;
+        assert!(settings.validate().is_empty());
+    }
     #[test]
     fn inherited_transfer_defaults_cannot_silently_exceed_runtime_caps() {
         let mut settings = ClientSettings::default();

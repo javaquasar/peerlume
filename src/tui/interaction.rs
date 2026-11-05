@@ -29,8 +29,8 @@ pub(super) struct PendingBatch {
 }
 
 impl TuiApp {
-    pub(super) fn visible_indices(&self) -> Vec<usize> {
-        crate::torrent_view::indices_with_query(
+    pub(super) fn visible_indices(&self) -> Arc<Vec<usize>> {
+        self.view_cache.borrow_mut().indices_with_query(
             &self.control.torrents,
             self.status_filter,
             &self.settings.ui,

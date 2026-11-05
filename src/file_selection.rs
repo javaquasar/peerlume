@@ -25,6 +25,9 @@ pub struct FileSelectionModel {
     selected_count: usize,
     selected_size: u64,
     selected_downloaded: u64,
+    // Exact engine aggregate while detailed file telemetry is not subscribed.
+    // Individual file counts remain the last genuine snapshot, never guessed.
+    selected_downloaded_summary: Option<u64>,
     download_cursor: usize,
 }
 
@@ -186,6 +189,7 @@ impl FileSelectionModel {
         if file.selected == selected {
             return false;
         }
+        self.selected_downloaded_summary = None;
         if selected {
             self.selected_count += 1;
             self.selected_size = self.selected_size.saturating_add(file.size_bytes);
@@ -204,6 +208,7 @@ impl FileSelectionModel {
     }
 
     pub fn refresh_selection_totals(&mut self) {
+        self.selected_downloaded_summary = None;
         self.selected_count = 0;
         self.selected_size = 0;
         self.selected_downloaded = 0;
@@ -230,13 +235,19 @@ impl FileSelectionModel {
     }
 
     pub fn selected_downloaded(&self) -> u64 {
-        self.selected_downloaded
+        self.selected_downloaded_summary
+            .unwrap_or(self.selected_downloaded)
+    }
+
+    pub fn set_selected_downloaded_summary(&mut self, bytes: u64) {
+        self.selected_downloaded_summary = Some(bytes.min(self.selected_size));
     }
 
     pub fn set_file_downloaded(&mut self, index: usize, downloaded_bytes: u64) -> bool {
         let Some(file) = self.files.get_mut(index) else {
             return false;
         };
+        self.selected_downloaded_summary = None;
         let old = file.downloaded_bytes.min(file.size_bytes);
         let new = downloaded_bytes.min(file.size_bytes);
         file.downloaded_bytes = new;
@@ -250,6 +261,7 @@ impl FileSelectionModel {
     }
 
     pub fn apply_downloaded_bytes(&mut self, mut bytes: u64) -> u64 {
+        self.selected_downloaded_summary = None;
         if bytes == 0 || self.files.is_empty() || self.selected_downloaded >= self.selected_size {
             return 0;
         }
@@ -276,6 +288,7 @@ impl FileSelectionModel {
     }
 
     pub fn set_total_downloaded(&mut self, total_downloaded: u64) {
+        self.selected_downloaded_summary = None;
         for file in &mut self.files {
             file.downloaded_bytes = 0;
         }
@@ -319,6 +332,26 @@ fn build_tree_rows(files: &[TorrentFile]) -> Vec<FileTreeRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_progress_never_fabricates_files_or_double_counts_fresh_details() {
+        let mut files = FileSelectionModel::from_files([("a".into(), 100), ("b".into(), 100)]);
+        files.set_selected_downloaded_summary(150);
+        assert_eq!(files.selected_downloaded(), 150);
+        assert_eq!(files.files()[0].downloaded_bytes, 0);
+        assert_eq!(files.files()[1].downloaded_bytes, 0);
+        files.set_file_downloaded(0, 100);
+        files.set_file_downloaded(1, 50);
+        assert_eq!(files.selected_downloaded(), 150);
+        files.set_selected_downloaded_summary(200);
+        files.set_file_downloaded(0, 100);
+        files.set_file_downloaded(1, 100);
+        assert_eq!(files.selected_downloaded(), 200);
+        files.set_selected(1, false);
+        assert_eq!(files.selected_downloaded(), 100);
+        files.set_selected_downloaded_summary(u64::MAX);
+        assert_eq!(files.selected_downloaded(), 100);
+    }
     #[test]
     fn file_search_and_sort_cache_survive_progress_without_rebuilding_or_mutating_selection() {
         let mut files = FileSelectionModel::from_files([

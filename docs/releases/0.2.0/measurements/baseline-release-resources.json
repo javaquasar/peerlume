@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "workload": "synthetic_process_resources",
+  "completed": true,
+  "source_label": "2c5cf1a-preserved-baseline-release",
+  "executable_file_name": "baseline-release-preserved-20261105.exe",
+  "executable_sha256": "84d0187db6fe723dd6a40d0cc9631d79affc1d9fc62b5a0c3c1df7670af37dcb",
+  "child_exit_code": 0,
+  "child_workload_report": "baseline-release-sampled-workload.json",
+  "child_compiled_inputs_sha256": {
+    "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+    "Cargo.toml": "bf543e53131851951a29f490b349646d79002c884100b364913eba27ec31c850",
+    "src/file_selection.rs": "563807699d78fb4a361156fcba9660d0a920a8f5438195fa6a693b65cec770f1",
+    "src/state.rs": "0ef485cc9955286397c6d687d0ad5ede6faa4d843cecf78706960e2f13ebe8e9",
+    "src/torrent_view.rs": "ae0fe65021f3bb356ed47473ac01f209ef6417f7e4c90d8e14a7b814af1b4748"
+  },
+  "os": "win32",
+  "wall_ns": 729523800,
+  "cpu_user_time_ns": 203125000,
+  "cpu_kernel_time_ns": 93750000,
+  "cpu_time_ns": 296875000,
+  "cpu_measurement": "Windows GetProcessTimes (completed child handle)",
+  "average_cpu_percent_of_one_core": 40.69435431715867,
+  "memory_sampling": {
+    "successful_samples": 65,
+    "requested_interval_ns": 10000000,
+    "first_sample_offset_ns": 26193300,
+    "last_sample_offset_ns": 729416400,
+    "max_successful_sample_gap_ns": 11312900,
+    "unsampled_start_ns": 26193300,
+    "unsampled_tail_ns": 107400,
+    "sampled_rss_peak_bytes": 20045824,
+    "sampled_rss_peak_offset_ns": 707355800,
+    "os_high_water_mark_observed_bytes": 21811200
+  },
+  "resource_query_failures": 0,
+  "last_resource_query_error": null,
+  "timed_out": false,
+  "verification_error": null,
+  "limitations": [
+    "Measures only the spawned synthetic workload, not the existing client or sampler",
+    "Sampled RSS can miss spikes; start/tail and sample gaps are reported",
+    "Observed OS high-water mark is through the last successful query, not a heap allocation profile",
+    "Average CPU percent uses one logical core as 100%; ambient machine load remains uncontrolled",
+    "No sustained swarm, cold-start, production throughput or leak-absence claim"
+  ]
+}

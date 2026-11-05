@@ -1,7 +1,12 @@
 //! Copy preserves originals. Only a separately confirmed duplicate cleanup deletes them.
 use super::sandbox::Directory;
+#[path = "bulk_budget.rs"]
+mod bulk_budget;
+pub(crate) use bulk_budget::Budget as BulkBudget;
+use bulk_budget::{Admission, Volume};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::{
@@ -44,10 +49,18 @@ pub(crate) struct CopyJob {
     pub removed: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     result: mpsc::Receiver<Result<(), String>>,
-    thread: Option<thread::JoinHandle<()>>,
+    thread: RefCell<Option<thread::JoinHandle<()>>>,
+    admission: RefCell<Option<Admission>>,
+    sender: RefCell<Option<mpsc::SyncSender<Result<(), String>>>>,
+    budget: Arc<BulkBudget>,
 }
 impl CopyJob {
-    pub fn start(source: Directory, parent: &Path, files: Vec<(PathBuf, u64)>) -> io::Result<Self> {
+    pub fn start(
+        source: Directory,
+        parent: &Path,
+        files: Vec<(PathBuf, u64)>,
+        budget: Arc<BulkBudget>,
+    ) -> io::Result<Self> {
         if !parent.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -56,6 +69,7 @@ impl CopyJob {
         }
         let parent_path = parent.canonicalize()?;
         let parent = Directory::open(&parent_path)?;
+        let admission = budget.register(vec![volume(&source), volume(&parent)])?;
         let name = format!(
             "PeerLume-copy-{}",
             &crate::control::access::random_id()?[..16]
@@ -65,26 +79,20 @@ impl CopyJob {
         let bytes = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, result) = mpsc::sync_channel(1);
-        let (target, progress, stop) = (root.clone(), bytes.clone(), cancel.clone());
-        let (original, paths) = (source.clone(), files.clone());
-        let worker = thread::Builder::new()
-            .name("peerlume-copy".into())
-            .spawn(move || {
-                let result = copy_files(&source, &target, &files, &progress, &stop)
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(result);
-            })?;
         Ok(Self {
             removed: Default::default(),
-            source: original,
-            files: paths,
+            source,
+            files,
             cleanup: false,
             destination,
             root,
             bytes,
             cancel,
             result,
-            thread: Some(worker),
+            thread: RefCell::new(None),
+            admission: RefCell::new(Some(admission)),
+            sender: RefCell::new(Some(sender)),
+            budget,
         })
     }
     pub fn cleanup(
@@ -92,20 +100,13 @@ impl CopyJob {
         root: Directory,
         destination: String,
         files: Vec<(PathBuf, u64)>,
+        budget: Arc<BulkBudget>,
     ) -> io::Result<Self> {
         let bytes = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, result) = mpsc::sync_channel(1);
-        let (from, to, paths, stop) = (source.clone(), root.clone(), files.clone(), cancel.clone());
         let removed = Arc::new(AtomicU64::new(0));
-        let observed = removed.clone();
-        let worker = thread::Builder::new()
-            .name("peerlume-cleanup".into())
-            .spawn(move || {
-                let result = remove_duplicates_counted(&from, &to, &paths, &stop, &observed)
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(result);
-            })?;
+        let admission = budget.register(vec![volume(&source), volume(&root)])?;
         Ok(Self {
             removed,
             source,
@@ -116,13 +117,20 @@ impl CopyJob {
             bytes,
             cancel,
             result,
-            thread: Some(worker),
+            thread: RefCell::new(None),
+            admission: RefCell::new(Some(admission)),
+            sender: RefCell::new(Some(sender)),
+            budget,
         })
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.budget.wake();
     }
     pub fn finished(&self) -> Option<Result<(), String>> {
+        if let Err(error) = self.launch_if_admitted() {
+            return Some(Err(error.to_string()));
+        }
         match self.result.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -131,21 +139,103 @@ impl CopyJob {
             Err(_) => None,
         }
     }
+
+    fn launch_if_admitted(&self) -> io::Result<()> {
+        if self.thread.borrow().is_some() || self.sender.borrow().is_none() {
+            return Ok(());
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            self.admission.borrow_mut().take();
+            if let Some(sender) = self.sender.borrow_mut().take() {
+                let _ = sender.send(Err(
+                    "Bulk operation cancelled while queued; originals retained".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let Some(permit) = self
+            .admission
+            .borrow()
+            .as_ref()
+            .and_then(Admission::try_enter)
+        else {
+            return Ok(());
+        };
+        self.admission.borrow_mut().take();
+        let sender = self
+            .sender
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| io::Error::other("Bulk result sender unavailable"))?;
+        let (source, target, files) = (self.source.clone(), self.root.clone(), self.files.clone());
+        let (progress, removed, stop, budget, cleanup) = (
+            self.bytes.clone(),
+            self.removed.clone(),
+            self.cancel.clone(),
+            self.budget.clone(),
+            self.cleanup,
+        );
+        let worker = thread::Builder::new()
+            .name(
+                if cleanup {
+                    "peerlume-cleanup"
+                } else {
+                    "peerlume-copy"
+                }
+                .into(),
+            )
+            .spawn(move || {
+                let _permit = permit;
+                let result = if cleanup {
+                    remove_duplicates_counted_budgeted(
+                        &source,
+                        &target,
+                        &files,
+                        &stop,
+                        &removed,
+                        Some(&budget),
+                    )
+                } else {
+                    copy_files_budgeted(&source, &target, &files, &progress, &stop, Some(&budget))
+                }
+                .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            })?;
+        *self.thread.borrow_mut() = Some(worker);
+        Ok(())
+    }
 }
 impl Drop for CopyJob {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(worker) = self.thread.take() {
+        if let Some(worker) = self.thread.get_mut().take() {
             let _ = worker.join();
         }
     }
 }
+fn volume(directory: &Directory) -> Volume {
+    directory
+        .volume_key()
+        .map(Volume::Known)
+        .unwrap_or(Volume::Unknown)
+}
+#[cfg(test)]
 fn copy_files(
     source: &Directory,
     target: &Directory,
     files: &[(PathBuf, u64)],
     progress: &AtomicU64,
     cancel: &AtomicBool,
+) -> io::Result<()> {
+    copy_files_budgeted(source, target, files, progress, cancel, None)
+}
+fn copy_files_budgeted(
+    source: &Directory,
+    target: &Directory,
+    files: &[(PathBuf, u64)],
+    progress: &AtomicU64,
+    cancel: &AtomicBool,
+    budget: Option<&BulkBudget>,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; 1024 * 1024];
     for (path, expected) in files {
@@ -171,6 +261,7 @@ fn copy_files(
             if read == 0 {
                 break;
             }
+            throttle(budget, 2 * read as u64, cancel)?;
             copied = copied.saturating_add(read as u64);
             if copied > before.len() {
                 return Err(io::Error::other("Source changed during copy"));
@@ -195,6 +286,7 @@ fn copy_files(
             if read == 0 {
                 break;
             }
+            throttle(budget, read as u64, cancel)?;
             verified.update(&buffer[..read]);
         }
         if digest.finalize() != verified.finalize() {
@@ -204,7 +296,11 @@ fn copy_files(
     Ok(())
 }
 
-fn digest(mut file: std::fs::File, cancel: &AtomicBool) -> io::Result<Vec<u8>> {
+fn digest(
+    mut file: std::fs::File,
+    cancel: &AtomicBool,
+    budget: Option<&BulkBudget>,
+) -> io::Result<Vec<u8>> {
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut hash = Sha256::new();
     loop {
@@ -213,6 +309,7 @@ fn digest(mut file: std::fs::File, cancel: &AtomicBool) -> io::Result<Vec<u8>> {
         if count == 0 {
             break;
         }
+        throttle(budget, count as u64, cancel)?;
         hash.update(&buffer[..count]);
     }
     Ok(hash.finalize().to_vec())
@@ -228,12 +325,23 @@ fn remove_duplicates(
 ) -> io::Result<()> {
     remove_duplicates_counted(source, target, files, cancel, &AtomicU64::new(0))
 }
+#[cfg(test)]
 fn remove_duplicates_counted(
     source: &Directory,
     target: &Directory,
     files: &[(PathBuf, u64)],
     cancel: &AtomicBool,
     removed: &AtomicU64,
+) -> io::Result<()> {
+    remove_duplicates_counted_budgeted(source, target, files, cancel, removed, None)
+}
+fn remove_duplicates_counted_budgeted(
+    source: &Directory,
+    target: &Directory,
+    files: &[(PathBuf, u64)],
+    cancel: &AtomicBool,
+    removed: &AtomicU64,
+    budget: Option<&BulkBudget>,
 ) -> io::Result<()> {
     let mut proofs = Vec::new();
     for (path, _) in files {
@@ -244,8 +352,8 @@ fn remove_duplicates_counted(
             Err(error) => return Err(error),
         };
         let before = input.metadata()?;
-        let expected = digest(input, cancel)?;
-        if digest(target.read_payload(path)?, cancel)? != expected {
+        let expected = digest(input, cancel, budget)?;
+        if digest(target.read_payload(path)?, cancel, budget)? != expected {
             return Err(io::Error::other(
                 "Original and destination differ; originals retained",
             ));
@@ -262,8 +370,8 @@ fn remove_duplicates_counted(
         let current = input.metadata()?;
         if before.len() != current.len()
             || before.modified()? != current.modified()?
-            || digest(input, cancel)? != expected
-            || digest(target.read_payload(path)?, cancel)? != expected
+            || digest(input, cancel, budget)? != expected
+            || digest(target.read_payload(path)?, cancel, budget)? != expected
         {
             return Err(io::Error::other(
                 "Source changed during cleanup; remaining originals retained",
@@ -273,6 +381,12 @@ fn remove_duplicates_counted(
         removed.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+fn throttle(budget: Option<&BulkBudget>, bytes: u64, cancel: &AtomicBool) -> io::Result<()> {
+    if let Some(budget) = budget {
+        budget.throttle(bytes, cancel)?;
+    }
+    check_cancel(cancel)
 }
 fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
     if cancel.load(Ordering::Relaxed) {
@@ -288,6 +402,45 @@ fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_copy_owns_no_worker_and_can_cancel_before_admission_without_touching_originals() {
+        let source = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("x"), b"safe").unwrap();
+        let root = Directory::open(source.path()).unwrap();
+        let budget = BulkBudget::new(1, 0);
+        let blocker = budget.register(vec![Volume::Unknown]).unwrap();
+        let permit = blocker.try_enter().unwrap();
+        let files = vec![("x".into(), 4)];
+        let first =
+            CopyJob::start(root.clone(), parent.path(), files.clone(), budget.clone()).unwrap();
+        let second = CopyJob::start(root, parent.path(), files, budget).unwrap();
+        assert!(first.finished().is_none());
+        assert!(second.finished().is_none());
+        assert!(first.thread.borrow().is_none());
+        assert!(second.thread.borrow().is_none());
+        assert_eq!(first.bytes.load(Ordering::Relaxed), 0);
+        second.cancel();
+        assert!(second.finished().unwrap().is_err());
+        assert!(second.thread.borrow().is_none());
+        assert!(!Path::new(&second.destination).join("x").exists());
+        drop(permit);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(result) = first.finished() {
+                result.unwrap();
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(first.bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            std::fs::read(Path::new(&first.destination).join("x")).unwrap(),
+            b"safe"
+        );
+        assert_eq!(std::fs::read(source.path().join("x")).unwrap(), b"safe");
+    }
     #[test]
     fn cleanup_preflights_all_files_and_never_removes_a_different_original() {
         let source = tempfile::tempdir().unwrap();

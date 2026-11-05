@@ -17,6 +17,7 @@ use std::{
 pub struct Directory {
     dir: Arc<Dir>,
     resume: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    bulk_budget: Arc<std::sync::Mutex<Option<Arc<super::relocation::BulkBudget>>>>,
     #[cfg(test)]
     read_calls: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -33,6 +34,44 @@ impl PartialEq for Directory {
 impl Eq for Directory {}
 
 impl Directory {
+    pub(crate) fn set_bulk_budget(&self, budget: Arc<super::relocation::BulkBudget>) {
+        *self
+            .bulk_budget
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(budget);
+    }
+    /// Filesystem-volume identity from the pinned directory handle, never a path prefix.
+    pub(crate) fn volume_key(&self) -> Option<u64> {
+        let directory = self.dir.try_clone().ok()?.into_std_file();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(directory.metadata().ok()?.dev())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // The pinned directory owns this handle throughout the query.
+            if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) }
+                == 0
+            {
+                None
+            } else {
+                Some(u64::from(
+                    unsafe { info.assume_init() }.dwVolumeSerialNumber,
+                ))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = directory;
+            None
+        }
+    }
     #[cfg(test)]
     pub(crate) fn read_calls(&self) -> u64 {
         self.read_calls.load(std::sync::atomic::Ordering::Relaxed)
@@ -54,6 +93,7 @@ impl Directory {
         Dir::open_ambient_dir(path, cap_std::ambient_authority()).map(|dir| Self {
             dir: Arc::new(dir),
             resume: Default::default(),
+            bulk_budget: Default::default(),
             #[cfg(test)]
             read_calls: Default::default(),
         })
@@ -227,6 +267,7 @@ impl Directory {
         self.walk(&parts, false).map(|dir| Self {
             dir: Arc::new(dir),
             resume: Default::default(),
+            bulk_budget: self.bulk_budget.clone(),
             #[cfg(test)]
             read_calls: Default::default(),
         })
@@ -321,6 +362,26 @@ impl Payload {
     }
 }
 impl TorrentStorage for Payload {
+    fn check_admission<'a>(
+        &'a self,
+        cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> librqbit::storage::CheckAdmission<'a> {
+        let budget = self
+            .root
+            .bulk_budget
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let volume = self.root.volume_key();
+        Box::pin(async move {
+            if let Some(budget) = budget {
+                Ok(Box::new(budget.enter_check(volume, cancel).await?)
+                    as librqbit::storage::CheckGuard)
+            } else {
+                Ok(Box::new(()) as librqbit::storage::CheckGuard)
+            }
+        })
+    }
     fn initial_verified_pieces(&self) -> Option<Vec<u8>> {
         self.root
             .resume

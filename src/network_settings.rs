@@ -55,6 +55,7 @@ pub fn options(settings: &ClientSettings) -> Result<SessionOptions, String> {
     };
     // A proxy is not a VPN. Disable incoming and direct UDP discovery paths.
     Ok(SessionOptions {
+        concurrent_init_limit: Some(settings.queue.max_active_checks),
         disable_trackers: settings.privacy.tracker_reporting == TrackerReportingMode::Disabled,
         bind_device_name: (!interface.is_empty()).then(|| interface.to_owned()),
         dht: (proxy.is_empty() && settings.bittorrent.dht).then(Default::default),
@@ -92,6 +93,12 @@ pub fn options(settings: &ClientSettings) -> Result<SessionOptions, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_check_concurrency_reaches_the_engine_initializer() {
+        let mut settings = ClientSettings::default();
+        settings.queue.max_active_checks = 7;
+        assert_eq!(options(&settings).unwrap().concurrent_init_limit, Some(7));
+    }
     #[test]
     fn real_engine_honors_aggregate_caps_and_proxy_peer_routes_without_udp_tracker_leaks() {
         use sha1::{Digest, Sha1};

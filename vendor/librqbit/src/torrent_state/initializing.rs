@@ -187,6 +187,9 @@ impl TorrentStateInitializing {
     }
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
+        // Await shared storage-volume admission before entering a blocking hasher.
+        // Dropping this future releases queued admission on pause or shutdown.
+        let _disk_admission = self.files.check_admission(&self.pause_requested).await?;
         let id: TorrentIdOrHash = self.shared.info_hash.into();
         let bitv_factory = self
             .shared
@@ -204,7 +207,10 @@ impl TorrentStateInitializing {
             if let Some(bits) = self.files.initial_verified_pieces() {
                 Some(BF::from_boxed_slice(bits.into_boxed_slice()).into_dyn())
             } else {
-                bitv_factory.load(id).await.context("error loading have_pieces")?
+                bitv_factory
+                    .load(id)
+                    .await
+                    .context("error loading have_pieces")?
             }
         };
 
@@ -240,13 +246,20 @@ impl TorrentStateInitializing {
             &self.metadata.file_infos,
         );
 
-        let chunk_tracker = ChunkTracker::new(
+        let mut chunk_tracker = ChunkTracker::new(
             have_pieces.into_dyn(),
             selected_pieces,
             *self.metadata.lengths(),
             &self.metadata.file_infos,
         )
         .context("error creating chunk tracker")?;
+        chunk_tracker.configure_selected_files(
+            &self.metadata.file_infos,
+            self.only_files
+                .as_ref()
+                .map(|indices| indices.iter().copied().collect())
+                .as_ref(),
+        );
 
         let hns = chunk_tracker.get_hns();
 

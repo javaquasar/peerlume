@@ -24,6 +24,8 @@ fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
         selected_torrent: 0,
         status_filter: Default::default(),
         name_column: Default::default(),
+        view_cache: Default::default(),
+        metainfo_loader: Default::default(),
         settings: settings.clone(),
         saved_settings: settings.clone(),
         settings_draft: settings.clone(),
@@ -435,4 +437,87 @@ fn empty_filtered_lists_and_extreme_short_windows_keep_the_divider_inside_the_pa
         );
     }
     assert_eq!(app.control.torrents.len(), 5);
+}
+
+#[test]
+fn a_large_torrent_table_materializes_only_viewport_rows_and_reaches_the_last_identity() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(5_000, 1);
+    let size = egui::vec2(1080.0, 720.0);
+    let output = settle(&ctx, &mut app, size);
+    let names = |output: &egui::FullOutput| {
+        output.shapes.iter().filter(|shape|
+        matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.starts_with("Torrent "))).count()
+    };
+    assert!(
+        names(&output) < 60,
+        "Offscreen torrents were materialized: {}",
+        names(&output)
+    );
+    text_rect(&output, "Torrent 000");
+    let top = pane(&ctx);
+    frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![
+            egui::Event::PointerMoved(top.center()),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -1_000_000.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let output = settle(&ctx, &mut app, size);
+    assert!(names(&output) < 60);
+    let last = text_rect(&output, "Torrent 4999");
+    assert!(last.bottom() <= top.bottom());
+    frame(&ctx, &mut app, size, pointer(last.center(), true));
+    frame(&ctx, &mut app, size, pointer(last.center(), false));
+    assert_eq!(app.selected_torrent, 4_999);
+}
+
+#[test]
+fn background_import_preserves_drop_review_order_and_never_adds_without_confirmation() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for name in ["one", "two", "three"] {
+        let path = root.path().join(format!("{name}.torrent"));
+        std::fs::write(
+            &path,
+            format!("d4:infod6:lengthi1e4:name{}:{name}ee", name.len()),
+        )
+        .unwrap();
+        paths.push(path);
+    }
+    let mut app = fixture(1, 1);
+    let original = app.control.torrents[0].info_hashes.clone();
+    app.handle_dropped_files(3, paths);
+    assert!(
+        app.add_dialog.is_none(),
+        "Parsing must run outside the frontend transaction"
+    );
+    assert!(app.metainfo_loader.is_loading());
+    assert_eq!(app.pending_torrent_paths.len(), 2);
+    for expected in ["one", "two", "three"] {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.add_dialog.is_none() {
+            app.poll_metainfo_import();
+            assert!(Instant::now() < deadline, "Import did not open its review");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.add_dialog.as_ref().unwrap().name, expected);
+        assert_eq!(
+            app.control.torrents.len(),
+            1,
+            "Review is not an add acknowledgement"
+        );
+        assert_eq!(app.control.torrents[0].info_hashes, original);
+        app.add_dialog = None;
+        app.open_next_queued_torrent();
+    }
+    assert!(app.pending_torrent_paths.is_empty());
+    assert!(!app.metainfo_loader.is_loading());
 }

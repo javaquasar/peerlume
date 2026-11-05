@@ -1,0 +1,126 @@
+{
+  "architecture": "x86_64",
+  "cases": [
+    {
+      "checkpoint_changed": {
+        "p50_ns": 1364400,
+        "p95_ns": 1503300,
+        "p99_ns": 1503300,
+        "repetitions": 20,
+        "total_ns": 27343800
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 74600,
+        "p95_ns": 90900,
+        "p99_ns": 90900,
+        "repetitions": 20,
+        "total_ns": 1525200
+      },
+      "files_per_torrent": 100,
+      "torrents": 1,
+      "view": {
+        "p50_ns": 500,
+        "p95_ns": 600,
+        "p99_ns": 700,
+        "repetitions": 200,
+        "total_ns": 101200
+      },
+      "view_operation": "repeated_name_sort"
+    },
+    {
+      "checkpoint_changed": {
+        "p50_ns": 1711400,
+        "p95_ns": 1916500,
+        "p99_ns": 1916500,
+        "repetitions": 20,
+        "total_ns": 34712400
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 396700,
+        "p95_ns": 405900,
+        "p99_ns": 405900,
+        "repetitions": 20,
+        "total_ns": 7964500
+      },
+      "files_per_torrent": 100,
+      "torrents": 10,
+      "view": {
+        "p50_ns": 13800,
+        "p95_ns": 14000,
+        "p99_ns": 18500,
+        "repetitions": 200,
+        "total_ns": 2777500
+      },
+      "view_operation": "repeated_name_sort"
+    },
+    {
+      "checkpoint_changed": {
+        "p50_ns": 5230200,
+        "p95_ns": 5856600,
+        "p99_ns": 5856600,
+        "repetitions": 20,
+        "total_ns": 105883400
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 3636900,
+        "p95_ns": 4176500,
+        "p99_ns": 4176500,
+        "repetitions": 20,
+        "total_ns": 73782700
+      },
+      "files_per_torrent": 100,
+      "torrents": 100,
+      "view": {
+        "p50_ns": 50600,
+        "p95_ns": 53500,
+        "p99_ns": 56600,
+        "repetitions": 200,
+        "total_ns": 10168900
+      },
+      "view_operation": "repeated_name_sort"
+    }
+  ],
+  "compiled_inputs_sha256": {
+    "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+    "Cargo.toml": "bf543e53131851951a29f490b349646d79002c884100b364913eba27ec31c850",
+    "src/file_selection.rs": "563807699d78fb4a361156fcba9660d0a920a8f5438195fa6a693b65cec770f1",
+    "src/state.rs": "0ef485cc9955286397c6d687d0ad5ede6faa4d843cecf78706960e2f13ebe8e9",
+    "src/torrent_view.rs": "ae0fe65021f3bb356ed47473ac01f209ef6417f7e4c90d8e14a7b814af1b4748"
+  },
+  "completed": true,
+  "debug_assertions": true,
+  "large_model": {
+    "cached_search": {
+      "p50_ns": 200,
+      "p95_ns": 200,
+      "p99_ns": 1900,
+      "repetitions": 200,
+      "total_ns": 43000
+    },
+    "construction": {
+      "p50_ns": 106342400,
+      "p95_ns": 108101800,
+      "p99_ns": 108101800,
+      "repetitions": 3,
+      "total_ns": 318822400
+    },
+    "files": 100000
+  },
+  "limitations": [
+    "Wall-clock workload, not an allocation or sustained-transfer profiler",
+    "No tracker, peer, session runtime or user profile is opened",
+    "No disk throughput, cold-start or one-second resource peak claim",
+    "Source label is caller supplied; compiled input digests identify the measured source inputs"
+  ],
+  "os": "windows",
+  "package_version": "0.1.0",
+  "resource_samples": {
+    "allocations": null,
+    "cpu_percent": null,
+    "rss_bytes": null
+  },
+  "schema_version": 1,
+  "source_label": "2c5cf1a-baseline",
+  "warmup_view_operations": 3,
+  "workload": "synthetic_frontend_and_checkpoint"
+}

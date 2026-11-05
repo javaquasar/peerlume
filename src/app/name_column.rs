@@ -30,6 +30,44 @@ pub(super) struct NameColumn {
     trailing_space: f32,
     last_layout_width: Option<f32>,
     last_input_frame: Option<u64>,
+    measurements: ColumnMeasurements,
+}
+
+#[derive(Clone, PartialEq)]
+struct MetricKey {
+    state: crate::torrent::TorrentState,
+    done: bool,
+    pending: Option<crate::runtime_status::TransferAction>,
+    down: u64,
+    up: u64,
+    peers: usize,
+    seeds: usize,
+    eta: Option<u64>,
+    ratio: u64,
+}
+
+impl MetricKey {
+    fn of(torrent: &TorrentItem) -> Self {
+        Self {
+            state: torrent.state,
+            done: torrent.completed_successfully(),
+            pending: torrent.runtime.command.pending_action(),
+            down: torrent.download_rate,
+            up: torrent.upload_rate,
+            peers: torrent.peers,
+            seeds: torrent.seeds,
+            eta: torrent.eta_seconds(),
+            ratio: torrent.ratio().to_bits(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ColumnMeasurements {
+    font: Option<egui::FontId>,
+    pixels_per_point: f32,
+    headers: [f32; 6],
+    rows: Vec<Option<(MetricKey, [f32; 6])>>,
 }
 
 pub(super) struct ColumnLayout {
@@ -57,6 +95,52 @@ impl ColumnLayout {
 }
 
 impl NameColumn {
+    pub fn cached_widths(
+        &mut self,
+        ui: &egui::Ui,
+        torrents: &[TorrentItem],
+        filter: StatusFilter,
+    ) -> [f32; 6] {
+        let cache = &mut self.measurements;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let measure = |text: &str| {
+            ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(text.into(), font.clone(), egui::Color32::PLACEHOLDER)
+                    .size()
+                    .x
+                    .ceil()
+            })
+        };
+        if cache.font.as_ref() != Some(&font) || cache.pixels_per_point != pixels_per_point {
+            cache.font = Some(font.clone());
+            cache.pixels_per_point = pixels_per_point;
+            cache.rows.clear();
+            cache.headers = HEADERS.map(|text| measure(text).max(MIN_OTHER_WIDTH));
+        }
+        cache.rows.resize_with(torrents.len(), || None);
+        let mut widths = cache.headers;
+        for (index, torrent) in torrents
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| filter.matches(t))
+        {
+            let key = MetricKey::of(torrent);
+            if cache.rows[index]
+                .as_ref()
+                .is_none_or(|(previous, _)| *previous != key)
+            {
+                cache.rows[index] = Some((key, metrics(torrent).map(|text| measure(&text))));
+            }
+            let (_, row) = cache.rows[index].as_ref().unwrap();
+            for (width, value) in widths.iter_mut().zip(row) {
+                *width = width.max(*value);
+            }
+        }
+        widths
+    }
+
     pub fn from_gap(gap: u32) -> Self {
         Self {
             trailing_space: gap.min(10_000) as f32,
@@ -127,6 +211,7 @@ impl NameColumn {
     }
 }
 
+#[cfg(test)]
 pub(super) fn headers(ui: &mut egui::Ui, width: f32) {
     ui.add_sized(
         [width, 20.0],
@@ -145,6 +230,30 @@ pub(super) fn headers(ui: &mut egui::Ui, width: f32) {
     ui.end_row();
 }
 
+pub(super) fn headers_with_widths(ui: &mut egui::Ui, width: f32, columns: [f32; 6]) {
+    ui.add_sized(
+        [width, 20.0],
+        egui::Label::new(egui::RichText::new("Name").strong())
+            .halign(egui::Align::Min)
+            .truncate(),
+    );
+    ui.add_sized(
+        [PROGRESS_WIDTH, 20.0],
+        egui::Label::new(egui::RichText::new("Progress").strong()).truncate(),
+    );
+    for (title, width) in HEADERS.into_iter().zip(columns) {
+        ui.add_sized(
+            [width, 20.0],
+            egui::Label::new(egui::RichText::new(title).strong()).truncate(),
+        );
+    }
+    ui.end_row();
+}
+
+pub(super) fn reserved_for_widths(ui: &egui::Ui, widths: [f32; 6]) -> f32 {
+    PROGRESS_WIDTH + widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * 7.0
+}
+
 pub(super) fn metrics(torrent: &TorrentItem) -> [String; 6] {
     [
         torrent.status_text(),
@@ -159,6 +268,7 @@ pub(super) fn metrics(torrent: &TorrentItem) -> [String; 6] {
     ]
 }
 
+#[cfg(test)]
 pub(super) fn reserved_width(ui: &egui::Ui, torrents: &[TorrentItem], filter: StatusFilter) -> f32 {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let measure = |text: &str| {

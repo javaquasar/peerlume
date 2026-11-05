@@ -96,11 +96,25 @@ fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
 #[derive(Default)]
 pub struct SessionDatabase {
     torrents: HashMap<TorrentId, ManagedTorrentHandle>,
+    by_hash: HashMap<Id20, TorrentId>,
 }
 
 impl SessionDatabase {
     fn add_torrent(&mut self, torrent: ManagedTorrentHandle, id: TorrentId) {
+        self.by_hash.insert(torrent.info_hash(), id);
         self.torrents.insert(id, torrent);
+    }
+
+    fn remove_torrent(&mut self, id: TorrentId) -> Option<ManagedTorrentHandle> {
+        let removed = self.torrents.remove(&id)?;
+        if self.by_hash.get(&removed.info_hash()) == Some(&id) {
+            self.by_hash.remove(&removed.info_hash());
+        }
+        Some(removed)
+    }
+
+    fn get_hash(&self, hash: Id20) -> Option<ManagedTorrentHandle> {
+        self.torrents.get(self.by_hash.get(&hash)?).cloned()
     }
 }
 
@@ -807,7 +821,10 @@ impl Session {
                 max_active_downloads: Default::default(),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
-                proxy_only: opts.connect.as_ref().is_some_and(|options|options.proxy_url.is_some()),
+                proxy_only: opts
+                    .connect
+                    .as_ref()
+                    .is_some_and(|options| options.proxy_url.is_some()),
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
@@ -1330,14 +1347,11 @@ impl Session {
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
-            if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
-                if t.info_hash() == info_hash || *eid == id {
-                    Some((*eid, t.clone()))
-                } else {
-                    None
-                }
-            }) {
-                return Ok(AddTorrentResponse::AlreadyManaged(id, handle));
+            if let Some(handle) = g
+                .get_hash(info_hash)
+                .or_else(|| g.torrents.get(&id).cloned())
+            {
+                return Ok(AddTorrentResponse::AlreadyManaged(handle.id(), handle));
             }
 
             let span = debug_span!(parent: self.rs(), "torrent", id);
@@ -1397,7 +1411,7 @@ impl Session {
         if let Some(p) = self.persistence.as_ref()
             && let Err(e) = p.store(id, &managed_torrent).await
         {
-            self.db.write().torrents.remove(&id);
+            self.db.write().remove_torrent(id);
             return Err(e);
         }
 
@@ -1417,13 +1431,7 @@ impl Session {
     pub fn get(&self, id: TorrentIdOrHash) -> Option<ManagedTorrentHandle> {
         match id {
             TorrentIdOrHash::Id(id) => self.db.read().torrents.get(&id).cloned(),
-            TorrentIdOrHash::Hash(id) => self.db.read().torrents.iter().find_map(|(_, v)| {
-                if v.info_hash() == id {
-                    Some(v.clone())
-                } else {
-                    None
-                }
-            }),
+            TorrentIdOrHash::Hash(id) => self.db.read().get_hash(id),
         }
     }
 
@@ -1433,22 +1441,15 @@ impl Session {
             TorrentIdOrHash::Hash(h) => self
                 .db
                 .read()
-                .torrents
-                .values()
-                .find_map(|v| {
-                    if v.info_hash() == h {
-                        Some(v.id())
-                    } else {
-                        None
-                    }
-                })
+                .by_hash
+                .get(&h)
+                .copied()
                 .context("no such torrent in db")?,
         };
         let removed = self
             .db
             .write()
-            .torrents
-            .remove(&id)
+            .remove_torrent(id)
             .with_context(|| format!("torrent with id {id} did not exist"))?;
 
         if let Err(e) = removed.pause() {

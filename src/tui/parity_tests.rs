@@ -38,7 +38,7 @@ fn focus_search_marks_and_confirmation_use_ids_not_row_positions() {
     assert!(app.run_command("search other").is_ok());
     assert!(app.marked.is_empty());
     assert_eq!(app.selected().unwrap().info_hashes, ["v1: other"]);
-    assert_eq!(app.visible_indices(), [0]);
+    assert_eq!(app.visible_indices().as_slice(), [0]);
     key(&mut app, KeyCode::Tab);
     assert_eq!(app.focus, Focus::Details);
     let row = app.selected_torrent;
@@ -367,4 +367,29 @@ fn live_queue_admits_high_priority_and_releases_a_slot_on_pause() {
         engine.max_active_downloads.load(Ordering::Relaxed) == 0
     });
     assert!(handles[0].download_admitted());
+}
+
+#[test]
+fn terminal_import_reads_in_background_and_keeps_review_and_cancel_explicit() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("review.torrent");
+    std::fs::write(&path, b"d4:infod6:lengthi1e4:name6:reviewee").unwrap();
+    let mut app = app();
+    let count = app.control.torrents.len();
+    let message = app.prepare_torrent_add(path.clone()).unwrap();
+    assert!(message.contains("background"));
+    assert!(app.pending_add.is_none());
+    assert!(app.metainfo_loader.is_loading());
+    wait_for_tui(&mut app, |app| app.pending_add.is_some());
+    assert_eq!(app.pending_add.as_ref().unwrap().0, path);
+    assert_eq!(app.input.as_ref().unwrap().kind, PromptKind::DownloadMode);
+    assert_eq!(app.control.torrents.len(), count);
+    key(&mut app, KeyCode::Esc);
+    assert!(app.pending_add.is_none());
+    assert_eq!(app.control.torrents.len(), count);
+    app.prepare_torrent_add(root.path().join("missing.torrent"))
+        .unwrap();
+    wait_for_tui(&mut app, |app| !app.metainfo_loader.is_loading());
+    assert!(app.status.contains("Could not open torrent"));
+    assert_eq!(app.control.torrents.len(), count);
 }

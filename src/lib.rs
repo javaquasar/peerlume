@@ -19,6 +19,8 @@ mod live_history;
 pub mod magnet;
 pub mod metadata;
 pub mod metainfo;
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub mod metainfo_loader;
 pub mod network_settings;
 pub mod piece_map;
 #[cfg(feature = "gui")]

@@ -82,6 +82,15 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
             }
             SessionNotice::SettingsApplied { id }
         }
+        SessionEvent::FileSnapshot { id, progress } => {
+            if let Some(torrent) = find_torrent_mut(torrents, &id) {
+                for (index, bytes) in progress.into_iter().enumerate() {
+                    torrent.files.set_file_downloaded(index, bytes);
+                }
+                torrent.downloaded_bytes = torrent.files.selected_downloaded();
+            }
+            SessionNotice::None
+        }
         SessionEvent::FilesApplied { id, only_files } => {
             if let Some(torrent) = find_torrent_mut(torrents, &id) {
                 let selected: std::collections::HashSet<_> = only_files.into_iter().collect();
@@ -236,8 +245,14 @@ pub fn apply_session_event(torrents: &mut [TorrentItem], event: SessionEvent) ->
                 ) {
                     return SessionNotice::None;
                 }
-                for (index, progress) in file_progress.into_iter().enumerate() {
-                    torrent.files.set_file_downloaded(index, progress);
+                if file_progress.is_empty() {
+                    torrent
+                        .files
+                        .set_selected_downloaded_summary(downloaded_bytes);
+                } else {
+                    for (index, progress) in file_progress.into_iter().enumerate() {
+                        torrent.files.set_file_downloaded(index, progress);
+                    }
                 }
                 torrent.downloaded_bytes = if torrent.files.files().is_empty() {
                     downloaded_bytes
@@ -476,6 +491,7 @@ pub fn torrent_from_record(record: TorrentRecord, settings: &ClientSettings) -> 
         )
     }));
     files.set_high_priority(&high);
+    files.set_selected_downloaded_summary(record.downloaded_bytes);
     let downloaded_bytes = files.selected_downloaded();
     let mut info_hashes = Vec::new();
     if let Some(hash) = record.info_hash_v1 {
@@ -563,6 +579,15 @@ impl ClientBackend {
 
     pub fn journal(&self) -> Option<&crate::announce_journal::AnnounceJournal> {
         self.session_runtime.as_ref().map(|s| &s.journal)
+    }
+
+    pub(crate) fn set_detail_interest(
+        &self,
+        interest: Option<(String, crate::session::DetailInterest)>,
+    ) {
+        if let Some(runtime) = &self.session_runtime {
+            runtime.set_detail_interest(interest);
+        }
     }
     pub fn offline() -> Self {
         Self {
@@ -729,6 +754,88 @@ impl ClientBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn summary_stats_keep_selected_totals_without_inventing_file_progress() {
+        let mut items = vec![torrent()];
+        items[0].files = FileSelectionModel::from_files([("a".into(), 100), ("b".into(), 100)]);
+        let event = |progress| SessionEvent::Stats {
+            id: "v1: abc".into(),
+            downloaded_bytes: 150,
+            uploaded_bytes: 0,
+            download_rate: 10,
+            upload_rate: 0,
+            file_progress: progress,
+            peers: 1,
+            finished: false,
+            paused: false,
+        };
+        apply_session_event(&mut items, event(vec![]));
+        assert_eq!(items[0].downloaded_bytes, 150);
+        assert_eq!(items[0].files.selected_downloaded(), 150);
+        assert!(
+            items[0]
+                .files
+                .files()
+                .iter()
+                .all(|file| file.downloaded_bytes == 0)
+        );
+        apply_session_event(&mut items, event(vec![100, 50]));
+        assert_eq!(items[0].downloaded_bytes, 150);
+        assert_eq!(items[0].files.files()[0].downloaded_bytes, 100);
+        assert_eq!(items[0].files.files()[1].downloaded_bytes, 50);
+    }
+
+    #[test]
+    fn restore_keeps_saved_aggregate_but_does_not_invent_details_or_verification() {
+        let mut item = torrent_to_record(&torrent(), None);
+        item.downloaded_bytes = 75;
+        item.files[0].downloaded_bytes = 10;
+        let restored = torrent_from_record(item, &ClientSettings::default());
+        assert_eq!(restored.downloaded_bytes, 75);
+        assert_eq!(restored.files.selected_downloaded(), 75);
+        assert_eq!(restored.files.files()[0].downloaded_bytes, 10);
+        assert_eq!(
+            restored.completion,
+            crate::completion::CompletionStatus::Pending
+        );
+    }
+
+    #[test]
+    fn reliable_file_snapshot_precedes_selection_ack_without_a_files_subscription() {
+        let mut items = vec![torrent()];
+        items[0].files = FileSelectionModel::from_files([("a".into(), 100), ("b".into(), 100)]);
+        items[0].files.set_selected_downloaded_summary(150);
+        items[0].downloaded_bytes = 150;
+        assert_eq!(
+            apply_session_event(
+                &mut items,
+                SessionEvent::FileSnapshot {
+                    id: "v1: abc".into(),
+                    progress: vec![100, 50],
+                }
+            ),
+            SessionNotice::None
+        );
+        assert_eq!(
+            apply_session_event(
+                &mut items,
+                SessionEvent::FilesApplied {
+                    id: "v1: abc".into(),
+                    only_files: vec![0],
+                }
+            ),
+            SessionNotice::SettingsApplied {
+                id: "v1: abc".into()
+            }
+        );
+        assert_eq!(items[0].downloaded_bytes, 100);
+        assert_eq!(items[0].files.selected_downloaded(), 100);
+        let saved = torrent_to_record(&items[0], None);
+        assert_eq!(saved.downloaded_bytes, 100);
+        assert_eq!(saved.files[0].downloaded_bytes, 100);
+        assert!(!saved.files[1].selected);
+    }
 
     #[test]
     fn restore_failure_has_one_redacted_frontend_message_without_erasing_records() {

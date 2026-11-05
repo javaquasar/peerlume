@@ -48,6 +48,7 @@ pub struct Controller {
     pending_removals: std::collections::BTreeSet<String>,
     notices: std::collections::VecDeque<SessionNotice>,
     last_checkpoint: std::time::Instant,
+    frontend_revision: u64,
 }
 
 impl Controller {
@@ -64,6 +65,7 @@ impl Controller {
             pending_removals: Default::default(),
             notices: Default::default(),
             last_checkpoint: std::time::Instant::now(),
+            frontend_revision: 0,
         };
         controller.publish();
         controller
@@ -72,6 +74,15 @@ impl Controller {
     /// A read-only, independently polled observer. Dropping it cannot stop transfers.
     pub fn read_handle(&self) -> ReadHandle {
         self.reader.clone()
+    }
+
+    /// Local presentation wake-up token, independent of protocol/CAS revisions.
+    pub fn frontend_revision(&self) -> u64 {
+        self.frontend_revision
+    }
+
+    pub fn set_detail_interest(&self, interest: Option<(String, crate::session::DetailInterest)>) {
+        self.backend.set_detail_interest(interest);
     }
 
     /// Owner-side pump; headless in-project hosts may drive it without a frontend.
@@ -86,6 +97,7 @@ impl Controller {
     }
 
     fn apply(&mut self, event: SessionEvent) -> SessionNotice {
+        self.frontend_revision = self.frontend_revision.wrapping_add(1);
         let retry_acknowledged = matches!(&event, SessionEvent::Added { id } if self.torrents.iter()
             .any(|torrent| torrent.info_hashes.join(";") == *id
                 && torrent.runtime.command.pending_action() == Some(crate::runtime_status::TransferAction::Start)));
@@ -93,6 +105,7 @@ impl Controller {
             && !matches!(
                 event,
                 SessionEvent::Stats { .. }
+                    | SessionEvent::FileSnapshot { .. }
                     | SessionEvent::NetworkTotals { .. }
                     | SessionEvent::Peers { .. }
                     | SessionEvent::Storage {
@@ -119,6 +132,7 @@ impl Controller {
             | SessionEvent::Added { id }
             | SessionEvent::StateChanged { id, .. }
             | SessionEvent::Stats { id, .. }
+            | SessionEvent::FileSnapshot { id, .. }
             | SessionEvent::Error { id, .. }
             | SessionEvent::Removed { id } => Some(id.clone()),
             SessionEvent::VerifyAfterDownload { id, .. }

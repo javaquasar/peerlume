@@ -1,6 +1,7 @@
 //! Ratatui frontend backed by the same client model and component schema as egui.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -38,6 +39,7 @@ use crate::{
     file_selection::FileSelectionModel,
     magnet::MagnetLink,
     metainfo::{self, TorrentMetainfo},
+    metainfo_loader::MetainfoLoader,
     settings::ClientSettings,
     state::{StoredTrackerAuditProfile, StoredTrackerAuditStep},
     torrent::{EffectiveTorrentSettings, TorrentItem, TorrentOverrides, TorrentState},
@@ -84,6 +86,9 @@ struct InputPrompt {
 }
 
 pub struct TuiApp {
+    view_cache: RefCell<crate::torrent_view::ViewCache>,
+    metainfo_loader: MetainfoLoader,
+    ui_dirty: bool,
     focus: Focus,
     split_percent: u16,
     search: String,
@@ -160,6 +165,9 @@ impl TuiApp {
     ) -> Self {
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
         Self {
+            view_cache: Default::default(),
+            metainfo_loader: Default::default(),
+            ui_dirty: true,
             focus: Focus::Torrents,
             split_percent: if settings.ui.torrent_pane_percent == 0 {
                 43
@@ -200,7 +208,15 @@ impl TuiApp {
     }
 
     fn poll(&mut self) {
-        while let Some(notice) = self.control.poll_next() {
+        let started = Instant::now();
+        for _ in 0..256 {
+            if started.elapsed() >= Duration::from_millis(4) {
+                break;
+            }
+            let Some(notice) = self.control.poll_next() else {
+                break;
+            };
+            self.ui_dirty |= !matches!(notice, SessionNotice::None);
             match notice {
                 SessionNotice::SettingsApplied { id } | SessionNotice::StateApplied { id } => {
                     if !self.control.has_confirmed_update(&id) {
@@ -232,12 +248,43 @@ impl TuiApp {
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok());
         if let Some(message) = audit_message {
+            self.ui_dirty = true;
             self.status = message.clone();
             self.push_log(message);
             self.audit_result = None;
             self.audit_cancel = None;
         }
+        if self.input.is_none()
+            && let Some(loaded) = self.metainfo_loader.poll()
+        {
+            self.ui_dirty = true;
+            self.status = match loaded.result {
+                Ok(metainfo) => self.review_torrent_add(loaded.path, metainfo),
+                Err(error) => format!("Could not open torrent: {error}"),
+            };
+        }
         self.clamp_selection();
+    }
+
+    fn refresh_detail_interest(&mut self) {
+        let interest = if self.page == MainPage::Torrents && !self.agent_panel.open {
+            self.selected().map(|torrent| {
+                (
+                    torrent.info_hashes.join(";"),
+                    crate::session::DetailInterest {
+                        files: matches!(
+                            self.details_tab,
+                            TorrentDetailsTab::Files | TorrentDetailsTab::Pieces
+                        ),
+                        peers: self.details_tab == TorrentDetailsTab::Peers,
+                    },
+                )
+            })
+        } else {
+            None
+        };
+        self.control
+            .set_detail_interest(interest.filter(|(_, detail)| detail.files || detail.peers));
     }
 
     fn push_log(&mut self, message: impl Into<String>) {
@@ -271,6 +318,12 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc && self.metainfo_loader.is_loading() {
+            self.metainfo_loader.cancel();
+            self.status = "Import cancelled".into();
+            self.ui_dirty = true;
+            return;
+        }
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c')
@@ -786,7 +839,12 @@ impl TuiApp {
         {
             return Err("Path must point to a .torrent file".into());
         }
-        let metainfo = TorrentMetainfo::load(&path)?;
+        self.pending_add = None;
+        self.metainfo_loader.start(path)?;
+        Ok("Reading torrent metadata in the background; Esc cancels".into())
+    }
+
+    fn review_torrent_add(&mut self, path: PathBuf, metainfo: TorrentMetainfo) -> String {
         self.pending_add = Some((path, metainfo));
         self.pending_verify_after_download = false;
         self.pending_repair = Default::default();
@@ -807,7 +865,7 @@ impl TuiApp {
             "Download mode · Enter confirms · Esc cancels",
             "1".into(),
         );
-        Ok(choices)
+        choices
     }
 
     fn confirm_torrent_mode(&mut self, value: &str) -> Result<String, String> {
@@ -1914,6 +1972,9 @@ pub fn run() -> io::Result<()> {
     let owner = Arc::new(std::sync::Mutex::new(app));
     let _host =
         crate::control::host::Host::start(owner.clone(), |app| &mut app.control, directory)?;
+    let mut last_draw = Instant::now();
+    let mut drawn_revision = None;
+    let mut input_changed = true;
     loop {
         {
             let mut app = owner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1921,21 +1982,40 @@ pub fn run() -> io::Result<()> {
                 break;
             }
             app.poll();
-            terminal.terminal.draw(|frame| {
-                if app.agent_panel.open {
-                    app.agent_panel.render(&app.control, frame);
-                } else {
-                    app.render(frame);
-                }
-            })?;
+            app.refresh_detail_interest();
+            let revision = app.control.frontend_revision();
+            let pending = app.metainfo_loader.is_loading() || app.audit_result.is_some();
+            let interval =
+                crate::torrent_view::refresh_interval(&app.control.torrents, pending, false);
+            let timed_refresh = (pending
+                || crate::torrent_view::needs_live_refresh(&app.control.torrents))
+                && last_draw.elapsed() >= interval;
+            if input_changed || app.ui_dirty || drawn_revision != Some(revision) || timed_refresh {
+                terminal.terminal.draw(|frame| {
+                    if app.agent_panel.open {
+                        app.agent_panel.render(&app.control, frame);
+                    } else {
+                        app.render(frame);
+                    }
+                })?;
+                drawn_revision = Some(revision);
+                last_draw = Instant::now();
+                input_changed = false;
+                app.ui_dirty = false;
+            }
         }
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            owner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle_key(key);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    input_changed = true;
+                    owner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .handle_key(key);
+                }
+                Event::Resize(_, _) => input_changed = true,
+                _ => {}
+            }
         }
     }
     Ok(())

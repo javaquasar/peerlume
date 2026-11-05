@@ -1,0 +1,132 @@
+{
+  "architecture": "x86_64",
+  "cases": [
+    {
+      "checkpoint_changed": {
+        "p50_ns": 2947200,
+        "p95_ns": 4612000,
+        "p99_ns": 4612000,
+        "repetitions": 20,
+        "total_ns": 51087100
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 1200,
+        "p95_ns": 2100,
+        "p99_ns": 2100,
+        "repetitions": 20,
+        "total_ns": 25500
+      },
+      "files_per_torrent": 100,
+      "torrents": 1,
+      "view": {
+        "p50_ns": 300,
+        "p95_ns": 400,
+        "p99_ns": 400,
+        "repetitions": 200,
+        "total_ns": 68700
+      },
+      "view_implementation": "retained_view_cache",
+      "view_operation": "repeated_name_sort",
+      "view_rebuilds": 1
+    },
+    {
+      "checkpoint_changed": {
+        "p50_ns": 1695600,
+        "p95_ns": 6992100,
+        "p99_ns": 6992100,
+        "repetitions": 20,
+        "total_ns": 48409700
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 7600,
+        "p95_ns": 8700,
+        "p99_ns": 8700,
+        "repetitions": 20,
+        "total_ns": 153500
+      },
+      "files_per_torrent": 100,
+      "torrents": 10,
+      "view": {
+        "p50_ns": 1900,
+        "p95_ns": 1900,
+        "p99_ns": 2200,
+        "repetitions": 200,
+        "total_ns": 375900
+      },
+      "view_implementation": "retained_view_cache",
+      "view_operation": "repeated_name_sort",
+      "view_rebuilds": 1
+    },
+    {
+      "checkpoint_changed": {
+        "p50_ns": 3382200,
+        "p95_ns": 6693300,
+        "p99_ns": 6693300,
+        "repetitions": 20,
+        "total_ns": 68586600
+      },
+      "checkpoint_unchanged": {
+        "p50_ns": 66500,
+        "p95_ns": 70100,
+        "p99_ns": 70100,
+        "repetitions": 20,
+        "total_ns": 1339100
+      },
+      "files_per_torrent": 100,
+      "torrents": 100,
+      "view": {
+        "p50_ns": 16600,
+        "p95_ns": 16800,
+        "p99_ns": 18400,
+        "repetitions": 200,
+        "total_ns": 3335300
+      },
+      "view_implementation": "retained_view_cache",
+      "view_operation": "repeated_name_sort",
+      "view_rebuilds": 1
+    }
+  ],
+  "compiled_inputs_sha256": {
+    "Cargo.lock": "7490db1d8bef0b5d964b3e33b6788c8796ae4cbf89d2d0335b8027d77394d47f",
+    "Cargo.toml": "0f80bab736286a6c688bf4e92175ee9a423be51e3fd11b05df18632d6964f48a",
+    "src/file_selection.rs": "ecbf5f319f5acc3212c60237c46ad3518c9506d4772432e181cc40e70b451e29",
+    "src/state.rs": "ee35fb7f5092cddc2d73a557aca24aa20e5ddaefecdd629750628787e66de9a1",
+    "src/torrent_view.rs": "54eea7d278a33b66f94e4fd97096db38b7ba00abb0225aff5ee9240eaa8266bf"
+  },
+  "completed": true,
+  "debug_assertions": true,
+  "large_model": {
+    "cached_search": {
+      "p50_ns": 200,
+      "p95_ns": 200,
+      "p99_ns": 300,
+      "repetitions": 200,
+      "total_ns": 38900
+    },
+    "construction": {
+      "p50_ns": 103879400,
+      "p95_ns": 104275900,
+      "p99_ns": 104275900,
+      "repetitions": 3,
+      "total_ns": 311959900
+    },
+    "files": 100000
+  },
+  "limitations": [
+    "Wall-clock workload, not an allocation or sustained-transfer profiler",
+    "No tracker, peer, session runtime or user profile is opened",
+    "No disk throughput, cold-start or one-second resource peak claim",
+    "Source label is caller supplied; compiled input digests identify the measured source inputs"
+  ],
+  "os": "windows",
+  "package_version": "0.1.0",
+  "resource_samples": {
+    "allocations": null,
+    "cpu_percent": null,
+    "rss_bytes": null
+  },
+  "schema_version": 1,
+  "source_label": "0.2.0-optimized-working-tree-development-run-2",
+  "warmup_view_operations": 3,
+  "workload": "synthetic_frontend_and_checkpoint"
+}

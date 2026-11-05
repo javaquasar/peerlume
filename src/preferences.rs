@@ -174,6 +174,12 @@ fn show_downloads(ui: &mut egui::Ui, settings: &mut ClientSettings) {
 fn show_queue(ui: &mut egui::Ui, settings: &mut ClientSettings) {
     let value = &mut settings.queue;
     ui.heading("Queue");
+    number_row(
+        ui,
+        "Maximum simultaneous checks (restart required)",
+        &mut value.max_active_checks,
+        1..=32,
+    );
     ui.checkbox(&mut value.enabled, "Enable download queue");
     ui.add_enabled_ui(value.enabled, |ui| {
         number_row(
@@ -181,12 +187,6 @@ fn show_queue(ui: &mut egui::Ui, settings: &mut ClientSettings) {
             "Maximum active downloads",
             &mut value.max_active_downloads,
             1..=1000,
-        );
-        number_row(
-            ui,
-            "Maximum simultaneous checks",
-            &mut value.max_active_checks,
-            1..=64,
         );
         ui.checkbox(&mut value.add_to_top, "Add new torrents to top of queue");
         ui.checkbox(
@@ -576,6 +576,21 @@ fn show_privacy(
 fn show_storage(ui: &mut egui::Ui, settings: &mut ClientSettings) {
     let value = &mut settings.storage;
     ui.heading("Disk and cache");
+    group(ui, "Bulk disk operations", |ui| {
+        number_row(
+            ui,
+            "Maximum active bulk jobs",
+            &mut value.max_active_bulk_jobs,
+            1..=32,
+        );
+        u64_row(
+            ui,
+            "Bulk disk I/O limit KiB/s (0 = unlimited)",
+            &mut value.bulk_io_limit_kib,
+            0..=u64::from(u32::MAX / 1024),
+        );
+        ui.label("Bulk limits require an application restart. Download and upload rate limits are separate.");
+    });
     group(ui, "Cache", |ui| {
         u64_row(
             ui,
