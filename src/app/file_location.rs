@@ -37,9 +37,20 @@ pub(super) fn context_menu_extra(
 #[derive(Default)]
 pub(super) struct Navigator {
     pending: Option<Receiver<Result<String, String>>>,
+    last_error: Option<String>,
 }
 
 impl Navigator {
+    pub(super) fn take_error(&mut self) -> Option<String> {
+        self.last_error.take()
+    }
+
+    fn status(&mut self, result: Result<String, String>) -> String {
+        if let Err(error) = &result {
+            self.last_error = Some(error.clone());
+        }
+        navigation_status(result)
+    }
     pub(super) fn is_busy(&self) -> bool {
         self.pending.is_some()
     }
@@ -63,7 +74,7 @@ impl Navigator {
         }
         let location = match location {
             Ok(location) => location,
-            Err(error) => return navigation_status(Err(error)),
+            Err(error) => return self.status(Err(error)),
         };
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
@@ -83,7 +94,7 @@ impl Navigator {
                 self.pending = Some(receiver);
                 "Opening file location...".into()
             }
-            Err(error) => navigation_status(Err(error.to_string())),
+            Err(error) => self.status(Err(error.to_string())),
         }
     }
 
@@ -96,7 +107,7 @@ impl Navigator {
             }
         };
         self.pending = None;
-        Some(navigation_status(result))
+        Some(self.status(result))
     }
 }
 
@@ -330,6 +341,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut navigator = Navigator {
             pending: Some(receiver),
+            ..Default::default()
         };
         assert!(navigator.poll().is_none());
         assert!(navigator.start(Err("unused".into())).contains("pending"));
@@ -354,6 +366,42 @@ mod tests {
     fn receiver_after_worker_exit() -> Receiver<Result<String, String>> {
         let (_, receiver) = mpsc::channel();
         receiver
+    }
+
+    #[test]
+    fn invalid_source_and_disconnected_worker_retain_typed_errors_once_without_opening_a_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut navigator = Navigator::default();
+        navigator.reveal_source(&root.path().join("missing.torrent"));
+        assert_eq!(
+            navigator.take_error().as_deref(),
+            Some("Source .torrent file is not on disk")
+        );
+        assert!(navigator.take_error().is_none());
+        navigator.pending = Some(receiver_after_worker_exit());
+        assert!(navigator.poll().unwrap().contains("stopped unexpectedly"));
+        assert_eq!(
+            navigator.take_error().as_deref(),
+            Some("Desktop navigation worker stopped unexpectedly")
+        );
+        assert!(navigator.take_error().is_none());
+    }
+
+    #[test]
+    fn a_later_success_message_does_not_erase_an_unconsumed_navigation_error() {
+        let mut navigator = Navigator::default();
+        navigator.start(Err("Original failure".into()));
+        let (sender, receiver) = mpsc::channel();
+        navigator.pending = Some(receiver);
+        sender
+            .send(Ok("Later successful navigation".into()))
+            .unwrap();
+        assert_eq!(
+            navigator.poll().as_deref(),
+            Some("Later successful navigation")
+        );
+        assert_eq!(navigator.take_error().as_deref(), Some("Original failure"));
+        assert!(navigator.take_error().is_none());
     }
 
     #[cfg(unix)]

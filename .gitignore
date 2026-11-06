@@ -11,3 +11,5 @@
 /long-soak-results
 /continuous-results
 __pycache__/
+/.tools/gui-coverage/
+/.tools/coverage-gui/

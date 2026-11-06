@@ -41,4 +41,4 @@ pub(super) fn details(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 mod trash_plan;
 use trash_plan::PreparedTrash;
 #[cfg(test)]
+mod file_revision_tests;
+#[cfg(test)]
 mod tests;
 
 pub struct Server {
@@ -395,9 +397,10 @@ impl Service {
                 offset,
                 limit,
                 revision,
+                file_revision,
                 paths,
             } => {
-                check_revision(&owner, &id, revision)?;
+                check_file_revision(&mut owner, &id, revision, file_revision)?;
                 let index = owner.torrent_index(&id).ok_or(Error::Stale)?;
                 let item = &owner.torrents[index];
                 let total = item.files.file_count();
@@ -431,17 +434,34 @@ impl Service {
                             .collect(),
                     }
                 };
-                for file in &mut page.files {
-                    if let Some(state) = item.files.file_state(file.index as usize) {
-                        file.size_bytes = state.size_bytes;
-                        file.downloaded_bytes = state.downloaded_bytes;
-                        file.selected = state.selected;
-                        file.priority = i32::from(state.high_priority);
-                    }
+                let maximum_end = offset.saturating_add(limit).min(total);
+                let end = offset.saturating_add(page.files.len());
+                if page.total != total
+                    || page.offset != offset
+                    || end > maximum_end
+                    || (end == offset && offset < total)
+                    || (!paths && end != maximum_end)
+                    || page.next_offset != (end < total).then_some(end)
+                {
+                    return Err(Error::Stale);
                 }
+                for (index, file) in (offset..end).zip(&mut page.files) {
+                    if file.index as usize != index {
+                        return Err(Error::Stale);
+                    }
+                    let state = item.files.file_state(index).ok_or(Error::Stale)?;
+                    file.size_bytes = state.size_bytes;
+                    file.downloaded_bytes = state.downloaded_bytes;
+                    file.selected = state.selected;
+                    file.priority = i32::from(state.high_priority);
+                }
+                // The owner mutex spans SQL path loading and canonical overlay.
+                // Never return pages under a generation other than the caller's.
+                check_file_revision(&mut owner, &id, revision, file_revision)?;
                 Ok(Reply::Files(FilePage {
                     id,
                     revision,
+                    file_revision,
                     total: page.total,
                     next_offset: page.next_offset,
                     files: page.files,
@@ -452,6 +472,11 @@ impl Service {
                 command,
                 revision,
             } => {
+                if matches!(command, crate::control::TorrentCommand::SetFiles(_)) {
+                    return Err(Error::Failed(
+                        "File selection requires a native file generation fence".into(),
+                    ));
+                }
                 let remove = matches!(command, crate::control::TorrentCommand::Remove);
                 let accepted = owner
                     .submit(&id, command, revision)
@@ -465,20 +490,27 @@ impl Service {
                 id,
                 files,
                 revision,
-            } => owner
-                .submit(
-                    &id,
-                    crate::control::TorrentCommand::SetFiles(files.indices()?),
-                    revision,
-                )
-                .map(Reply::Accepted)
-                .map_err(Error::Command),
+                file_revision,
+            } => {
+                check_file_revision(&mut owner, &id, revision, file_revision)?;
+                check_file_count(&mut owner, &id, &files)?;
+                owner
+                    .submit(
+                        &id,
+                        crate::control::TorrentCommand::SetFiles(files.indices()?),
+                        Some(revision),
+                    )
+                    .map(Reply::Accepted)
+                    .map_err(Error::Command)
+            }
             Action::Priorities {
                 id,
                 files,
                 revision,
+                file_revision,
             } => {
-                check_revision(&owner, &id, revision)?;
+                check_file_revision(&mut owner, &id, revision, file_revision)?;
+                check_file_count(&mut owner, &id, &files)?;
                 let next = next_native_revision(&owner)?;
                 owner
                     .set_file_priorities(&id, files.indices()?)
@@ -511,7 +543,11 @@ impl Service {
                         owner.select_storage(&id, directory, copy)
                     }
                     StorageAction::Cancel => owner.cancel_storage(&id),
-                    StorageAction::Priorities { high } => owner.set_file_priorities(&id, high),
+                    StorageAction::Priorities { .. } => {
+                        return Err(Error::Failed(
+                            "File priorities require a native file generation fence".into(),
+                        ));
+                    }
                     StorageAction::Cleanup => owner.remove_copy_originals(&id),
                     StorageAction::Move { parent } => owner.move_storage(&id, parent),
                 }
@@ -703,6 +739,31 @@ fn check_revision(owner: &Controller, id: &str, revision: u64) -> Result<(), Err
     }
     if owner.is_busy(id) {
         return Err(Error::Busy);
+    }
+    Ok(())
+}
+
+fn check_file_revision(
+    owner: &mut Controller,
+    id: &str,
+    revision: u64,
+    file_revision: u64,
+) -> Result<(), Error> {
+    check_revision(owner, id, revision)?;
+    let index = owner.torrent_index(id).ok_or(Error::Stale)?;
+    if file_revision == 0
+        || file_revision == u64::MAX
+        || owner.torrents[index].files.metadata_revision() != file_revision
+    {
+        return Err(Error::Stale);
+    }
+    Ok(())
+}
+
+fn check_file_count(owner: &mut Controller, id: &str, files: &PackedIndices) -> Result<(), Error> {
+    let index = owner.torrent_index(id).ok_or(Error::Stale)?;
+    if files.count != owner.torrents[index].files.file_count() {
+        return Err(Error::Stale);
     }
     Ok(())
 }

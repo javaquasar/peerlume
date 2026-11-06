@@ -131,6 +131,7 @@ pub enum Action {
         offset: usize,
         limit: usize,
         revision: u64,
+        file_revision: u64,
         paths: bool,
     },
     Mutate {
@@ -141,12 +142,14 @@ pub enum Action {
     Selection {
         id: String,
         files: PackedIndices,
-        revision: Option<u64>,
+        revision: u64,
+        file_revision: u64,
     },
     Priorities {
         id: String,
         files: PackedIndices,
         revision: u64,
+        file_revision: u64,
     },
     Add(NewTorrent),
     Retry {
@@ -258,6 +261,8 @@ pub enum Error {
     Busy,
     Command(CommandError),
     Failed(String),
+    /// The request may have reached the owner without a verifiable reply.
+    Transport(String),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -272,7 +277,7 @@ impl std::fmt::Display for Error {
             Self::TooLarge => f.write_str("Native frontend frame exceeds its bounded limit"),
             Self::Busy => f.write_str("Background owner is busy; retry after refreshing"),
             Self::Command(error) => error.fmt(f),
-            Self::Failed(message) => f.write_str(message),
+            Self::Failed(message) | Self::Transport(message) => f.write_str(message),
         }
     }
 }
@@ -300,6 +305,7 @@ pub struct Page {
 pub struct FilePage {
     pub id: String,
     pub revision: u64,
+    pub file_revision: u64,
     pub total: usize,
     pub next_offset: Option<usize>,
     pub files: Vec<StoredFile>,
@@ -308,6 +314,7 @@ pub struct FilePage {
 pub struct NativeTorrent {
     pub item: TorrentItem,
     pub command_revision: u64,
+    pub file_revision: u64,
     pub durable: bool,
     pub file_updates: Option<CompactFileUpdate>,
 }
@@ -341,6 +348,7 @@ pub struct WireTorrent {
     pub seeds: usize,
     pub runtime: RuntimeWire,
     pub command_revision: u64,
+    pub file_revision: u64,
     pub durable: bool,
 }
 
@@ -365,12 +373,18 @@ impl WireTorrent {
             seeds: item.seeds,
             runtime: RuntimeWire::capture(&item.runtime, detail),
             command_revision: revision,
+            file_revision: item.files.metadata_revision(),
             durable,
         }
     }
-    pub fn into_native(self) -> NativeTorrent {
-        NativeTorrent {
+    pub fn into_native(self) -> Result<NativeTorrent, Error> {
+        let mut files = FileSelectionModel::from_summary(self.summary);
+        files
+            .adopt_metadata_revision(self.file_revision)
+            .map_err(|_| Error::Stale)?;
+        Ok(NativeTorrent {
             command_revision: self.command_revision,
+            file_revision: self.file_revision,
             durable: self.durable,
             file_updates: None,
             item: TorrentItem {
@@ -381,7 +395,7 @@ impl WireTorrent {
                 peer_id: self.peer_id,
                 is_private: self.is_private,
                 overrides: self.overrides,
-                files: FileSelectionModel::from_summary(self.summary),
+                files,
                 state: self.state,
                 completion: self.completion,
                 downloaded_bytes: self.downloaded_bytes,
@@ -392,7 +406,7 @@ impl WireTorrent {
                 seeds: self.seeds,
                 runtime: self.runtime.into_runtime(),
             },
-        }
+        })
     }
 }
 

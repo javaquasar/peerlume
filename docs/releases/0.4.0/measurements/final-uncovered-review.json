@@ -1,0 +1,1527 @@
+{
+  "note": "LLVM summary denominators are authoritative; LCOV zero-DA ranges locate unexecuted code but unique lines/generic instantiations may differ.",
+  "files": {
+    "src/app/desktop_controls.rs": {
+      "llvm_summary_uncovered": 4,
+      "unique_lcov_zero_DA_line_count": 4,
+      "lcov_zero_DA_ranges": [
+        [
+          349,
+          349
+        ],
+        [
+          374,
+          374
+        ],
+        [
+          396,
+          396
+        ],
+        [
+          432,
+          432
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 349,
+          "source": "return None;"
+        },
+        {
+          "line": 374,
+          "source": "return None;"
+        },
+        {
+          "line": 396,
+          "source": "return None;"
+        },
+        {
+          "line": 432,
+          "source": "return None;"
+        }
+      ]
+    },
+    "src/app/desktop_integration.rs": {
+      "llvm_summary_uncovered": 112,
+      "unique_lcov_zero_DA_line_count": 105,
+      "lcov_zero_DA_ranges": [
+        [
+          31,
+          32
+        ],
+        [
+          34,
+          34
+        ],
+        [
+          143,
+          144
+        ],
+        [
+          165,
+          166
+        ],
+        [
+          169,
+          171
+        ],
+        [
+          174,
+          178
+        ],
+        [
+          180,
+          180
+        ],
+        [
+          189,
+          189
+        ],
+        [
+          192,
+          192
+        ],
+        [
+          201,
+          201
+        ],
+        [
+          223,
+          223
+        ],
+        [
+          232,
+          232
+        ],
+        [
+          242,
+          243
+        ],
+        [
+          268,
+          272
+        ],
+        [
+          274,
+          274
+        ],
+        [
+          276,
+          280
+        ],
+        [
+          282,
+          282
+        ],
+        [
+          284,
+          290
+        ],
+        [
+          292,
+          296
+        ],
+        [
+          298,
+          301
+        ],
+        [
+          303,
+          306
+        ],
+        [
+          309,
+          309
+        ],
+        [
+          311,
+          311
+        ],
+        [
+          314,
+          314
+        ],
+        [
+          316,
+          316
+        ],
+        [
+          318,
+          318
+        ],
+        [
+          320,
+          320
+        ],
+        [
+          323,
+          327
+        ],
+        [
+          329,
+          333
+        ],
+        [
+          335,
+          338
+        ],
+        [
+          343,
+          343
+        ],
+        [
+          345,
+          345
+        ],
+        [
+          353,
+          353
+        ],
+        [
+          433,
+          434
+        ],
+        [
+          454,
+          468
+        ],
+        [
+          470,
+          470
+        ],
+        [
+          485,
+          485
+        ],
+        [
+          496,
+          496
+        ],
+        [
+          508,
+          508
+        ],
+        [
+          640,
+          645
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 31,
+          "source": "let Some(rest) = remaining.strip_prefix(';') else {"
+        },
+        {
+          "line": 32,
+          "source": "return false;"
+        },
+        {
+          "line": 34,
+          "source": "remaining = rest;"
+        },
+        {
+          "line": 143,
+          "source": "{"
+        },
+        {
+          "line": 144,
+          "source": "self.add_status = format!(\"{message}; operation history: {error:?}\");"
+        },
+        {
+          "line": 165,
+          "source": "self.open_agent_access = true;"
+        },
+        {
+          "line": 166,
+          "source": "return;"
+        },
+        {
+          "line": 169,
+          "source": "self.settings.ui.table_columns = Default::default();"
+        },
+        {
+          "line": 170,
+          "source": "self.name_column.reset_width();"
+        },
+        {
+          "line": 171,
+          "source": "return;"
+        },
+        {
+          "line": 174,
+          "source": "let visible = self.presentation_indices();"
+        },
+        {
+          "line": 175,
+          "source": "self.selection.clear_hidden("
+        },
+        {
+          "line": 176,
+          "source": "visible"
+        },
+        {
+          "line": 177,
+          "source": ".iter()"
+        },
+        {
+          "line": 178,
+          "source": ".filter_map(|&index| self.identities.ids.get(index)),"
+        },
+        {
+          "line": 180,
+          "source": "return;"
+        },
+        {
+          "line": 189,
+          "source": "Action::AddTorrent => self.open_torrent_picker(),"
+        },
+        {
+          "line": 192,
+          "source": "self.add_magnet();"
+        },
+        {
+          "line": 201,
+          "source": "_ => TorrentCommand::RecheckAndRepair,"
+        },
+        {
+          "line": 223,
+          "source": "return;"
+        },
+        {
+          "line": 232,
+          "source": "continue;"
+        },
+        {
+          "line": 242,
+          "source": "Err(error) => {"
+        },
+        {
+          "line": 243,
+          "source": "self.desktop_error(\"Removal review\", Some(&id), error.to_string())"
+        },
+        {
+          "line": 268,
+          "source": "let [id] = targets.as_slice() else {"
+        },
+        {
+          "line": 269,
+          "source": "self.desktop_error("
+        },
+        {
+          "line": 270,
+          "source": "\"Storage command\","
+        },
+        {
+          "line": 271,
+          "source": "None,"
+        },
+        {
+          "line": 272,
+          "source": "\"Select exactly one visible torrent for this storage operation\".into(),"
+        },
+        {
+          "line": 274,
+          "source": "return;"
+        },
+        {
+          "line": 276,
+          "source": "let Some(index) = self.control.torrent_index(id) else {"
+        },
+        {
+          "line": 277,
+          "source": "self.desktop_error("
+        },
+        {
+          "line": 278,
+          "source": "\"Storage command\","
+        },
+        {
+          "line": 279,
+          "source": "Some(id),"
+        },
+        {
+          "line": 280,
+          "source": "\"The selected torrent no longer exists\".into(),"
+        },
+        {
+          "line": 282,
+          "source": "return;"
+        },
+        {
+          "line": 284,
+          "source": "if action != Action::CancelCopy"
+        },
+        {
+          "line": 285,
+          "source": "&& (self.control.torrents[index].state != TorrentState::Paused"
+        },
+        {
+          "line": 286,
+          "source": "|| self.control.torrents[index]"
+        },
+        {
+          "line": 287,
+          "source": ".runtime"
+        },
+        {
+          "line": 288,
+          "source": ".command"
+        },
+        {
+          "line": 289,
+          "source": ".pending_action()"
+        },
+        {
+          "line": 290,
+          "source": ".is_some())"
+        },
+        {
+          "line": 292,
+          "source": "self.desktop_error("
+        },
+        {
+          "line": 293,
+          "source": "\"Storage command\","
+        },
+        {
+          "line": 294,
+          "source": "Some(id),"
+        },
+        {
+          "line": 295,
+          "source": "\"Pause this torrent and wait for confirmation before changing its storage\""
+        },
+        {
+          "line": 296,
+          "source": ".into(),"
+        },
+        {
+          "line": 298,
+          "source": "return;"
+        },
+        {
+          "line": 299,
+          "source": "}"
+        },
+        {
+          "line": 300,
+          "source": "let result = match action {"
+        },
+        {
+          "line": 301,
+          "source": "Action::CancelCopy => self.control.cancel_storage(id),"
+        },
+        {
+          "line": 303,
+          "source": "if rfd::MessageDialog::new().set_title(\"Permanently remove originals?\")"
+        },
+        {
+          "line": 304,
+          "source": ".set_description(\"Only originals from a verified copy in this session can be removed. Every file is compared again before deletion. The destination is retained. Originals are not moved to the Recycle Bin.\")"
+        },
+        {
+          "line": 305,
+          "source": ".set_buttons(rfd::MessageButtons::YesNo).show() != rfd::MessageDialogResult::Yes { return; }"
+        },
+        {
+          "line": 306,
+          "source": "self.control.remove_copy_originals(id)"
+        },
+        {
+          "line": 309,
+          "source": "let title = match action {"
+        },
+        {
+          "line": 311,
+          "source": "\"Choose existing payload root; hash-check and resume\""
+        },
+        {
+          "line": 314,
+          "source": "\"Choose copy destination parent; originals retained\""
+        },
+        {
+          "line": 316,
+          "source": "_ => \"Choose parent for an exclusive same-volume move\","
+        },
+        {
+          "line": 318,
+          "source": "let Some(directory) = rfd::FileDialog::new().set_title(title).pick_folder()"
+        },
+        {
+          "line": 320,
+          "source": "return;"
+        },
+        {
+          "line": 323,
+          "source": "if self.control.torrent_index(id).is_none() {"
+        },
+        {
+          "line": 324,
+          "source": "self.desktop_error("
+        },
+        {
+          "line": 325,
+          "source": "\"Storage command\","
+        },
+        {
+          "line": 326,
+          "source": "Some(id),"
+        },
+        {
+          "line": 327,
+          "source": "\"Selected torrent disappeared while the picker was open\".into(),"
+        },
+        {
+          "line": 329,
+          "source": "return;"
+        },
+        {
+          "line": 330,
+          "source": "}"
+        },
+        {
+          "line": 331,
+          "source": "if action == Action::MoveData {"
+        },
+        {
+          "line": 332,
+          "source": "self.control"
+        },
+        {
+          "line": 333,
+          "source": ".move_storage(id, directory.to_string_lossy().into_owned())"
+        },
+        {
+          "line": 335,
+          "source": "self.control.select_storage("
+        },
+        {
+          "line": 336,
+          "source": "id,"
+        },
+        {
+          "line": 337,
+          "source": "directory.to_string_lossy().into_owned(),"
+        },
+        {
+          "line": 338,
+          "source": "action == Action::CopyData,"
+        },
+        {
+          "line": 343,
+          "source": "self.desktop_result(\"Storage command\", Some(id), result);"
+        },
+        {
+          "line": 345,
+          "source": "_ => {}"
+        },
+        {
+          "line": 353,
+          "source": "Err(error) => self.desktop_error(kind, id, error),"
+        },
+        {
+          "line": 433,
+          "source": "for sort in crate::torrent_view::Sort::ALL {ui.selectable_value(&mut self.settings.ui.sort,sort,sort.label());}"
+        },
+        {
+          "line": 434,
+          "source": "});"
+        },
+        {
+          "line": 454,
+          "source": "let props=desktop_props(torrents,ids.iter().filter_map(|id|identities.get(id).copied()),connected,hidden,visible.len());"
+        },
+        {
+          "line": 455,
+          "source": "if ui.add_enabled(connected&&props.can_pause,egui::Button::new(\"Pause selected\")).clicked(){actions.push((Action::PauseSelected,ids.to_vec()));ui.close();}"
+        },
+        {
+          "line": 456,
+          "source": "if ui.add_enabled(connected&&props.can_resume,egui::Button::new(\"Resume selected\")).clicked(){actions.push((Action::ResumeSelected,ids.to_vec()));ui.close();}"
+        },
+        {
+          "line": 457,
+          "source": "actions.extend(desktop_controls::more_actions(ui,props).into_iter().map(|action|(action,ids.to_vec())));"
+        },
+        {
+          "line": 458,
+          "source": "ui.separator();"
+        },
+        {
+          "line": 459,
+          "source": "if ui.add_enabled(ids.len()==1,egui::Button::new(\"Open download folder\")).clicked(){"
+        },
+        {
+          "line": 460,
+          "source": "directory=Some(torrent.info_hashes.join(\";\"));ui.close();"
+        },
+        {
+          "line": 461,
+          "source": "}"
+        },
+        {
+          "line": 462,
+          "source": "if ui.add_enabled(ids.len()==1,egui::Button::new(\"Open .torrent location\")).clicked(){reveal=Some(PathBuf::from(&torrent.source));ui.close();}"
+        },
+        {
+          "line": 463,
+          "source": "for (label,scope) in ["
+        },
+        {
+          "line": 464,
+          "source": "(\"Remove torrent and recycle downloaded files\",TrashScope::DownloadedFiles),"
+        },
+        {
+          "line": 465,
+          "source": "(\"Recycle source .torrent file\",TrashScope::TorrentFile),"
+        },
+        {
+          "line": 466,
+          "source": "(\"Remove torrent and recycle source and data\",TrashScope::Everything),"
+        },
+        {
+          "line": 467,
+          "source": "] {"
+        },
+        {
+          "line": 468,
+          "source": "if ui.add_enabled(connected&&ids.len()==1,egui::Button::new(label)).on_hover_text(\"Review the owner's exact per-torrent plan before recycling. For a group use Remove selected (keep data).\").clicked(){trash=Some((torrent.info_hashes.join(\";\"),scope));ui.close();}"
+        },
+        {
+          "line": 470,
+          "source": "})"
+        },
+        {
+          "line": 485,
+          "source": "let path=self.control.torrent_index(&id).map(|index|PathBuf::from(EffectiveTorrentSettings::resolve(&self.settings,&self.control.torrents[index].overrides,self.control.torrents[index].is_private).download_directory));"
+        },
+        {
+          "line": 496,
+          "source": "Ok(path) => self.add_status = format!(\"Opened {}\", path.display()),"
+        },
+        {
+          "line": 508,
+          "source": "ConnectionStatus::Connecting => \"Connecting to background client\".to_owned(),"
+        },
+        {
+          "line": 640,
+          "source": "HistoryIntent::DismissFinished => {"
+        },
+        {
+          "line": 641,
+          "source": "self.operation_tracker.history.clear_finished();"
+        },
+        {
+          "line": 642,
+          "source": "}"
+        },
+        {
+          "line": 643,
+          "source": "HistoryIntent::AcknowledgeReview(id) => {"
+        },
+        {
+          "line": 644,
+          "source": "let _ = self.operation_tracker.history.acknowledge_review(id);"
+        },
+        {
+          "line": 645,
+          "source": "}"
+        }
+      ]
+    },
+    "src/app/file_tree.rs": {
+      "llvm_summary_uncovered": 36,
+      "unique_lcov_zero_DA_line_count": 35,
+      "lcov_zero_DA_ranges": [
+        [
+          26,
+          26
+        ],
+        [
+          32,
+          32
+        ],
+        [
+          38,
+          38
+        ],
+        [
+          40,
+          47
+        ],
+        [
+          97,
+          99
+        ],
+        [
+          112,
+          113
+        ],
+        [
+          123,
+          123
+        ],
+        [
+          140,
+          142
+        ],
+        [
+          220,
+          220
+        ],
+        [
+          245,
+          245
+        ],
+        [
+          262,
+          263
+        ],
+        [
+          302,
+          308
+        ],
+        [
+          317,
+          319
+        ],
+        [
+          322,
+          322
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 26,
+          "source": "Self::Flat(rows) => rows.len(),"
+        },
+        {
+          "line": 32,
+          "source": "Self::Flat(rows) => !rows.is_empty(),"
+        },
+        {
+          "line": 38,
+          "source": "Self::Flat(rows) => match rows.get(position)? {"
+        },
+        {
+          "line": 40,
+          "source": "index,"
+        },
+        {
+          "line": 41,
+          "source": "display_start,"
+        },
+        {
+          "line": 42,
+          "source": "} => Some(HierarchyRow::File {"
+        },
+        {
+          "line": 43,
+          "source": "index: *index,"
+        },
+        {
+          "line": 44,
+          "source": "depth: 0,"
+        },
+        {
+          "line": 45,
+          "source": "display_start: *display_start,"
+        },
+        {
+          "line": 46,
+          "source": "}),"
+        },
+        {
+          "line": 47,
+          "source": "_ => None,"
+        },
+        {
+          "line": 97,
+          "source": "Err(error) => {"
+        },
+        {
+          "line": 98,
+          "source": "ui.label(error);"
+        },
+        {
+          "line": 99,
+          "source": "None"
+        },
+        {
+          "line": 112,
+          "source": "ui.selectable_value(&mut sort,0,\"Tree\");ui.selectable_value(&mut sort,1,\"Name\");ui.selectable_value(&mut sort,2,\"Largest first\");"
+        },
+        {
+          "line": 113,
+          "source": "});"
+        },
+        {
+          "line": 123,
+          "source": "None"
+        },
+        {
+          "line": 140,
+          "source": "torrent"
+        },
+        {
+          "line": 141,
+          "source": ".files"
+        },
+        {
+          "line": 142,
+          "source": ".view_rows(&query, if sort == 2 { 2 } else { 1 }),"
+        },
+        {
+          "line": 220,
+          "source": "continue;"
+        },
+        {
+          "line": 245,
+          "source": "0.0"
+        },
+        {
+          "line": 262,
+          "source": "{"
+        },
+        {
+          "line": 263,
+          "source": "changes.insert(index, selected);"
+        },
+        {
+          "line": 302,
+          "source": "{"
+        },
+        {
+          "line": 303,
+          "source": "priorities = Some(priority_intent("
+        },
+        {
+          "line": 304,
+          "source": "&torrent.files,"
+        },
+        {
+          "line": 305,
+          "source": "[index],"
+        },
+        {
+          "line": 306,
+          "source": "high,"
+        },
+        {
+          "line": 307,
+          "source": "));"
+        },
+        {
+          "line": 308,
+          "source": "ui.close();"
+        },
+        {
+          "line": 317,
+          "source": "{"
+        },
+        {
+          "line": 318,
+          "source": "changes.insert(index, false);"
+        },
+        {
+          "line": 319,
+          "source": "ui.close();"
+        },
+        {
+          "line": 322,
+          "source": "\"Priority: high\""
+        }
+      ]
+    },
+    "src/app/operation_tracking.rs": {
+      "llvm_summary_uncovered": 80,
+      "unique_lcov_zero_DA_line_count": 33,
+      "lcov_zero_DA_ranges": [
+        [
+          47,
+          47
+        ],
+        [
+          82,
+          82
+        ],
+        [
+          96,
+          107
+        ],
+        [
+          198,
+          198
+        ],
+        [
+          224,
+          224
+        ],
+        [
+          232,
+          232
+        ],
+        [
+          269,
+          269
+        ],
+        [
+          277,
+          277
+        ],
+        [
+          308,
+          308
+        ],
+        [
+          324,
+          324
+        ],
+        [
+          327,
+          327
+        ],
+        [
+          412,
+          414
+        ],
+        [
+          421,
+          421
+        ],
+        [
+          423,
+          423
+        ],
+        [
+          425,
+          425
+        ],
+        [
+          429,
+          429
+        ],
+        [
+          431,
+          431
+        ],
+        [
+          439,
+          439
+        ],
+        [
+          441,
+          441
+        ],
+        [
+          443,
+          443
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 47,
+          "source": "Self::Resume => Some(TransferAction::Resume),"
+        },
+        {
+          "line": 82,
+          "source": "}"
+        },
+        {
+          "line": 96,
+          "source": "let oldest = self"
+        },
+        {
+          "line": 97,
+          "source": ".jobs"
+        },
+        {
+          "line": 98,
+          "source": ".iter()"
+        },
+        {
+          "line": 99,
+          "source": ".find(|(_, job)| {"
+        },
+        {
+          "line": 100,
+          "source": "self.history"
+        },
+        {
+          "line": 101,
+          "source": ".get(job.operation_id)"
+        },
+        {
+          "line": 102,
+          "source": ".is_some_and(|entry| entry.phase.is_terminal())"
+        },
+        {
+          "line": 103,
+          "source": "})"
+        },
+        {
+          "line": 104,
+          "source": ".map(|(&id, _)| id);"
+        },
+        {
+          "line": 105,
+          "source": "let Some(id) = oldest else { break };"
+        },
+        {
+          "line": 106,
+          "source": "self.jobs.remove(&id);"
+        },
+        {
+          "line": 107,
+          "source": "self.retire(id);"
+        },
+        {
+          "line": 198,
+          "source": ")?;"
+        },
+        {
+          "line": 224,
+          "source": ")?;"
+        },
+        {
+          "line": 232,
+          "source": ")?;"
+        },
+        {
+          "line": 269,
+          "source": "}"
+        },
+        {
+          "line": 277,
+          "source": "return;"
+        },
+        {
+          "line": 308,
+          "source": "continue;"
+        },
+        {
+          "line": 324,
+          "source": "continue;"
+        },
+        {
+          "line": 327,
+          "source": "continue;"
+        },
+        {
+          "line": 412,
+          "source": "Some(TorrentCommand::SetFiles(_)) => OperationKind::FileSelection,"
+        },
+        {
+          "line": 413,
+          "source": "Some(TorrentCommand::SetMode(_)) => OperationKind::SetMode,"
+        },
+        {
+          "line": 414,
+          "source": "Some(TorrentCommand::SetRepairPolicy(_)) => OperationKind::RepairPolicy,"
+        },
+        {
+          "line": 421,
+          "source": "OperationKind::Recycle"
+        },
+        {
+          "line": 423,
+          "source": "OperationKind::Export"
+        },
+        {
+          "line": 425,
+          "source": "OperationKind::Copy"
+        },
+        {
+          "line": 429,
+          "source": "OperationKind::Priorities"
+        },
+        {
+          "line": 431,
+          "source": "OperationKind::FileSelection"
+        },
+        {
+          "line": 439,
+          "source": "OperationKind::Pause"
+        },
+        {
+          "line": 441,
+          "source": "OperationKind::Resume"
+        },
+        {
+          "line": 443,
+          "source": "OperationKind::Recheck"
+        }
+      ]
+    },
+    "src/app/torrent_table.rs": {
+      "llvm_summary_uncovered": 12,
+      "unique_lcov_zero_DA_line_count": 12,
+      "lcov_zero_DA_ranges": [
+        [
+          54,
+          55
+        ],
+        [
+          57,
+          57
+        ],
+        [
+          60,
+          60
+        ],
+        [
+          80,
+          80
+        ],
+        [
+          191,
+          191
+        ],
+        [
+          343,
+          343
+        ],
+        [
+          442,
+          442
+        ],
+        [
+          494,
+          494
+        ],
+        [
+          576,
+          576
+        ],
+        [
+          636,
+          637
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 54,
+          "source": "let Some(rest) = remaining.strip_prefix(';') else {"
+        },
+        {
+          "line": 55,
+          "source": "return false;"
+        },
+        {
+          "line": 57,
+          "source": "remaining = rest;"
+        },
+        {
+          "line": 60,
+          "source": "return false;"
+        },
+        {
+          "line": 80,
+          "source": "Column::Name => 0.0,"
+        },
+        {
+          "line": 191,
+          "source": "-4.0"
+        },
+        {
+          "line": 343,
+          "source": "}"
+        },
+        {
+          "line": 442,
+          "source": "columns.reset_width(cell.column)"
+        },
+        {
+          "line": 494,
+          "source": "}"
+        },
+        {
+          "line": 576,
+          "source": "Column::Progress => unreachable!(),"
+        },
+        {
+          "line": 636,
+          "source": "name.reset_width();"
+        },
+        {
+          "line": 637,
+          "source": "changed(runtime, frame, ui);"
+        }
+      ]
+    },
+    "src/appearance.rs": {
+      "llvm_summary_uncovered": 0,
+      "unique_lcov_zero_DA_line_count": 0,
+      "lcov_zero_DA_ranges": [],
+      "zero_DA_source_samples": []
+    },
+    "src/file_selection/hierarchy.rs": {
+      "llvm_summary_uncovered": 6,
+      "unique_lcov_zero_DA_line_count": 1,
+      "lcov_zero_DA_ranges": [
+        [
+          439,
+          439
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 439,
+          "source": "return false;"
+        }
+      ]
+    },
+    "src/file_selection/metadata.rs": {
+      "llvm_summary_uncovered": 0,
+      "unique_lcov_zero_DA_line_count": 0,
+      "lcov_zero_DA_ranges": [],
+      "zero_DA_source_samples": []
+    },
+    "src/table_view.rs": {
+      "llvm_summary_uncovered": 3,
+      "unique_lcov_zero_DA_line_count": 3,
+      "lcov_zero_DA_ranges": [
+        [
+          42,
+          42
+        ],
+        [
+          137,
+          137
+        ],
+        [
+          210,
+          210
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 42,
+          "source": "Self::Name => 160,"
+        },
+        {
+          "line": 137,
+          "source": "return false;"
+        },
+        {
+          "line": 210,
+          "source": "continue;"
+        }
+      ]
+    },
+    "src/torrent_selection.rs": {
+      "llvm_summary_uncovered": 0,
+      "unique_lcov_zero_DA_line_count": 0,
+      "lcov_zero_DA_ranges": [],
+      "zero_DA_source_samples": []
+    },
+    "src/ui_operations.rs": {
+      "llvm_summary_uncovered": 51,
+      "unique_lcov_zero_DA_line_count": 51,
+      "lcov_zero_DA_ranges": [
+        [
+          47,
+          47
+        ],
+        [
+          49,
+          49
+        ],
+        [
+          51,
+          52
+        ],
+        [
+          54,
+          57
+        ],
+        [
+          59,
+          64
+        ],
+        [
+          94,
+          94
+        ],
+        [
+          96,
+          98
+        ],
+        [
+          100,
+          100
+        ],
+        [
+          116,
+          116
+        ],
+        [
+          191,
+          198
+        ],
+        [
+          200,
+          200
+        ],
+        [
+          396,
+          396
+        ],
+        [
+          482,
+          482
+        ],
+        [
+          486,
+          486
+        ],
+        [
+          537,
+          537
+        ],
+        [
+          541,
+          541
+        ],
+        [
+          557,
+          557
+        ],
+        [
+          561,
+          561
+        ],
+        [
+          633,
+          633
+        ],
+        [
+          737,
+          737
+        ],
+        [
+          797,
+          800
+        ],
+        [
+          803,
+          809
+        ],
+        [
+          867,
+          867
+        ],
+        [
+          885,
+          885
+        ]
+      ],
+      "zero_DA_source_samples": [
+        {
+          "line": 47,
+          "source": "Self::Add => \"Add torrent\","
+        },
+        {
+          "line": 49,
+          "source": "Self::Resume => \"Resume\","
+        },
+        {
+          "line": 51,
+          "source": "Self::Repair => \"Check and repair\","
+        },
+        {
+          "line": 52,
+          "source": "Self::Relocate => \"Move data\","
+        },
+        {
+          "line": 54,
+          "source": "Self::Remove => \"Remove from list\","
+        },
+        {
+          "line": 55,
+          "source": "Self::Recycle => \"Recycle confirmed data\","
+        },
+        {
+          "line": 56,
+          "source": "Self::Preferences => \"Save preferences\","
+        },
+        {
+          "line": 57,
+          "source": "Self::ViewSettings => \"Save view\","
+        },
+        {
+          "line": 59,
+          "source": "Self::Priorities => \"File priorities\","
+        },
+        {
+          "line": 60,
+          "source": "Self::SetMode => \"Change transfer mode\","
+        },
+        {
+          "line": 61,
+          "source": "Self::RepairPolicy => \"Change repair policy\","
+        },
+        {
+          "line": 62,
+          "source": "Self::Export => \"Export log\","
+        },
+        {
+          "line": 63,
+          "source": "Self::TrackerAudit => \"Controlled tracker audit\","
+        },
+        {
+          "line": 64,
+          "source": "Self::Reveal => \"Show location\","
+        },
+        {
+          "line": 94,
+          "source": "Self::Accepted => \"Accepted \u0412\u00b7 waiting for confirmation\","
+        },
+        {
+          "line": 96,
+          "source": "Self::Persisting => \"Confirmed \u0412\u00b7 saving\","
+        },
+        {
+          "line": 97,
+          "source": "Self::Completed => \"Completed and saved\","
+        },
+        {
+          "line": 98,
+          "source": "Self::LocalCompleted => \"Local action completed\","
+        },
+        {
+          "line": 100,
+          "source": "Self::Cancelled => \"Cancelled before dispatch\","
+        },
+        {
+          "line": 116,
+          "source": "Self::Completed => Tone::Success,"
+        },
+        {
+          "line": 191,
+          "source": "fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {"
+        },
+        {
+          "line": 192,
+          "source": "f.write_str(match self {"
+        },
+        {
+          "line": 193,
+          "source": "Self::InvalidLimits=>\"Invalid operation history limits\",Self::InvalidIdentity=>\"Invalid operation identity\","
+        },
+        {
+          "line": 194,
+          "source": "Self::HistoryFull=>\"Operation history is full of unconfirmed work; inspect current state before starting more\","
+        },
+        {
+          "line": 195,
+          "source": "Self::IdExhausted=>\"Operation ID space is exhausted\",Self::UnknownOperation=>\"Operation is no longer in recent history\","
+        },
+        {
+          "line": 196,
+          "source": "Self::EvidenceMismatch=>\"Owner or command revision does not match this operation\",Self::WrongPhase=>\"Operation evidence arrived in the wrong phase\","
+        },
+        {
+          "line": 197,
+          "source": "Self::WrongCompletionRule=>\"This response cannot prove completion for this operation\",Self::AmbiguousOutcome=>\"Reconnect and inspect current state; this operation was not replayed\","
+        },
+        {
+          "line": 198,
+          "source": "Self::ProgressTotalChanged=>\"Operation progress total changed; previous progress retained\",Self::AlreadyDispatched=>\"The operation was already dispatched and cannot be cancelled locally\","
+        },
+        {
+          "line": 200,
+          "source": "}"
+        },
+        {
+          "line": 396,
+          "source": "return Err(HistoryError::AmbiguousOutcome);"
+        },
+        {
+          "line": 482,
+          "source": "if !matches!("
+        },
+        {
+          "line": 486,
+          "source": "return Err(HistoryError::WrongPhase);"
+        },
+        {
+          "line": 537,
+          "source": "if !matches!("
+        },
+        {
+          "line": 541,
+          "source": "return Err(HistoryError::WrongPhase);"
+        },
+        {
+          "line": 557,
+          "source": "if !matches!("
+        },
+        {
+          "line": 561,
+          "source": "return Err(HistoryError::WrongPhase);"
+        },
+        {
+          "line": 633,
+          "source": "return Err(HistoryError::WrongPhase);"
+        },
+        {
+          "line": 737,
+          "source": "&& matches!("
+        },
+        {
+          "line": 797,
+          "source": "ui.small(format!("
+        },
+        {
+          "line": 798,
+          "source": "\"{} older finished records removed by history limits\","
+        },
+        {
+          "line": 799,
+          "source": "history.evicted_count()"
+        },
+        {
+          "line": 800,
+          "source": "));"
+        },
+        {
+          "line": 803,
+          "source": "ui.colored_label("
+        },
+        {
+          "line": 804,
+          "source": "ui.visuals().warn_fg_color,"
+        },
+        {
+          "line": 805,
+          "source": "format!("
+        },
+        {
+          "line": 806,
+          "source": "\"{} requests could not enter the bounded history\","
+        },
+        {
+          "line": 807,
+          "source": "history.rejected_count()"
+        },
+        {
+          "line": 808,
+          "source": "),"
+        },
+        {
+          "line": 809,
+          "source": ");"
+        },
+        {
+          "line": 867,
+          "source": "ui.add(egui::ProgressBar::new(fraction).show_percentage());"
+        },
+        {
+          "line": 885,
+          "source": "ui.small(\"Display text shortened to keep history bounded.\");"
+        }
+      ]
+    }
+  }
+}

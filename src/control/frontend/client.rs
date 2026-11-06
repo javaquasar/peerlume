@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -21,6 +21,22 @@ use std::{
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connecting,
+    Connected,
+    Reconnecting(String),
+    StopRequested,
+    Stopped,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectionView {
+    pub status: ConnectionStatus,
+    pub owner_instance: Option<String>,
+    pub snapshot_serial: u64,
 }
 struct Inner {
     directory: PathBuf,
@@ -35,6 +51,7 @@ struct Inner {
     journal: crate::announce_journal::AnnounceJournal,
     queued: AtomicUsize,
     inflight: AtomicBool,
+    next_job: AtomicU64,
 }
 static CLIENTS: OnceLock<Mutex<Vec<Weak<Inner>>>> = OnceLock::new();
 static ACTION_ERRORS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -70,6 +87,11 @@ pub fn finish_pending_actions(timeout: Duration) -> Result<(), String> {
     }
 }
 struct Shared {
+    connection: ConnectionStatus,
+    stopping_owner: Option<String>,
+    receipt_overflow: u64,
+    snapshot_serial: u64,
+    delivered_serial: u64,
     latest: Option<Snapshot>,
     revisions: HashMap<String, u64>,
     notices: VecDeque<SessionNotice>,
@@ -83,15 +105,31 @@ struct Shared {
     audits: HashMap<String, (u64, Option<StoredTrackerAuditProfile>)>,
     audit_updates: VecDeque<(String, Option<StoredTrackerAuditProfile>)>,
     delivered_instance: Option<String>,
+    delivered_file_revisions: HashMap<String, u64>,
 }
 struct Job {
+    sequence: u64,
+    operation: &'static str,
+    command: Option<TorrentCommand>,
+    completed_by_reply: bool,
     action: Action,
     label: &'static str,
     id: String,
     keep_alive: Arc<Inner>,
     owner_instance: String,
 }
+#[derive(Default)]
 pub struct Receipt {
+    pub job_id: u64,
+    pub owner_instance: String,
+    pub queued: bool,
+    pub ambiguous_error: bool,
+    pub snapshot_after: u64,
+    pub accepted: Option<AcceptedCommand>,
+    pub ui_saved: Option<crate::settings::UiSettings>,
+    pub operation: &'static str,
+    pub command: Option<TorrentCommand>,
+    pub completed_by_reply: bool,
     pub label: &'static str,
     pub message: String,
     pub settings: Option<ClientSettings>,
@@ -226,6 +264,11 @@ impl Client {
             credentials: Mutex::new(credentials),
             settings: Mutex::new(*settings),
             shared: Mutex::new(Shared {
+                connection: ConnectionStatus::Connecting,
+                stopping_owner: None,
+                receipt_overflow: 0,
+                snapshot_serial: 0,
+                delivered_serial: 0,
                 latest: None,
                 revisions: HashMap::new(),
                 notices: VecDeque::new(),
@@ -239,6 +282,7 @@ impl Client {
                 audits: HashMap::new(),
                 audit_updates: VecDeque::new(),
                 delivered_instance: None,
+                delivered_file_revisions: HashMap::new(),
             }),
             jobs,
             stop: AtomicBool::new(false),
@@ -247,6 +291,7 @@ impl Client {
             journal: crate::announce_journal::AnnounceJournal::frontend_view(),
             queued: AtomicUsize::new(0),
             inflight: AtomicBool::new(false),
+            next_job: AtomicU64::new(1),
         });
         {
             let mut clients = CLIENTS
@@ -272,6 +317,40 @@ impl Client {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+    pub fn connection(&self) -> ConnectionView {
+        let current = self
+            .inner
+            .credentials
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0
+            .clone();
+        let shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let status = if shared.connection == ConnectionStatus::Connected
+            && shared.delivered_instance.as_deref() != Some(current.as_str())
+        {
+            ConnectionStatus::Connecting
+        } else {
+            shared.connection.clone()
+        };
+        ConnectionView {
+            status,
+            owner_instance: shared.delivered_instance.clone(),
+            snapshot_serial: shared.delivered_serial,
+        }
+    }
+    pub fn take_receipt_overflow(&self) -> u64 {
+        let mut shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut shared.receipt_overflow)
+    }
     pub fn sync(&self) -> Option<Snapshot> {
         let mut shared = self
             .inner
@@ -280,7 +359,13 @@ impl Client {
             .unwrap_or_else(|error| error.into_inner());
         let snapshot = shared.latest.take();
         if let Some(snapshot) = &snapshot {
+            shared.delivered_serial = shared.snapshot_serial;
             shared.delivered_instance = Some(snapshot.instance_id.clone());
+            shared.delivered_file_revisions = snapshot
+                .torrents
+                .iter()
+                .map(|row| (row.item.info_hashes.join(";"), row.file_revision))
+                .collect();
         }
         snapshot
     }
@@ -439,6 +524,22 @@ impl Client {
     pub fn stop_owner(&self) -> Result<(), String> {
         self.call(Action::Stop).map(|_| ())
     }
+    /// GUI shutdown is tied to the owner shown in its confirmation. The CLI's
+    /// immediate authenticated Stop intentionally remains a separate entry point.
+    pub fn enqueue_stop_owner(&self, displayed_owner: &str) -> Result<u64, String> {
+        let view = self.connection();
+        if view.status != ConnectionStatus::Connected
+            || view.owner_instance.as_deref() != Some(displayed_owner)
+        {
+            return Err("Background owner changed or is not connected; review Stop again".into());
+        }
+        self.queue_for_instance(
+            Action::Stop,
+            "Stop background client",
+            String::new(),
+            Some(displayed_owner),
+        )
+    }
     pub fn submit(
         &self,
         id: &str,
@@ -474,14 +575,15 @@ impl Client {
         command: &TorrentCommand,
         revision: Option<u64>,
     ) -> Result<Action, String> {
-        let revision = Some(match revision {
+        let revision = match revision {
             Some(revision) => revision,
             None => self.revision(id)?,
-        });
+        };
         if let TorrentCommand::SetFiles(indices) = command {
             let count = self.current_count(id)?;
             Ok(Action::Selection {
                 id: id.into(),
+                file_revision: self.delivered_file_revision(id)?,
                 files: PackedIndices::new(count, indices).map_err(|error| error.to_string())?,
                 revision,
             })
@@ -489,9 +591,22 @@ impl Client {
             Ok(Action::Mutate {
                 id: id.into(),
                 command: command.clone(),
-                revision,
+                revision: Some(revision),
             })
         }
+    }
+    fn delivered_file_revision(&self, id: &str) -> Result<u64, String> {
+        self.inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .delivered_file_revisions
+            .get(id)
+            .copied()
+            .filter(|revision| *revision != 0 && *revision != u64::MAX)
+            .ok_or_else(|| {
+                "File selection snapshot has not reached this frontend; wait for refresh".into()
+            })
     }
     fn current_count(&self, id: &str) -> Result<usize, String> {
         self.inner
@@ -547,6 +662,7 @@ impl Client {
         let action = if let StorageAction::Priorities { high } = action {
             Action::Priorities {
                 id: id.into(),
+                file_revision: self.delivered_file_revision(id)?,
                 files: PackedIndices::new(self.current_count(id)?, &high)
                     .map_err(|error| error.to_string())?,
                 revision,
@@ -624,6 +740,15 @@ impl Client {
             .ok_or_else(|| "Owner snapshot is not ready; refresh first".into())
     }
     fn queue(&self, action: Action, label: &'static str, id: String) -> Result<(), String> {
+        self.queue_for_instance(action, label, id, None).map(|_| ())
+    }
+    fn queue_for_instance(
+        &self,
+        action: Action,
+        label: &'static str,
+        id: String,
+        expected_owner: Option<&str>,
+    ) -> Result<u64, String> {
         let owner_instance = self
             .inner
             .credentials
@@ -631,26 +756,80 @@ impl Client {
             .unwrap_or_else(|error| error.into_inner())
             .0
             .clone();
+        if expected_owner.is_some_and(|expected| expected != owner_instance) {
+            return Err("Background owner changed; the request was not queued".into());
+        }
         if !self.inner.snapshot_allows(&action, &owner_instance) {
             return Err("Wait for an authoritative snapshot of the current background owner; the action was not queued".into());
         }
+        let quiet = matches!(&action, Action::Access(AccessAction::View));
+        let mut shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !quiet && shared.connection != ConnectionStatus::Connected {
+            return Err("Background client is not connected; wait for its current state before changing downloads".into());
+        }
+        let sequence = self
+            .inner
+            .next_job
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| "Native operation ID space exhausted".to_owned())?;
+        let operation = operation_name(&action, label);
+        let command = if let Action::Mutate { command, .. } = &action {
+            Some(command.clone())
+        } else {
+            None
+        };
+        let completed_by_reply = matches!(
+            &action,
+            Action::SaveView(_)
+                | Action::SaveSettings(_)
+                | Action::SaveEditable { .. }
+                | Action::SaveAudit { .. }
+                | Action::Export { .. }
+                | Action::Trash { .. }
+        );
         self.inner.queued.fetch_add(1, Ordering::Release);
         if self
             .inner
             .jobs
             .try_send(Job {
+                sequence,
+                operation,
+                command: command.clone(),
+                completed_by_reply,
                 action,
                 label,
-                id,
+                id: id.clone(),
                 keep_alive: self.inner.clone(),
-                owner_instance,
+                owner_instance: owner_instance.clone(),
             })
             .is_err()
         {
             self.inner.queued.fetch_sub(1, Ordering::AcqRel);
             Err("Native request queue is full or disconnected".into())
         } else {
-            Ok(())
+            if !quiet {
+                shared.push_receipt(Receipt {
+                    job_id: sequence,
+                    owner_instance,
+                    queued: true,
+                    label,
+                    operation,
+                    command,
+                    id,
+                    completed_by_reply,
+                    message: "Request queued; awaiting background client".into(),
+                    ..Default::default()
+                });
+            }
+            drop(shared);
+            self.inner.notify();
+            Ok(sequence)
         }
     }
     fn call(&self, action: Action) -> Result<Reply, String> {
@@ -659,6 +838,44 @@ impl Client {
     fn call_raw(&self, action: Action) -> Result<Reply, Error> {
         let request = self.inner.request(action)?;
         transport::call_blocking(self.inner.directory.clone(), request)?.result
+    }
+}
+
+impl Shared {
+    fn push_receipt(&mut self, receipt: Receipt) {
+        if self.receipts.len() == 256 {
+            self.receipts.pop_front();
+            self.receipt_overflow = self.receipt_overflow.saturating_add(1);
+        }
+        self.receipts.push_back(receipt);
+    }
+}
+
+fn operation_name(action: &Action, fallback: &'static str) -> &'static str {
+    match action {
+        Action::Mutate { command, .. } => match command {
+            TorrentCommand::Pause => "Pause",
+            TorrentCommand::Resume => "Resume",
+            TorrentCommand::Recheck => "Integrity check",
+            TorrentCommand::RecheckAndRepair => "Check and repair",
+            TorrentCommand::SetMode(_) => "Change download mode",
+            TorrentCommand::SetFiles(_) => "Select files",
+            TorrentCommand::Remove => "Remove torrent; keep data",
+            TorrentCommand::SetRepairPolicy(_) => "Change repair policy",
+            TorrentCommand::SetVerifyAfterDownload(_) => "Change verification policy",
+            TorrentCommand::SetTransferSettings(_) => "Change transfer settings",
+        },
+        Action::Selection { .. } => "Select files",
+        Action::Priorities { .. } => "Change file priorities",
+        Action::Storage { action, .. } => match action {
+            StorageAction::Select { copy: true, .. } => "Copy data",
+            StorageAction::Select { copy: false, .. } => "Use existing data",
+            StorageAction::Cancel => "Cancel copy",
+            StorageAction::Priorities { .. } => "Change file priorities",
+            StorageAction::Cleanup => "Remove verified duplicate originals",
+            StorageAction::Move { .. } => "Move data directory",
+        },
+        _ => fallback,
     }
 }
 
@@ -716,6 +933,53 @@ fn spawn_owner(command: &mut Command) -> std::io::Result<std::process::Child> {
     command.spawn()
 }
 impl Inner {
+    fn connection_state(&self, requested: ConnectionStatus) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let status = if shared.stopping_owner.is_some() {
+            if shared.connection == ConnectionStatus::Stopped {
+                ConnectionStatus::Stopped
+            } else {
+                ConnectionStatus::StopRequested
+            }
+        } else {
+            requested
+        };
+        let changed = shared.connection != status;
+        shared.connection = status;
+        drop(shared);
+        if changed {
+            self.notify();
+        }
+    }
+
+    fn inspect_requested_stop(&self) {
+        let stopping = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stopping_owner
+            .is_some();
+        if !stopping {
+            return;
+        }
+        // This runs on the native worker, never inside a GUI frame. As in the
+        // Stop CLI, lock release proves termination, not every durability result.
+        if let Ok(lock) = crate::control::host::InstanceLock::acquire(&self.directory) {
+            drop(lock);
+            let mut shared = self
+                .shared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            shared.connection = ConnectionStatus::Stopped;
+            shared.interest = None;
+            shared.visible = None;
+            drop(shared);
+            self.notify();
+        }
+    }
     fn snapshot_allows(&self, action: &Action, instance: &str) -> bool {
         if matches!(
             action,
@@ -768,6 +1032,8 @@ impl Inner {
         shared.counts.clear();
         shared.audits.clear();
         shared.audit_updates.clear();
+        shared.connection = ConnectionStatus::Connecting;
+        shared.stopping_owner = None;
         drop(shared);
         let _ = self
             .journal
@@ -870,8 +1136,8 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
     };
     let mut next = Instant::now();
     let mut disconnected = false;
-    let mut loaded: Option<(String, u64, usize, u64)> = None;
-    let mut failed_detail: Option<(String, u64, usize, u64)> = None;
+    let mut loaded: Option<(String, u64, u64, usize, u64)> = None;
+    let mut failed_detail: Option<(String, u64, u64, usize, u64)> = None;
     let mut notice_cursor = 0;
     let mut owner_instance = String::new();
     let mut audit_key: Option<(String, u64)> = None;
@@ -897,6 +1163,14 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
             break;
         }
         if let Some(job) = job {
+            let receipt_context = Receipt {
+                job_id: job.sequence,
+                owner_instance: job.owner_instance.clone(),
+                operation: job.operation,
+                command: job.command.clone(),
+                ..Default::default()
+            };
+            let requests_stop = matches!(&job.action, Action::Stop);
             inner.inflight.store(true, Ordering::Release);
             inner.queued.fetch_sub(1, Ordering::AcqRel);
             let quiet = matches!(&job.action, Action::Access(AccessAction::View));
@@ -923,6 +1197,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
             } else {
                 None
             };
+            let ui_saved = view.clone();
             let response = if inner.job_is_current(&job) {
                 runtime.block_on(inner.call(job.action))
             } else {
@@ -944,24 +1219,34 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                             .ui = view;
                     }
                     let mut trash_plan = None;
-                    let message=match reply{
-                        Reply::Done(message)=>message,
-                        Reply::TrashPlan(plan)=>{trash_plan=Some(plan);"Review the exact Recycle Bin plan before confirming".into()},
-                        Reply::Access(view)=>{
-                            inner.apply_access(view);"Agent access updated".into()
-                        },
-                        Reply::Accepted(_)=>"Owner accepted the command; awaiting engine confirmation and persistence".into(),
-                        _=>"Owner response received".into()
+                    let mut accepted = None;
+                    let message = match reply {
+                        Reply::Done(message) => message,
+                        Reply::TrashPlan(plan) => {
+                            trash_plan = Some(plan);
+                            "Review the exact Recycle Bin plan before confirming".into()
+                        }
+                        Reply::Access(view) => {
+                            inner.apply_access(view);
+                            "Agent access updated".into()
+                        }
+                        Reply::Accepted(value) => {
+                            accepted = Some(value);
+                            "Owner accepted the command; awaiting engine confirmation and persistence".into()
+                        }
+                        _ => "Owner response received".into(),
                     };
                     let mut shared = inner
                         .shared
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
                     if !quiet {
-                        if shared.receipts.len() == 64 {
-                            shared.receipts.pop_front();
+                        let snapshot_after = shared.snapshot_serial.saturating_add(1);
+                        if requests_stop {
+                            shared.stopping_owner = Some(job.owner_instance.clone());
+                            shared.connection = ConnectionStatus::StopRequested;
                         }
-                        shared.receipts.push_back(Receipt {
+                        shared.push_receipt(Receipt {
                             label: job.label,
                             message,
                             settings,
@@ -970,12 +1255,14 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                             audit_saved,
                             trackers_saved,
                             error: None,
+                            accepted,
+                            ui_saved,
+                            completed_by_reply: job.completed_by_reply,
+                            snapshot_after,
+                            ..receipt_context
                         });
                     } else {
-                        if shared.receipts.len() == 64 {
-                            shared.receipts.pop_front();
-                        }
-                        shared.receipts.push_back(Receipt {
+                        shared.push_receipt(Receipt {
                             label: "Agent view",
                             message: String::new(),
                             settings: None,
@@ -984,6 +1271,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                             audit_saved: None,
                             trackers_saved: None,
                             error: None,
+                            ..receipt_context
                         });
                     }
                     drop(shared);
@@ -1004,10 +1292,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                         .shared
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if shared.receipts.len() == 64 {
-                        shared.receipts.pop_front();
-                    }
-                    shared.receipts.push_back(Receipt {
+                    shared.push_receipt(Receipt {
                         label: job.label,
                         message: message.clone(),
                         settings: None,
@@ -1016,6 +1301,8 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                         audit_saved: None,
                         trackers_saved: None,
                         error: Some(message.clone()),
+                        ambiguous_error: matches!(error, Error::Transport(_)),
+                        ..receipt_context
                     });
                     drop(shared);
                     inner.error(job.id, message);
@@ -1124,6 +1411,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
         match result {
             Ok(None) => {
                 disconnected = false;
+                inner.connection_state(ConnectionStatus::Connected);
                 next = Instant::now()
                     + if was_live {
                         Duration::from_millis(250)
@@ -1132,6 +1420,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                     };
             }
             Ok(Some(mut snapshot)) => {
+                inner.connection_state(ConnectionStatus::Connected);
                 last_revision = Some(snapshot.revision);
                 last_view = Some(view);
                 if owner_instance != snapshot.instance_id {
@@ -1163,6 +1452,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                             (
                                 id.clone(),
                                 row.command_revision,
+                                row.file_revision,
                                 row.item.files.file_count(),
                                 row.item.files.total_size(),
                             )
@@ -1180,7 +1470,13 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                                 .torrents
                                 .iter()
                                 .find(|row| row.item.info_hashes.join(";") == *id)
-                                .map(|row| (row.command_revision, row.item.files.summary())),
+                                .map(|row| {
+                                    (
+                                        row.command_revision,
+                                        row.file_revision,
+                                        row.item.files.summary(),
+                                    )
+                                }),
                             loaded.as_ref(),
                         ))
                     } {
@@ -1197,6 +1493,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                                 loaded = Some((
                                     id.clone(),
                                     revision,
+                                    row.file_revision,
                                     row.item.files.file_count(),
                                     row.item.files.total_size(),
                                 ));
@@ -1279,6 +1576,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                     .map(|row| (row.item.info_hashes.join(";"), row.item.files.file_count()))
                     .collect();
                 retain_pending_details(shared.latest.take(), &mut snapshot);
+                shared.snapshot_serial = shared.snapshot_serial.saturating_add(1);
                 shared.latest = Some(snapshot);
                 drop(shared);
                 inner.notify();
@@ -1290,6 +1588,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                     };
             }
             Err(Error::Stale) => {
+                inner.connection_state(ConnectionStatus::Connecting);
                 if inner.refresh_credentials() {
                     loaded = None;
                     failed_detail = None;
@@ -1314,6 +1613,8 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                 next = Instant::now() + Duration::from_millis(50);
             }
             Err(error) => {
+                inner.connection_state(ConnectionStatus::Reconnecting(error.to_string()));
+                inner.inspect_requested_stop();
                 last_revision = None;
                 if !disconnected {
                     inner.error(
@@ -1426,6 +1727,7 @@ fn retain_pending_details(previous: Option<Snapshot>, snapshot: &mut Snapshot) {
     let Some(row) = snapshot.torrents.iter_mut().find(|row| {
         row.item.info_hashes.join(";") == *id
             && row.command_revision == old.command_revision
+            && row.file_revision == old.file_revision
             && !row.item.files.details_loaded()
     }) else {
         return;
@@ -1437,7 +1739,10 @@ fn retain_pending_details(previous: Option<Snapshot>, snapshot: &mut Snapshot) {
     {
         return;
     }
-    if files.apply_summary(summary).is_ok() {
+    if files.metadata_revision() == row.file_revision
+        && files.apply_summary(summary).is_ok()
+        && files.adopt_metadata_revision(row.file_revision).is_ok()
+    {
         row.item.files = files;
         row.file_updates = None;
     }
@@ -1495,6 +1800,10 @@ async fn fetch_snapshot(
         }
         if total.is_some_and(|total| total != page.total)
             || epoch.is_some_and(|epoch| epoch != page.epoch)
+            || page
+                .torrents
+                .iter()
+                .any(|row| row.file_revision == 0 || row.file_revision == u64::MAX)
             || page.observations.len() != page.torrents.len()
             || page
                 .next_offset
@@ -1520,7 +1829,12 @@ async fn fetch_snapshot(
         if offset == 0 {
             revision = page.revision;
         }
-        torrents.extend(page.torrents.into_iter().map(WireTorrent::into_native));
+        torrents.extend(
+            page.torrents
+                .into_iter()
+                .map(WireTorrent::into_native)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         observations.extend(page.observations);
         match page.next_offset {
             Some(next) => offset = next,
@@ -1565,8 +1879,8 @@ async fn renew_interest(inner: &Inner) -> Result<(), Error> {
 async fn fetch_files(
     inner: &Inner,
     id: &str,
-    revision: Option<(u64, crate::file_selection::FileSummary)>,
-    loaded: Option<&(String, u64, usize, u64)>,
+    revision: Option<(u64, u64, crate::file_selection::FileSummary)>,
+    loaded: Option<&(String, u64, u64, usize, u64)>,
 ) -> Result<
     Option<(
         Option<crate::file_selection::FileSelectionModel>,
@@ -1575,11 +1889,18 @@ async fn fetch_files(
     )>,
     Error,
 > {
-    let Some((revision, summary)) = revision else {
+    let Some((revision, file_revision, summary)) = revision else {
         return Ok(None);
     };
-    let paths = loaded.is_none_or(|(old, rev, count, size)| {
-        old != id || *rev != revision || *count != summary.file_count || *size != summary.total_size
+    if file_revision == 0 || file_revision == u64::MAX {
+        return Err(Error::Stale);
+    }
+    let paths = loaded.is_none_or(|(old, rev, generation, count, size)| {
+        old != id
+            || *rev != revision
+            || *generation != file_revision
+            || *count != summary.file_count
+            || *size != summary.total_size
     });
     let mut rows: Vec<StoredFile> = Vec::new();
     let mut offset = 0;
@@ -1608,6 +1929,7 @@ async fn fetch_files(
                 offset,
                 limit,
                 revision,
+                file_revision,
                 paths,
             })
             .await;
@@ -1631,22 +1953,15 @@ async fn fetch_files(
         {
             return Err(Error::Busy);
         }
-        if page.id != id
-            || page.revision != revision
-            || page.total != summary.file_count
-            || page.total > crate::limits::ResourceLimits::default().max_files
-            || page
-                .files
-                .iter()
-                .enumerate()
-                .any(|(index, row)| row.index as usize != offset + index)
-            || page
-                .next_offset
-                .is_some_and(|next| next != offset + page.files.len() || next >= page.total)
-            || (page.files.is_empty() && offset < page.total)
-        {
-            return Err(Error::Stale);
-        }
+        validate_file_page(
+            &page,
+            id,
+            revision,
+            file_revision,
+            summary.file_count,
+            offset,
+            limit,
+        )?;
         path_bytes =
             path_bytes.saturating_add(page.files.iter().map(|file| file.path.len()).sum::<usize>());
         if path_bytes > 64 * 1024 * 1024 {
@@ -1679,6 +1994,9 @@ async fn fetch_files(
         );
         model.set_high_priority(&high);
         model.apply_summary(summary).map_err(Error::Failed)?;
+        model
+            .adopt_metadata_revision(file_revision)
+            .map_err(Error::Failed)?;
         Ok(Some((Some(model), None, revision)))
     } else {
         let mut update = crate::file_selection::CompactFileUpdate {
@@ -1700,17 +2018,56 @@ async fn fetch_files(
     }
 }
 
+fn validate_file_page(
+    page: &FilePage,
+    id: &str,
+    revision: u64,
+    file_revision: u64,
+    total: usize,
+    offset: usize,
+    limit: usize,
+) -> Result<(), Error> {
+    let end = offset.checked_add(page.files.len()).ok_or(Error::Stale)?;
+    if page.id != id
+        || page.revision != revision
+        || file_revision == 0
+        || file_revision == u64::MAX
+        || page.file_revision != file_revision
+        || page.total != total
+        || total > crate::limits::ResourceLimits::default().max_files
+        || end > total
+        || page.files.len() > limit
+        || page
+            .files
+            .iter()
+            .enumerate()
+            .any(|(index, row)| row.index as usize != offset + index)
+        || page.next_offset != (end < total).then_some(end)
+        || (page.files.is_empty() && offset < total)
+    {
+        return Err(Error::Stale);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ui04_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::file_selection::{CompactFileUpdate, FileSelectionModel};
-    fn snapshot(instance: &str, full: bool, files_interest: bool) -> Snapshot {
+    pub(super) fn snapshot(instance: &str, full: bool, files_interest: bool) -> Snapshot {
         let mut item = crate::client::tests::torrent();
         item.files =
             FileSelectionModel::from_files([("one.bin".into(), 100), ("two.bin".into(), 200)]);
         if !full {
             item.files = FileSelectionModel::from_summary(item.files.summary());
         }
+        if full {
+            item.files.set_high_priority(&[1]);
+        }
+        item.files.adopt_metadata_revision(11).unwrap();
         let id = item.info_hashes.join(";");
         Snapshot {
             instance_id: instance.into(),
@@ -1718,6 +2075,7 @@ mod tests {
             torrents: vec![NativeTorrent {
                 item,
                 command_revision: 4,
+                file_revision: 11,
                 durable: true,
                 file_updates: None,
             }],
@@ -1779,7 +2137,7 @@ mod tests {
         retain_pending_details(Some(first), &mut next);
         assert!(!next.torrents[0].item.files.details_loaded());
     }
-    fn disconnected_client() -> (Client, mpsc::Receiver<Job>) {
+    pub(super) fn disconnected_client() -> (Client, mpsc::Receiver<Job>) {
         let (jobs, receiver) = mpsc::sync_channel(64);
         let inner = Arc::new(Inner {
             directory: PathBuf::from("unused"),
@@ -1787,6 +2145,11 @@ mod tests {
             credentials: Mutex::new(("owner".into(), "a".repeat(64))),
             settings: Mutex::new(ClientSettings::default()),
             shared: Mutex::new(Shared {
+                connection: ConnectionStatus::Connected,
+                stopping_owner: None,
+                receipt_overflow: 0,
+                snapshot_serial: 0,
+                delivered_serial: 0,
                 latest: None,
                 revisions: HashMap::from([("id".into(), 7)]),
                 notices: VecDeque::new(),
@@ -1800,6 +2163,7 @@ mod tests {
                 audits: HashMap::new(),
                 audit_updates: VecDeque::new(),
                 delivered_instance: Some("owner".into()),
+                delivered_file_revisions: HashMap::from([("id".into(), 77)]),
             }),
             jobs,
             stop: AtomicBool::new(false),
@@ -1808,6 +2172,7 @@ mod tests {
             journal: crate::announce_journal::AnnounceJournal::frontend_view(),
             queued: AtomicUsize::new(0),
             inflight: AtomicBool::new(false),
+            next_job: AtomicU64::new(1),
         });
         (Client { inner }, receiver)
     }
@@ -1825,8 +2190,12 @@ mod tests {
             panic!("wrong request")
         };
         assert_eq!(files.indices().unwrap(), vec![0, 2]);
-        assert_eq!(revision, Some(7));
-        assert!(client.take_receipts().is_empty());
+        assert_eq!(revision, 7);
+        let queued = client.take_receipts();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].queued);
+        assert_eq!(queued[0].job_id, job.sequence);
+        assert_eq!(queued[0].owner_instance, "owner");
         for _ in 0..64 {
             client
                 .enqueue_submit("id", TorrentCommand::Pause, Some(7))
@@ -2057,6 +2426,7 @@ mod tests {
             "id",
             Some((
                 7,
+                77,
                 crate::file_selection::FileSummary {
                     file_count: 3,
                     ..Default::default()

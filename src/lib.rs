@@ -1,6 +1,7 @@
 pub mod announce_journal;
 #[cfg(feature = "gui")]
 pub mod app;
+pub mod appearance;
 pub mod blocklist;
 pub mod buffer_pool;
 pub mod client;
@@ -40,8 +41,10 @@ pub mod settings;
 pub mod settings_support;
 pub mod state;
 pub mod storage;
+pub mod table_view;
 pub mod torrent;
 pub mod torrent_filter;
+pub mod torrent_selection;
 pub mod torrent_view;
 pub mod tracker;
 pub mod tracker_behavior;
@@ -49,5 +52,6 @@ pub mod transfer;
 pub mod transfer_settings;
 #[cfg(feature = "tui")]
 pub mod tui;
+pub mod ui_operations;
 pub mod ui_schema;
 pub mod verify;

@@ -115,7 +115,7 @@ jobs:
           cargo +1.93.0 test --locked --lib app::file_scroll_tests
           cargo +1.93.0 test --locked --lib app::torrent_panes
           cargo +1.93.0 test --locked --lib app::upload_ratio
-      - run: cargo +1.93.0 build --locked --features tui --bin peerlume --bin peerlume-control
+      - run: cargo +1.93.0 build --locked --features tui --bin peerlume --bin peerlume-daemon --bin peerlume-control
       - name: Operate the actual installed GUI and collect screenshots
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'

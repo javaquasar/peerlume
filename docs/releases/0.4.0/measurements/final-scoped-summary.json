@@ -1,0 +1,261 @@
+{
+  "schema": 1,
+  "scope": "windows-gui-0.4.0",
+  "files": {
+    "src/appearance.rs": {
+      "lines": {
+        "count": 192,
+        "covered": 192,
+        "uncovered": 0,
+        "percent": 100.0
+      },
+      "functions": {
+        "count": 23,
+        "covered": 23,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/ui_operations.rs": {
+      "lines": {
+        "count": 748,
+        "covered": 697,
+        "uncovered": 51,
+        "percent": 93.18181818181819
+      },
+      "functions": {
+        "count": 83,
+        "covered": 82,
+        "uncovered": 1,
+        "percent": 98.79518072289157
+      }
+    },
+    "src/table_view.rs": {
+      "lines": {
+        "count": 181,
+        "covered": 178,
+        "uncovered": 3,
+        "percent": 98.34254143646409
+      },
+      "functions": {
+        "count": 30,
+        "covered": 30,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/torrent_selection.rs": {
+      "lines": {
+        "count": 135,
+        "covered": 135,
+        "uncovered": 0,
+        "percent": 100.0
+      },
+      "functions": {
+        "count": 29,
+        "covered": 29,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/file_selection/hierarchy.rs": {
+      "lines": {
+        "count": 359,
+        "covered": 353,
+        "uncovered": 6,
+        "percent": 98.32869080779945
+      },
+      "functions": {
+        "count": 46,
+        "covered": 41,
+        "uncovered": 5,
+        "percent": 89.1304347826087
+      }
+    },
+    "src/file_selection/metadata.rs": {
+      "lines": {
+        "count": 109,
+        "covered": 109,
+        "uncovered": 0,
+        "percent": 100.0
+      },
+      "functions": {
+        "count": 20,
+        "covered": 20,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/app/file_tree.rs": {
+      "lines": {
+        "count": 386,
+        "covered": 350,
+        "uncovered": 36,
+        "percent": 90.67357512953367
+      },
+      "functions": {
+        "count": 28,
+        "covered": 27,
+        "uncovered": 1,
+        "percent": 96.42857142857143
+      }
+    },
+    "src/app/torrent_table.rs": {
+      "lines": {
+        "count": 572,
+        "covered": 560,
+        "uncovered": 12,
+        "percent": 97.9020979020979
+      },
+      "functions": {
+        "count": 43,
+        "covered": 43,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/app/desktop_controls.rs": {
+      "lines": {
+        "count": 367,
+        "covered": 363,
+        "uncovered": 4,
+        "percent": 98.91008174386921
+      },
+      "functions": {
+        "count": 27,
+        "covered": 27,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    },
+    "src/app/operation_tracking.rs": {
+      "lines": {
+        "count": 363,
+        "covered": 283,
+        "uncovered": 80,
+        "percent": 77.96143250688705
+      },
+      "functions": {
+        "count": 22,
+        "covered": 20,
+        "uncovered": 2,
+        "percent": 90.9090909090909
+      }
+    },
+    "src/app/desktop_integration.rs": {
+      "lines": {
+        "count": 576,
+        "covered": 464,
+        "uncovered": 112,
+        "percent": 80.55555555555556
+      },
+      "functions": {
+        "count": 55,
+        "covered": 48,
+        "uncovered": 7,
+        "percent": 87.27272727272727
+      }
+    }
+  },
+  "context_files": {
+    "src/app.rs": {
+      "lines": {
+        "count": 3948,
+        "covered": 1552,
+        "uncovered": 2396,
+        "percent": 39.31104356636271
+      },
+      "functions": {
+        "count": 311,
+        "covered": 146,
+        "uncovered": 165,
+        "percent": 46.945337620578776
+      }
+    },
+    "src/app/file_location.rs": {
+      "lines": {
+        "count": 304,
+        "covered": 268,
+        "uncovered": 36,
+        "percent": 88.15789473684211
+      },
+      "functions": {
+        "count": 31,
+        "covered": 24,
+        "uncovered": 7,
+        "percent": 77.41935483870968
+      }
+    },
+    "src/control/frontend/client.rs": {
+      "lines": {
+        "count": 2115,
+        "covered": 1403,
+        "uncovered": 712,
+        "percent": 66.33569739952719
+      },
+      "functions": {
+        "count": 215,
+        "covered": 82,
+        "uncovered": 133,
+        "percent": 38.13953488372093
+      }
+    },
+    "src/control/frontend/server.rs": {
+      "lines": {
+        "count": 799,
+        "covered": 504,
+        "uncovered": 295,
+        "percent": 63.07884856070088
+      },
+      "functions": {
+        "count": 71,
+        "covered": 29,
+        "uncovered": 42,
+        "percent": 40.84507042253521
+      }
+    },
+    "src/settings.rs": {
+      "lines": {
+        "count": 719,
+        "covered": 667,
+        "uncovered": 52,
+        "percent": 92.76773296244784
+      },
+      "functions": {
+        "count": 53,
+        "covered": 42,
+        "uncovered": 11,
+        "percent": 79.24528301886792
+      }
+    },
+    "src/torrent_view.rs": {
+      "lines": {
+        "count": 355,
+        "covered": 340,
+        "uncovered": 15,
+        "percent": 95.77464788732394
+      },
+      "functions": {
+        "count": 18,
+        "covered": 18,
+        "uncovered": 0,
+        "percent": 100.0
+      }
+    }
+  },
+  "totals": {
+    "lines": {
+      "count": 3988,
+      "covered": 3684,
+      "uncovered": 304,
+      "percent": 92.37713139418254
+    },
+    "functions": {
+      "count": 406,
+      "covered": 390,
+      "uncovered": 16,
+      "percent": 96.05911330049261
+    }
+  },
+  "baseline_gate": "not_established"
+}

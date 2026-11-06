@@ -353,6 +353,8 @@ pub struct AutomationSettings {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
+    pub table_columns: crate::table_view::TableColumns,
+    pub appearance: crate::appearance::AppearanceSettings,
     pub last_preferences_tab: usize,
     pub torrent_pane_percent: u16,
     pub name_gap_pixels: u32,
@@ -362,6 +364,15 @@ pub struct UiSettings {
     pub category_filter: String,
     pub labels: std::collections::BTreeMap<String, String>,
     pub categories: std::collections::BTreeMap<String, String>,
+}
+
+impl UiSettings {
+    pub fn normalize(&mut self) {
+        self.table_columns.normalize();
+        self.appearance.normalize();
+        self.name_gap_pixels = self.name_gap_pixels.min(10_000);
+        self.torrent_pane_percent = self.torrent_pane_percent.min(80);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -419,6 +430,7 @@ impl ClientSettings {
         if value.get("download").is_some() || value.get("version").is_some() {
             let mut settings: Self = toml::from_str(contents)?;
             settings.version = CONFIG_VERSION;
+            settings.ui.normalize();
             Ok(settings)
         } else {
             let legacy: LegacySettings = toml::from_str(contents)?;
@@ -1065,3 +1077,7 @@ blocklist_auto_update = false
         assert!(fields.contains(&"privacy.blocklist_url"));
     }
 }
+
+#[cfg(test)]
+#[path = "settings/ui04_tests.rs"]
+mod ui04_tests;

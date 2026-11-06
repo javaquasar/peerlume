@@ -11,15 +11,23 @@ pub enum Sort {
     Download,
     Upload,
     Size,
+    Status,
+    Peers,
+    Eta,
+    Ratio,
 }
 impl Sort {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Added,
         Self::Name,
         Self::Progress,
         Self::Download,
         Self::Upload,
         Self::Size,
+        Self::Status,
+        Self::Peers,
+        Self::Eta,
+        Self::Ratio,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -29,6 +37,10 @@ impl Sort {
             Self::Download => "Download",
             Self::Upload => "Upload",
             Self::Size => "Size",
+            Self::Status => "Status",
+            Self::Peers => "Peers",
+            Self::Eta => "ETA",
+            Self::Ratio => "Ratio",
         }
     }
 }
@@ -53,6 +65,8 @@ enum SortMetric {
     None,
     Number(u64),
     Fraction(u64, u64),
+    OptionalNumber(Option<u64>),
+    Pair(u64, u64),
 }
 
 #[derive(Default)]
@@ -174,6 +188,17 @@ impl ViewCache {
                 Sort::Download => SortMetric::Number(torrent.download_rate),
                 Sort::Upload => SortMetric::Number(torrent.upload_rate),
                 Sort::Size => SortMetric::Number(torrent.selected_size()),
+                Sort::Status => SortMetric::Number(status_rank(torrent.state)),
+                Sort::Peers => SortMetric::Pair(torrent.peers as u64, torrent.seeds as u64),
+                Sort::Eta => SortMetric::OptionalNumber(torrent.eta_seconds()),
+                Sort::Ratio => SortMetric::Fraction(
+                    if torrent.downloaded_bytes == 0 {
+                        0
+                    } else {
+                        torrent.uploaded_bytes
+                    },
+                    torrent.downloaded_bytes.max(1),
+                ),
             };
             dirty |= cached.visible != visible || (visible && cached.metric != metric);
             cached.visible = visible;
@@ -197,20 +222,54 @@ impl ViewCache {
                             (u128::from(ad) * u128::from(bz))
                                 .cmp(&(u128::from(bd) * u128::from(az)))
                         }
+                        (SortMetric::OptionalNumber(a), SortMetric::OptionalNumber(b)) => {
+                            match (a, b) {
+                                (Some(a), Some(b)) => a.cmp(&b),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            }
+                        }
+                        (SortMetric::Pair(a, az), SortMetric::Pair(b, bz)) => (a, az).cmp(&(b, bz)),
                         _ => std::cmp::Ordering::Equal,
                     },
-                }
-                .then_with(|| left.hashes.cmp(&right.hashes));
-                if view.descending {
+                };
+                // Unknown ETA stays at the end in both directions. Equal values
+                // always use canonical identity, not a transient row position.
+                let unknown_eta = matches!(
+                    (left.metric, right.metric),
+                    (
+                        SortMetric::OptionalNumber(None),
+                        SortMetric::OptionalNumber(Some(_))
+                    ) | (
+                        SortMetric::OptionalNumber(Some(_)),
+                        SortMetric::OptionalNumber(None)
+                    )
+                );
+                let order = if view.descending && !unknown_eta {
                     order.reverse()
                 } else {
                     order
-                }
+                };
+                order.then_with(|| left.hashes.cmp(&right.hashes))
             });
             self.result = Arc::new(result);
             self.rebuilds = self.rebuilds.saturating_add(1);
         }
         self.result.clone()
+    }
+}
+
+fn status_rank(state: crate::torrent::TorrentState) -> u64 {
+    use crate::torrent::TorrentState;
+    match state {
+        TorrentState::Error => 0,
+        TorrentState::VerificationFailed => 1,
+        TorrentState::WaitingForEngine => 2,
+        TorrentState::Checking => 3,
+        TorrentState::Downloading => 4,
+        TorrentState::Seeding => 5,
+        TorrentState::Paused => 6,
     }
 }
 
@@ -447,3 +506,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "torrent_view/ui04_tests.rs"]
+mod ui04_tests;

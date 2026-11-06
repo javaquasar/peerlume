@@ -1,7 +1,7 @@
 //! Exercise the production screen without opening profiles, sessions or sockets.
 use crate::app::*;
 
-fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
+pub(in crate::app) fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
     let settings = ClientSettings::default();
     let torrents = (0..count)
         .map(|index| {
@@ -22,6 +22,16 @@ fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
         details_tab: DetailsTab::Files,
         preferences_tab: Default::default(),
         selected_torrent: 0,
+        selection: Default::default(),
+        identities: Default::default(),
+        appearance_state: Default::default(),
+        operation_tracker: Default::default(),
+        operations_open: false,
+        appearance_open: false,
+        magnet_open: false,
+        open_agent_access: false,
+        batch_remove: None,
+        stop_confirmation: None,
         status_filter: Default::default(),
         name_column: Default::default(),
         view_cache: Default::default(),
@@ -119,17 +129,31 @@ fn view_controls_wrap_inside_the_actual_window_even_with_an_overflowing_status_m
         let mut app = fixture(2, 3);
         app.add_status = "Long status ".repeat(80);
         let output = settle(&ctx, &mut app, egui::vec2(width, 1000.0));
+        let more = text_rect(&output, "More");
+        assert!(
+            more.left() >= 0.0 && more.right() <= width,
+            "view control outside window: {more:?} / {width}"
+        );
+        assert!(more.bottom() < pane(&ctx).top());
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &mut app,
+                egui::vec2(width, 1000.0),
+                pointer(more.center(), pressed),
+            );
+        }
+        let output = settle(&ctx, &mut app, egui::vec2(width, 1000.0));
         let save = text_rect(&output, "Save view");
         assert!(
             save.left() >= 0.0 && save.right() <= width,
-            "view control outside window: {save:?} / {width}"
+            "overflow Save view outside viewport: {save:?}"
         );
-        assert!(save.bottom() < pane(&ctx).top());
     }
 }
 
 #[test]
-fn transfer_editor_is_a_retained_draft_even_when_the_engine_rejects_submission() {
+fn offline_transfer_editor_retains_the_draft_without_submitting() {
     let ctx = egui::Context::default();
     let mut app = fixture(1, 1);
     app.details_tab = DetailsTab::Settings;
@@ -175,7 +199,18 @@ fn transfer_editor_is_a_retained_draft_even_when_the_engine_rejects_submission()
     let position = text_rect(&output, "Apply transfer settings").center();
     render(&mut app, pointer(position, true), None, &mut draft_id);
     render(&mut app, pointer(position, false), None, &mut draft_id);
-    assert!(app.add_status.contains("unavailable"), "{}", app.add_status);
+    assert!(
+        app.add_status.is_empty(),
+        "Disabled offline control must not submit: {}",
+        app.add_status
+    );
+    assert!(
+        app.control.torrents[0]
+            .runtime
+            .command
+            .pending_action()
+            .is_none()
+    );
     assert_eq!(app.control.torrents[0].overrides, confirmed);
     assert_eq!(
         ctx.data_mut(|data| data.get_temp::<TorrentOverrides>(draft_id.unwrap()))
@@ -434,7 +469,7 @@ fn empty_filtered_lists_and_extreme_short_windows_keep_the_divider_inside_the_pa
         assert!(top.top() >= 0.0 && top.bottom() <= height);
         text_rect(
             &output,
-            "No torrents match this status. Choose All to show every torrent.",
+            "Select a visible torrent to inspect its files and details.",
         );
     }
     assert_eq!(app.control.torrents.len(), 5);

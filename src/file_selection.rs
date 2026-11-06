@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::metainfo::MetainfoFile;
 mod deferred;
+mod hierarchy;
+mod metadata;
+pub use hierarchy::{Expansion, FileHierarchy, FolderSelection, HierarchyRow};
 #[cfg(test)]
 mod deferred_tests;
 pub use deferred::{CompactFileUpdate, FileMemoryUsage, FileState, FileSummary};
@@ -25,6 +28,9 @@ pub enum FileTreeRow {
 pub struct FileSelectionModel {
     high_priority: Vec<u8>,
     view_cache: std::sync::Arc<std::sync::Mutex<Option<FileViewCache>>>,
+    hierarchy_cache: hierarchy::Cache,
+    selection_revision: u64,
+    metadata: metadata::Revision,
     files: Vec<TorrentFile>,
     deferred: Option<DeferredFiles>,
     rows: Vec<FileTreeRow>,
@@ -62,9 +68,14 @@ impl FileSelectionModel {
     }
     pub fn set_high_priority(&mut self, indices: &[usize]) {
         let count = self.file_count();
-        self.high_priority = vec![0; count.div_ceil(8)];
+        let mut incoming = vec![0; count.div_ceil(8)];
         for &index in indices.iter().filter(|index| **index < count) {
-            set_bit(&mut self.high_priority, index, true);
+            set_bit(&mut incoming, index, true);
+        }
+        let changed = metadata::priorities_changed(&self.high_priority, &incoming, count);
+        self.high_priority = incoming;
+        if changed {
+            self.metadata.changed();
         }
     }
     pub fn from_files(files: impl IntoIterator<Item = (String, u64)>) -> Self {
@@ -99,12 +110,15 @@ impl FileSelectionModel {
     fn from_torrent_files(files: impl IntoIterator<Item = TorrentFile>) -> Self {
         let files: Vec<_> = files.into_iter().collect();
         let rows = build_tree_rows(&files);
+        let hierarchy_cache = hierarchy::Cache::loaded(&files);
         let mut model = Self {
             files,
             rows,
+            hierarchy_cache,
             ..Self::default()
         };
         model.refresh_selection_totals();
+        model.metadata.loaded(&model.files);
         model
     }
 
@@ -120,6 +134,17 @@ impl FileSelectionModel {
     }
     pub fn details_loaded(&self) -> bool {
         self.deferred.is_none()
+    }
+    /// O(1) mutation fence, scoped to the authoritative owner instance. Download
+    /// telemetry and loaded/cold representation changes do not advance it.
+    pub fn metadata_revision(&self) -> u64 {
+        self.metadata.value()
+    }
+    /// Trusted native projection only: call after validating owner identity and
+    /// every detail page's command/file fence. Never bless stale retained bits
+    /// with a newer header's fence when those pages were not obtained.
+    pub fn adopt_metadata_revision(&mut self, revision: u64) -> Result<(), String> {
+        self.metadata.adopt(revision)
     }
     pub fn total_size(&self) -> u64 {
         self.total_size
@@ -278,7 +303,15 @@ impl FileSelectionModel {
                 self.set_file_downloaded(index, snapshot.downloaded[index]);
             }
         }
+        let priorities_changed = metadata::priorities_changed(
+            &self.high_priority,
+            &snapshot.priority_bits,
+            self.file_count(),
+        );
         self.high_priority = snapshot.priority_bits.clone();
+        if priorities_changed {
+            self.metadata.changed();
+        }
         Ok(())
     }
     pub fn apply_summary(&mut self, summary: FileSummary) -> Result<(), String> {
@@ -303,6 +336,9 @@ impl FileSelectionModel {
         if self.deferred.is_some() {
             return false;
         }
+        if self.metadata.legacy_pending() {
+            self.refresh_selection_totals();
+        }
         let mut compact = CompactFiles {
             sizes: Vec::with_capacity(self.files.len()),
             downloaded: Vec::with_capacity(self.files.len()),
@@ -316,6 +352,7 @@ impl FileSelectionModel {
         self.deferred = Some(DeferredFiles::Compact(compact));
         self.rows = Vec::new();
         self.view_cache = Default::default();
+        self.hierarchy_cache = Default::default();
         true
     }
     /// Paths from a bounded loader are merged with current canonical compact data.
@@ -348,8 +385,14 @@ impl FileSelectionModel {
                 selected: bit(&compact.selected, index),
             })
             .collect();
+        self.metadata.hydrate(
+            self.files
+                .iter()
+                .map(|file| (file.path.as_str(), file.size_bytes)),
+        );
         self.rows = build_tree_rows(&self.files);
         self.view_cache = Default::default();
+        self.hierarchy_cache = hierarchy::Cache::loaded(&self.files);
         Ok(())
     }
     pub fn memory_usage(&self) -> FileMemoryUsage {
@@ -377,11 +420,12 @@ impl FileSelectionModel {
             }
             _ => 0,
         };
+        let (hierarchy_bytes, hierarchy_view_bytes) = self.hierarchy_cache.allocated_bytes();
         FileMemoryUsage {
             file_slots_bytes: self.files.capacity() * std::mem::size_of::<TorrentFile>(),
             path_capacity_bytes: self.files.iter().map(|file| file.path.capacity()).sum(),
-            tree_capacity_bytes: row_bytes(&self.rows),
-            view_capacity_bytes,
+            tree_capacity_bytes: row_bytes(&self.rows) + hierarchy_bytes,
+            view_capacity_bytes: view_capacity_bytes + hierarchy_view_bytes,
             compact_capacity_bytes,
             priority_capacity_bytes: self.high_priority.capacity(),
         }
@@ -459,6 +503,10 @@ impl FileSelectionModel {
     }
 
     pub fn rows_and_files_mut(&mut self) -> (&[FileTreeRow], &mut [TorrentFile]) {
+        // Compatibility bulk-edit path. Reconcile with refresh_selection_totals
+        // before reading a mutation fence or dispatching an intent. New views
+        // render readonly rows and use set_selected for actual checkbox edits.
+        self.metadata.begin_legacy(&self.files);
         (&self.rows, &mut self.files)
     }
 
@@ -482,6 +530,8 @@ impl FileSelectionModel {
                 return false;
             }
             self.selected_downloaded_summary = None;
+            self.selection_revision = self.selection_revision.wrapping_add(1);
+            self.metadata.changed();
             let downloaded = files.downloaded[index].min(size);
             if selected {
                 self.selected_count += 1;
@@ -502,6 +552,8 @@ impl FileSelectionModel {
             return false;
         }
         self.selected_downloaded_summary = None;
+        self.selection_revision = self.selection_revision.wrapping_add(1);
+        self.metadata.changed();
         if selected {
             self.selected_count += 1;
             self.selected_size = self.selected_size.saturating_add(file.size_bytes);
@@ -520,6 +572,12 @@ impl FileSelectionModel {
     }
 
     pub fn refresh_selection_totals(&mut self) {
+        if self.metadata.finish_legacy(&self.files) {
+            self.rows = build_tree_rows(&self.files);
+            self.hierarchy_cache = hierarchy::Cache::loaded(&self.files);
+            self.view_cache = Default::default();
+        }
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         if matches!(self.deferred, Some(DeferredFiles::Summary(_))) {
             return;
         }

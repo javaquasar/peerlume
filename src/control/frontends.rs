@@ -4,6 +4,8 @@ use super::{Controller, access::Grants};
 #[derive(Default)]
 pub(crate) struct AccessPanel {
     pub open: bool,
+    #[cfg(feature = "gui")]
+    pub compact: bool,
     pub grants: Grants,
     pub token: String,
     pub status: String,
@@ -63,16 +65,18 @@ impl AccessPanel {
             return;
         }
         use eframe::egui;
-        egui::TopBottomPanel::top("agent_access_button").show(ctx, |ui| {
-            if ui.button("Agent access...").clicked() {
-                self.open = !self.open;
-            }
-            ui.label(if control.agent.as_ref().is_some_and(|a| a.enabled) {
-                "Local agents enabled"
-            } else {
-                "Agent access disabled"
+        if !self.compact {
+            egui::TopBottomPanel::top("agent_access_button").show(ctx, |ui| {
+                if ui.button("Agent access...").clicked() {
+                    self.open = !self.open;
+                }
+                ui.label(if control.agent.as_ref().is_some_and(|a| a.enabled) {
+                    "Local agents enabled"
+                } else {
+                    "Agent access disabled"
+                });
             });
-        });
+        }
         if !self.open {
             return;
         }
@@ -126,17 +130,19 @@ impl AccessPanel {
     fn show_remote(&mut self, client: &super::frontend::Client, ctx: &eframe::egui::Context) {
         use super::frontend::AccessAction;
         use eframe::egui;
-        egui::TopBottomPanel::top("agent_access_button").show(ctx, |ui| {
-            if ui.button("Agent access...").clicked() {
-                self.open = !self.open;
-                self.remote_refreshed = None;
-            }
-            ui.label(if client.access_view().enabled {
-                "Local agents enabled"
-            } else {
-                "Agent access disabled"
+        if !self.compact {
+            egui::TopBottomPanel::top("agent_access_button").show(ctx, |ui| {
+                if ui.button("Agent access...").clicked() {
+                    self.open = !self.open;
+                    self.remote_refreshed = None;
+                }
+                ui.label(if client.access_view().enabled {
+                    "Local agents enabled"
+                } else {
+                    "Agent access disabled"
+                });
             });
-        });
+        }
         if !self.open {
             return;
         }

@@ -89,3 +89,100 @@ jobs:
           path: coverage/
           if-no-files-found: warn
           retention-days: 14
+
+  windows-gui-coverage:
+    name: Windows GUI render and action coverage
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_DIR: target/coverage-gui-build
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Test the GUI coverage report and gate contracts
+        run: |
+          python -m unittest discover -s scripts -p '*gui_coverage.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s scripts -p 'test_prepare_ui_candidate.py' -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install stable Rust and matching LLVM tools
+        run: rustup toolchain install 1.93.0 --profile minimal --component llvm-tools-preview
+      - name: Test literal selective-instrumentation wrapper arguments
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .tools | Out-Null
+          rustc +1.93.0 --edition=2024 --test scripts/gui_coverage_wrapper.rs -o .tools/gui-coverage-wrapper-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.tools/gui-coverage-wrapper-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            .tools/coverage-gui
+            target/coverage-gui-build
+          key: ${{ runner.os }}-gui-coverage-0.9.1-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/coverage.yml') }}
+      - name: Check coverage build disk budget
+        run: python scripts/check_gui_coverage.py --preflight target/coverage-gui-build --minimum-free-gib 8
+      - name: Install pinned coverage tool
+        shell: pwsh
+        run: |
+          if (!(Test-Path .tools/coverage-gui/bin/cargo-llvm-cov.exe)) {
+            cargo +1.93.0 install cargo-llvm-cov --locked --version 0.9.1 --root .tools/coverage-gui
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          "$env:GITHUB_WORKSPACE/.tools/coverage-gui/bin" >> $env:GITHUB_PATH
+      - name: Instrument actual GUI rendering, actions, and receipt tests
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}/peerlume-gui-coverage/localappdata
+          APPDATA: ${{ runner.temp }}/peerlume-gui-coverage/appdata
+          XDG_CONFIG_HOME: ${{ runner.temp }}/peerlume-gui-coverage/config
+          XDG_DATA_HOME: ${{ runner.temp }}/peerlume-gui-coverage/data
+          XDG_CACHE_HOME: ${{ runner.temp }}/peerlume-gui-coverage/cache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path coverage/windows-gui | Out-Null
+          foreach ($directory in @($env:LOCALAPPDATA, $env:APPDATA, $env:XDG_CONFIG_HOME, $env:XDG_DATA_HOME, $env:XDG_CACHE_HOME)) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          }
+          cargo +1.93.0 llvm-cov clean --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.0 llvm-cov test --locked --all-features --lib -p peerlume --no-report -- --test-threads=2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Export measured per-source reports without rerunning tests
+        shell: pwsh
+        run: |
+          cargo +1.93.0 llvm-cov report --json --output-path coverage/windows-gui/llvm.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.0 llvm-cov report --lcov --output-path coverage/windows-gui/lcov.info
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.93.0 llvm-cov report --html --output-dir coverage/windows-gui/html
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify every new GUI module and any established numeric baseline
+        shell: pwsh
+        run: |
+          $coverageArgs = @('--output', 'coverage/windows-gui/scoped-summary.json', '--summary', $env:GITHUB_STEP_SUMMARY)
+          if (Test-Path config/windows-gui-coverage-baseline.json) {
+            $coverageArgs += @('--baseline', 'config/windows-gui-coverage-baseline.json')
+          }
+          python scripts/check_gui_coverage.py @coverageArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows GUI coverage and uncovered source details
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-windows-gui
+          path: coverage/windows-gui/
+          if-no-files-found: warn
+          retention-days: 14

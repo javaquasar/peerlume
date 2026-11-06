@@ -65,7 +65,7 @@ fn invalid_arguments() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "Invalid argument; use --help")
 }
 
-fn main() -> io::Result<()> {
+pub(crate) fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--version"] {
         println!("peerlume-daemon {}", env!("CARGO_PKG_VERSION"));

@@ -1,0 +1,40 @@
+{
+  "scoped_owner_stop_exit": 0,
+  "production_source_at_build": "18b8e8426d23bcaa12989b77800079d1079eac12c701623d8eb41fbd196d9873",
+  "user_process_checks": [
+    {
+      "pid": 53652,
+      "same_executable": true,
+      "actual_utc": "2026-11-06T01:09:36.3728194+01:00",
+      "same_start_time": true,
+      "expected_utc": "2026-11-06T01:09:36.3728194+01:00"
+    },
+    {
+      "pid": 29400,
+      "same_executable": true,
+      "actual_utc": "2026-11-06T01:08:31.042964+01:00",
+      "same_start_time": true,
+      "expected_utc": "2026-11-06T01:08:31.042964+01:00"
+    }
+  ],
+  "time_utc": "2026-11-06T10:48:50.131823Z",
+  "attached_gui_did_not_restart_owner": true,
+  "visual_inspection": "blocked",
+  "capture_errors": [
+    "FrameArrived timed out: timed out waiting on channel",
+    "window capture timed out: timed out waiting on channel"
+  ],
+  "rows_before_close": 80,
+  "startup_during_stop_rejected_without_replacement": true,
+  "third_owner": "4b7db40ec3c5622b050a726a98b1bedaee393b8846a908d2826223e10da1c354",
+  "all_candidate_owners_stopped": true,
+  "initial_gui_pid": 59252,
+  "normal_alt_f4_close_preserved_same_owner_and_rows": true,
+  "third_gui_pid": 53348,
+  "initial_owner": "2d8a50facbb3723767e1428ec9a5da3f31c12c9b066bdbbcc29700be29fa14cd",
+  "candidate_window_responding": true,
+  "candidate_directory": "disposable-ui-candidate",
+  "last_test_gui_exited": true,
+  "verification_correction": "Compare normalized UTC ticks: the initial report compared a string with a JSON-parsed DateTime. Actual PID/start-time/path are unchanged.",
+  "redaction": "Only the machine-specific candidate directory was replaced; measured identities, timestamps and outcomes are retained."
+}

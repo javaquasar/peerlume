@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "final_capture_completed": true,
+  "source_before_after_equal": true,
+  "source_file_count": 324,
+  "source_file_set_sha256": "717ba2c7d5fe7fda706aadfe899f3595098d3a6350222ae0dc2a59a7dc3575a3",
+  "base_commit": "c949c91a6d3c1b7730d3faf2e396f184d5d45f03",
+  "candidate_is_a_new_commit": false,
+  "production_candidate_build_source_sha256": "18b8e8426d23bcaa12989b77800079d1079eac12c701623d8eb41fbd196d9873",
+  "production_rust_unchanged_from_candidate_build": true,
+  "changed_files_since_candidate_build": [
+    "scripts/check_gui_coverage.py",
+    "scripts/test_gui_coverage.py",
+    "src/app/desktop_integration/tests.rs",
+    "src/app/operation_tracking/tests.rs"
+  ],
+  "instrumented_tests": {
+    "passed": 788,
+    "failed": 0,
+    "ignored": 7,
+    "seconds": 141.31
+  },
+  "executable_sha256": "b2bf39fa4871840cae57bfed83d78ffeeaa90c79a190efc2adde1d20a6a7aece",
+  "raw_reports": {
+    "capture.json": {
+      "bytes": 7276,
+      "sha256": "c066d6c9268c006e8fdf9987aa29718c43c79150b4d4125a2c001227e326452e"
+    },
+    "llvm.json": {
+      "bytes": 76473,
+      "sha256": "c370c9b3c3c8200c20f3c5cd04ce7e0a72ab079cc47d6ead71536ff2bc912692"
+    },
+    "lcov.info": {
+      "bytes": 1733079,
+      "sha256": "ce3a77fd39b49618d904dc64ab45ce6ea874b1369d4c45f71085f40e6a9adad0"
+    },
+    "scoped-summary.json": {
+      "bytes": 5792,
+      "sha256": "282edbecb9c8455f87d986c5a9f8a0a98fc033920bf3d402ad4398b020bc83d4"
+    },
+    "gui.profdata": {
+      "bytes": 858328,
+      "sha256": "8130ee665d770e6e3f4bef93f42f9e1f3eaba6779eaf98fd12d3157c2eb1f4f5"
+    },
+    "instrumented-library-tests.stdout.log": {
+      "bytes": 79176,
+      "sha256": "563698b9b879a91e9872a3f98688d308fa41ed64f9db04b88dc004b8ceac251d"
+    },
+    "source-after.json": {
+      "bytes": 51396,
+      "sha256": "431e8132eee3a076aa561171dd4e537af4573c878084e67cd4ef26f8ba85b1bc"
+    }
+  }
+}

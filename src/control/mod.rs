@@ -58,6 +58,7 @@ pub struct Controller {
     diagnostic_tail: diagnostics::Tail,
     pub(crate) frontend_busy: std::collections::HashSet<String>,
     native_instance_id: Option<String>,
+    native_durability: HashMap<String, (u64, bool)>,
     pub(crate) agent: Option<agent::AgentService>,
     pending_removals: std::collections::BTreeSet<String>,
     pending_restore: std::collections::BTreeSet<String>,
@@ -88,6 +89,7 @@ impl Controller {
             diagnostic_tail: Default::default(),
             frontend_busy: Default::default(),
             native_instance_id: None,
+            native_durability: Default::default(),
             agent: None,
             pending_removals: Default::default(),
             pending_restore: Default::default(),
@@ -720,7 +722,24 @@ impl Controller {
         else {
             return;
         };
+        self.apply_native_snapshot(snapshot);
+    }
+
+    fn apply_native_snapshot(&mut self, snapshot: frontend::Snapshot) {
         let same_owner = self.native_instance_id.as_ref() == Some(&snapshot.instance_id);
+        if !same_owner {
+            self.native_durability.clear();
+        }
+        let native_durability = snapshot
+            .torrents
+            .iter()
+            .map(|row| {
+                (
+                    row.item.info_hashes.join(";"),
+                    (row.command_revision, row.durable),
+                )
+            })
+            .collect();
         self.native_instance_id = Some(snapshot.instance_id);
         let mut previous: HashMap<_, _> = std::mem::take(&mut self.torrents)
             .into_iter()
@@ -741,14 +760,7 @@ impl Controller {
                     && let Some(mut old) = previous.remove(&id)
                     && old.files.details_loaded()
                 {
-                    let summary = row.item.files.summary();
-                    let updates_ok = row
-                        .file_updates
-                        .as_ref()
-                        .is_none_or(|update| old.files.apply_persistence_snapshot(update).is_ok());
-                    if updates_ok && old.files.apply_summary(summary).is_ok() {
-                        row.item.files = old.files;
-                    }
+                    Self::preserve_native_file_details(&mut row, &mut old);
                 }
                 row.item
             })
@@ -758,6 +770,7 @@ impl Controller {
             .into_iter()
             .map(|row| (row.id.clone(), row))
             .collect();
+        self.native_durability = native_durability;
         self.unpersisted_updates.clear();
         self.pending_removals.clear();
         self.pending_restore.clear();
@@ -776,6 +789,53 @@ impl Controller {
                 self.notices.pop_front();
             }
             self.notices.push_back(notice);
+        }
+    }
+
+    /// Durability is an explicit owner snapshot fact, never inferred from a
+    /// frontend mirror's lack of local SQLite work. Revisions must still match.
+    pub fn native_command_evidence(&self, id: &str) -> Option<(u64, bool)> {
+        let instance = self.native_instance_id.as_ref()?;
+        if let Some(client) = self.backend.attached_client() {
+            let connection = client.connection();
+            if connection.status != frontend::ConnectionStatus::Connected
+                || connection.owner_instance.as_ref() != Some(instance)
+            {
+                return None;
+            }
+        }
+        let canonical = self
+            .observed
+            .get_key_value(id)
+            .map(|(id, _)| id)
+            .or_else(|| {
+                self.torrent_indices
+                    .get(id)
+                    .and_then(|&index| self.canonical_ids.get(index))
+            })?;
+        let observed = self.observed.get(canonical)?;
+        self.native_durability
+            .get(canonical)
+            .copied()
+            .filter(|(revision, _)| *revision == observed.command_revision)
+    }
+
+    fn preserve_native_file_details(row: &mut frontend::NativeTorrent, old: &mut TorrentItem) {
+        // Command acceptance and engine metadata ACKs are independent. Equal
+        // selected counts or command revisions cannot authorize stale bitmaps.
+        if old.files.metadata_revision() != row.file_revision {
+            return;
+        }
+        let summary = row.item.files.summary();
+        let updates_ok = row.file_updates.as_ref().is_none_or(|update| {
+            old.files.apply_persistence_snapshot(update).is_ok()
+                && old.files.metadata_revision() == row.file_revision
+        });
+        if updates_ok
+            && old.files.apply_summary(summary).is_ok()
+            && old.files.adopt_metadata_revision(row.file_revision).is_ok()
+        {
+            std::mem::swap(&mut row.item.files, &mut old.files);
         }
     }
 
@@ -871,6 +931,8 @@ mod agent_tests;
 mod continuous_soak;
 #[cfg(test)]
 mod feedback_tests;
+#[cfg(test)]
+mod native_file_tests;
 #[cfg(test)]
 mod removal_tests;
 #[cfg(test)]

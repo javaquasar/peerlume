@@ -117,19 +117,19 @@ pub async fn read<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<
         .take(MAX_FRAME_BYTES as u64 + 1)
         .read_until(b'\n', &mut bytes)
         .await
-        .map_err(|_| Error::Failed("Native connection closed".into()))?;
+        .map_err(|_| Error::Transport("Native connection closed".into()))?;
     if count > MAX_FRAME_BYTES {
         return Err(Error::TooLarge);
     }
     if bytes.pop() != Some(b'\n') {
-        return Err(Error::Failed("Native frame is incomplete".into()));
+        return Err(Error::Transport("Native frame is incomplete".into()));
     }
     Ok(bytes)
 }
 
 pub async fn call(directory: &Path, request: &Request) -> Result<Response, Error> {
-    let address =
-        endpoint(directory).map_err(|_| Error::Failed("Background owner is unavailable".into()))?;
+    let address = endpoint(directory)
+        .map_err(|_| Error::Transport("Background owner is unavailable".into()))?;
     let mut bytes = serde_json::to_vec(request).map_err(|_| Error::TooLarge)?;
     bytes.push(b'\n');
     if bytes.len() > MAX_FRAME_BYTES {
@@ -137,7 +137,7 @@ pub async fn call(directory: &Path, request: &Request) -> Result<Response, Error
     }
     #[cfg(windows)]
     let mut stream = {
-        let mut result = Err(Error::Failed("Background owner is unavailable".into()));
+        let mut result = Err(Error::Transport("Background owner is unavailable".into()));
         for _ in 0..20 {
             match tokio::net::windows::named_pipe::ClientOptions::new().open(&address) {
                 Ok(stream) => {
@@ -155,29 +155,40 @@ pub async fn call(directory: &Path, request: &Request) -> Result<Response, Error
     #[cfg(unix)]
     let mut stream = tokio::net::UnixStream::connect(&address)
         .await
-        .map_err(|_| Error::Failed("Background owner is unavailable".into()))?;
+        .map_err(|_| Error::Transport("Background owner is unavailable".into()))?;
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         stream
             .write_all(&bytes)
             .await
-            .map_err(|_| Error::Failed("Native request could not be transmitted".into()))?;
-        let response: Response = serde_json::from_slice(&read(&mut BufReader::new(stream)).await?)
-            .map_err(|_| Error::Incompatible)?;
-        if response.protocol != PROTOCOL_VERSION {
-            return Err(Error::Incompatible);
-        }
-        if response.request_id != request.request_id
-            || request
-                .instance_id
-                .as_ref()
-                .is_some_and(|id| *id != response.instance_id)
-        {
-            return Err(Error::Stale);
-        }
-        Ok(response)
+            .map_err(|_| Error::Transport("Native request could not be transmitted".into()))?;
+        let reply = read(&mut BufReader::new(stream)).await.map_err(|error| {
+            Error::Transport(format!("Native owner reply was not received: {error}"))
+        })?;
+        let response: Response = serde_json::from_slice(&reply)
+            .map_err(|_| Error::Transport("Native owner reply could not be decoded".into()))?;
+        validate_response(request, response)
     })
     .await
-    .map_err(|_| Error::Failed("Native request timed out; refresh before retrying".into()))??;
+    .map_err(|_| Error::Transport("Native request timed out; refresh before retrying".into()))??;
+    Ok(response)
+}
+
+fn validate_response(request: &Request, response: Response) -> Result<Response, Error> {
+    if response.protocol != PROTOCOL_VERSION {
+        return Err(Error::Transport(
+            "Native owner reply uses an incompatible protocol".into(),
+        ));
+    }
+    if response.request_id != request.request_id
+        || request
+            .instance_id
+            .as_ref()
+            .is_some_and(|id| *id != response.instance_id)
+    {
+        return Err(Error::Transport(
+            "Native owner reply does not match the request or owner instance".into(),
+        ));
+    }
     Ok(response)
 }
 
@@ -207,7 +218,7 @@ pub fn call_blocking(directory: PathBuf, request: Request) -> Result<Response, E
             .block_on(call(&directory, &request))
     })
     .join()
-    .map_err(|_| Error::Failed("Native request worker stopped".into()))?
+    .map_err(|_| Error::Transport("Native request worker stopped".into()))?
 }
 
 #[cfg(test)]
@@ -224,9 +235,67 @@ mod tests {
             let mut reader = BufReader::new(bytes.as_slice());
             assert!(matches!(read(&mut reader).await, Err(Error::TooLarge)));
             let mut reader = BufReader::new(b"unfinished".as_slice());
-            assert!(read(&mut reader).await.is_err());
+            assert!(matches!(read(&mut reader).await, Err(Error::Transport(_))));
             let mut reader = BufReader::new(b"{}\nignored\n".as_slice());
             assert_eq!(read(&mut reader).await.unwrap(), b"{}");
         });
+    }
+
+    #[test]
+    fn unverified_reply_is_ambiguous_but_decoded_owner_rejections_remain_definitive() {
+        let request = Request {
+            protocol: PROTOCOL_VERSION,
+            request_id: "synthetic-request".into(),
+            client_id: String::new(),
+            token: String::new(),
+            instance_id: Some("owner-a".into()),
+            action: super::super::wire::Action::Stop,
+        };
+        let reply = |protocol, request_id: &str, instance_id: &str, result| Response {
+            protocol,
+            request_id: request_id.into(),
+            instance_id: instance_id.into(),
+            result,
+        };
+        for response in [
+            reply(
+                1,
+                "synthetic-request",
+                "owner-a",
+                Ok(super::super::wire::Reply::Done("accepted".into())),
+            ),
+            reply(
+                PROTOCOL_VERSION,
+                "another-request",
+                "owner-a",
+                Ok(super::super::wire::Reply::Done("accepted".into())),
+            ),
+            reply(
+                PROTOCOL_VERSION,
+                "synthetic-request",
+                "owner-b",
+                Ok(super::super::wire::Reply::Done("accepted".into())),
+            ),
+        ] {
+            assert!(matches!(
+                validate_response(&request, response),
+                Err(Error::Transport(_))
+            ));
+        }
+        for error in [
+            Error::Stale,
+            Error::Failed("synthetic disk rejection".into()),
+            Error::Incompatible,
+        ] {
+            let response = validate_response(
+                &request,
+                reply(PROTOCOL_VERSION, "synthetic-request", "owner-a", Err(error)),
+            )
+            .unwrap();
+            assert!(matches!(
+                response.result,
+                Err(Error::Stale | Error::Failed(_) | Error::Incompatible)
+            ));
+        }
     }
 }

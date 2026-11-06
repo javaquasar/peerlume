@@ -150,20 +150,49 @@ impl NameColumn {
     pub fn saved_gap(&self) -> u32 {
         self.trailing_space.round().clamp(0.0, 10_000.0) as u32
     }
+    pub fn current_width(&self, available: f32, reserved: f32) -> f32 {
+        self.width(available, reserved)
+    }
+    pub fn reset_width(&mut self) {
+        self.trailing_space = 0.0;
+        self.last_layout_width = None;
+    }
     fn width(&self, available: f32, reserved: f32) -> f32 {
         (available - reserved - self.trailing_space).max(MIN_WIDTH)
     }
 
     /// Call inside the table's horizontal scroll area, with the OUTER viewport
     /// width. The scroll area's unconstrained content width is not a resize budget.
+    #[cfg(test)]
     pub fn begin(&mut self, ui: &mut egui::Ui, available: f32, reserved: f32) -> ColumnLayout {
+        self.begin_with_height(ui, available, reserved, 20.0)
+    }
+    #[cfg(test)]
+    pub fn begin_with_height(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: f32,
+        reserved: f32,
+        height: f32,
+    ) -> ColumnLayout {
+        let grip_offset = ui.spacing().item_spacing.x * 0.5;
+        self.begin_with_grip(ui, available, reserved, height, grip_offset)
+    }
+    pub fn begin_with_grip(
+        &mut self,
+        ui: &mut egui::Ui,
+        available: f32,
+        reserved: f32,
+        height: f32,
+        grip_offset: f32,
+    ) -> ColumnLayout {
         let maximum = (available - reserved).max(MIN_WIDTH);
         let mut width = self.width(available, reserved);
         let gap = ui.spacing().item_spacing.x;
-        let x = ui.cursor().left() + width + gap * 0.5;
+        let x = ui.cursor().left() + width + grip_offset;
         let hit_rect = egui::Rect::from_center_size(
-            egui::pos2(x, ui.cursor().top() + 10.0),
-            egui::vec2(gap.max(8.0), 20.0),
+            egui::pos2(x, ui.cursor().top() + height * 0.5),
+            egui::vec2(gap.max(8.0), height),
         );
         let response = ui
             .interact(
@@ -228,30 +257,6 @@ pub(super) fn headers(ui: &mut egui::Ui, width: f32) {
         ui.strong(title);
     }
     ui.end_row();
-}
-
-pub(super) fn headers_with_widths(ui: &mut egui::Ui, width: f32, columns: [f32; 6]) {
-    ui.add_sized(
-        [width, 20.0],
-        egui::Label::new(egui::RichText::new("Name").strong())
-            .halign(egui::Align::Min)
-            .truncate(),
-    );
-    ui.add_sized(
-        [PROGRESS_WIDTH, 20.0],
-        egui::Label::new(egui::RichText::new("Progress").strong()).truncate(),
-    );
-    for (title, width) in HEADERS.into_iter().zip(columns) {
-        ui.add_sized(
-            [width, 20.0],
-            egui::Label::new(egui::RichText::new(title).strong()).truncate(),
-        );
-    }
-    ui.end_row();
-}
-
-pub(super) fn reserved_for_widths(ui: &egui::Ui, widths: [f32; 6]) -> f32 {
-    PROGRESS_WIDTH + widths.iter().sum::<f32>() + ui.spacing().item_spacing.x * 7.0
 }
 
 pub(super) fn metrics(torrent: &TorrentItem) -> [String; 6] {

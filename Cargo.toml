@@ -18,6 +18,15 @@ name = "peerlume-tui"
 path = "src/bin/peerlume-tui.rs"
 required-features = ["tui"]
 
+[[example]]
+name = "ui-candidate"
+path = "examples/ui-candidate.rs"
+required-features = ["gui"]
+
+[[example]]
+name = "ui-candidate-daemon"
+path = "examples/ui-candidate-daemon.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 cap-std = "=4.0.3"

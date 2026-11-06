@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "scope": "windows-gui-0.4.0",
+  "files": [
+    "src/appearance.rs",
+    "src/ui_operations.rs",
+    "src/table_view.rs",
+    "src/torrent_selection.rs",
+    "src/file_selection/hierarchy.rs",
+    "src/file_selection/metadata.rs",
+    "src/app/file_tree.rs",
+    "src/app/torrent_table.rs",
+    "src/app/desktop_controls.rs",
+    "src/app/operation_tracking.rs",
+    "src/app/desktop_integration.rs"
+  ],
+  "context_files": [
+    "src/app.rs",
+    "src/app/file_location.rs",
+    "src/control/frontend/client.rs",
+    "src/control/frontend/server.rs",
+    "src/settings.rs",
+    "src/torrent_view.rs"
+  ]
+}

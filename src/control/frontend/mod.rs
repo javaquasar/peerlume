@@ -5,13 +5,13 @@ mod server;
 mod transport;
 mod wire;
 
-pub use client::{Client, Receipt, finish_pending_actions};
+pub use client::{Client, ConnectionStatus, ConnectionView, Receipt, finish_pending_actions};
 pub use server::Server;
 pub use wire::{
     AccessAction, AccessView, NativeTorrent, Snapshot, StorageAction, TrashPlan, TrashScope,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
 
