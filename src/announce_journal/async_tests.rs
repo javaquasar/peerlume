@@ -217,6 +217,7 @@ fn a_timed_out_barrier_is_not_fabricated_success_and_can_be_retried() {
         root.path(),
         JournalOptions {
             gate: Some(gate.clone()),
+            queue_capacity: 1,
             barrier_timeout: Duration::from_millis(30),
             ..Default::default()
         },
@@ -225,19 +226,42 @@ fn a_timed_out_barrier_is_not_fabricated_success_and_can_be_retried() {
     wait_until(|| gate.entered.load(Ordering::Acquire));
     assert!(journal.flush().unwrap_err().contains("timed out"));
     assert_eq!(journal.status().flushed_sequence, 0);
-    gate.release();
-    wait_until(|| journal.status().flushed_sequence == 1);
-    // This test deliberately configures a 30 ms barrier. Parallel filesystem
-    // tests can exceed it even after the writer gate opens. Retry only explicit
-    // timeouts: a later acknowledged fence must still prove durable progress.
+    assert!(
+        journal.error().is_none(),
+        "a timed-out caller does not corrupt the writer"
+    );
+    // The original fence still occupies the one-slot queue. Repeated 30 ms
+    // flush calls would add serial fsync work after their receivers time out.
+    // Retry once under the same overall recovery budget, including admission.
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match journal.flush() {
-            Ok(()) => break,
-            Err(error) if error.contains("timed out") && Instant::now() < deadline => {}
-            Err(error) => panic!("released journal barrier did not complete: {error}"),
-        }
-    }
+    let disk = journal.disk.as_ref().unwrap().clone();
+    let (started, entered) = mpsc::sync_channel(1);
+    let (reply, recovered) = mpsc::sync_channel(1);
+    let recovery = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        reply.send(disk.snapshot_until(None, deadline)).unwrap();
+    });
+    entered
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    assert!(
+        matches!(
+            recovered.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a queued recovery fence must not succeed while the writer is blocked"
+    );
+    assert_eq!(journal.status().durable_sequence, 0);
+    gate.release();
+    let snapshot = recovered
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .expect(
+            "released journal recovery fence did not reply within its existing five-second budget",
+        )
+        .expect("released journal recovery fence did not complete");
+    recovery.join().unwrap();
+    assert_eq!(snapshot.stream(&mut Vec::new(), None, |_| {}).unwrap(), 1);
+    assert_eq!(journal.status().flushed_sequence, 1);
     assert_eq!(journal.status().durable_sequence, 1);
 }
 

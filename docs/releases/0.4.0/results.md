@@ -22,8 +22,8 @@ child GUI test files. Production Rust remained byte-identical. See the
 [final verification proof](measurements/final-verification-proof.json) and
 [source inputs](measurements/source-inputs-final.json).
 
-The plan target is 0.4.0; the Cargo package version remains 0.1.0. No commit,
-push, package publication or restart of the running user's client was performed.
+The plan target is 0.4.0; the Cargo package version remains 0.1.0. During the initial local implementation phase, no commit, push, package
+publication or restart of the running user's client was performed.
 Tests use disposable state and owners. The existing user's profile, downloads
 and running GUI/daemon were left untouched.
 
@@ -251,5 +251,53 @@ The baseline commit already had these verified GitHub results:
   Other package jobs succeeded. This is recorded as an inherited failure; no
   production timeout, assertion or Linux baseline was weakened for this UI work.
 
-These historical runs do not verify the current unpushed candidate. No new GitHub
-workflow execution, long swarm run or publication was started by this task.
+These historical runs did not verify the local candidate. The initial local
+implementation phase did not start a GitHub workflow, long swarm run or publication.
+The separately authorized push verification is recorded below.
+
+
+## Authorized GitHub push verification follow-up
+
+The complete candidate was committed and pushed to `main` as
+`1adfb71803be0e30c3446c3303cd83e333521f28` on 2026-11-06. The following
+first-attempt results were read from GitHub jobs and their full failure logs:
+
+- [Tests](https://github.com/javaquasar/peerlume/actions/runs/42250297315):
+  Linux core/TUI, Docker, formatting and strict Clippy passed. Windows reported
+  787 passed, one failed and seven ignored. The inherited journal retry test
+  failed with `released journal barrier did not complete: Journal flush barrier
+  timed out`.
+- [Reliability](https://github.com/javaquasar/peerlume/actions/runs/42250297239):
+  seven jobs passed. X11 startup failed because the copied test installation
+  omitted the required sibling daemon. The downloaded application log states
+  `peerlume-daemon is missing beside the frontend; build/install the complete
+  application package`.
+- [Coverage](https://github.com/javaquasar/peerlume/actions/runs/42250297346):
+  Windows GUI passed with 788 tests and seven ignored. The eleven new modules
+  measured 3,684/3,988 lines (92.38%) and 390/406 functions (96.06%), matching the
+  local measurements. All Linux instrumented workloads passed, but its measured
+  84.6611363280639% line coverage remains below the unchanged 86.879% gate. This
+  improves on the inherited 83.5690168154314% result; the shortfall remains open.
+
+The follow-up corrects the copied native fixture rather than changing application
+permissions or bypassing UI input. It supplies all three executables, navigates
+the actual More menu and agent window, and explicitly stops only its disposable
+profile owner before expecting a new owner identity. Secondary-menu lookup uses
+bounded real wheel input when its target is outside the popup viewport. Closing
+the GUI still must
+preserve that owner. Exact Done OCR, independent payload hash verification,
+positive damaged-piece refetch and normal reporting mode remain required.
+
+The journal regression test retains its injected 30 ms failure and five-second
+recovery budget. Recovery now sends one fence under that existing overall budget
+instead of creating a backlog of serial fsync requests every 30 ms. The shared
+internal deadline helper retains the production configured timeout. The test
+also proves a queued recovery cannot succeed while the writer gate is closed,
+then requires an acknowledged snapshot and durable sequence 1. All 13 focused
+journal tests and strict core Clippy passed locally. The final Python contract
+suite passed all 70 tests, including 16 new native-package/menu/lifecycle cases;
+formatting, actionlint and the repository language check also passed.
+
+This section records the first push and the rationale for the follow-up. It does
+not represent the follow-up commit's GitHub jobs as passed before they complete.
+The user's existing client and profile remain untouched; no release was published.

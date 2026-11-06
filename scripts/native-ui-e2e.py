@@ -23,6 +23,80 @@ import threading
 import time
 
 
+def install_package(gui, daemon, cli, directory):
+    """Copy a complete Linux package, refusing missing inputs before copying."""
+    sources = [Path(path).resolve(strict=True) for path in (gui, daemon, cli)]
+    if not all(path.is_file() and path.stat().st_size > 0 for path in sources):
+        raise ValueError("The native fixture requires three nonempty executable files")
+    directory.mkdir()
+    return tuple(Path(shutil.copy2(source, directory / name)) for source, name in zip(
+        sources, ("peerlume", "peerlume-daemon", "peerlume-control")))
+
+
+class NativePackage:
+    """Own only the copied fixture processes, before their profile is removed."""
+    def __init__(self, args, root, report, desktop):
+        self.root, self.report, self.desktop = Path(root), report, desktop
+        self.profile = self.root / "profile"
+        self.profile.mkdir()
+        self.downloads = self.root / "downloads"
+        self.downloads.mkdir()
+        self.installed = self.root / "installed"
+        self.gui, self.daemon, self.cli = install_package(
+            args.gui, args.daemon, args.cli, self.installed)
+        self.app = None
+        self.owner_may_be_running = False
+        self.stops = 0
+
+    def __enter__(self):
+        return self
+
+    def launch(self, source, log):
+        command = [str(self.gui), "--profile", str(self.profile)]
+        if source is not None:
+            command += ["--open", str(source)]
+        self.owner_may_be_running = True
+        self.app = subprocess.Popen(command, cwd=self.installed, stdout=log, stderr=subprocess.STDOUT)
+        return self.app
+
+    def stop_owner(self):
+        # Production --stop never starts or kills an owner and waits up to 95s
+        # for this exact profile's lock. Leave five seconds for process teardown.
+        result = subprocess.run([str(self.daemon), "--profile", str(self.profile), "--stop"],
+                                cwd=self.installed, capture_output=True, timeout=100, check=True)
+        self.stops += 1
+        (self.report / f"owner-stop-{self.stops}.log").write_bytes(result.stdout + result.stderr)
+        self.owner_may_be_running = False
+
+    def __exit__(self, exception_type, exception, traceback):
+        errors = []
+        if self.app is not None and self.app.poll() is None:
+            if exception is not None:
+                try:
+                    self.desktop.screenshot("failure")
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            try:
+                self.app.terminate()
+                try:
+                    self.app.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.app.kill()
+                    self.app.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError) as error:
+                errors.append(str(error))
+        if self.owner_may_be_running:
+            try:
+                self.stop_owner()
+            except (OSError, subprocess.SubprocessError) as error:
+                errors.append(str(error))
+        if errors:
+            (self.report / "owner-cleanup-error.txt").write_text("\n".join(errors), encoding="utf-8")
+            if exception is None:
+                raise AssertionError("Fixture owner cleanup failed; see owner-cleanup-error.txt")
+        return False
+
+
 def wait_for(action, timeout=60):
     end = time.monotonic() + timeout
     last = None
@@ -179,6 +253,32 @@ class Desktop:
         subprocess.run(["xdotool", "mousemove", "--sync", str(position[0]), str(position[1]), "click", "1"], check=True)
         time.sleep(0.5)
 
+    def more(self, phrase):
+        self.click("More")
+        deadline = time.monotonic() + 45
+        anchor = None
+        for scrolls in range(13):
+            if self.locate(phrase) is not None:
+                self.click(phrase)
+                return
+            if scrolls == 12 or time.monotonic() >= deadline:
+                raise AssertionError(f"More menu item {phrase!r} was not visible after {scrolls} bounded scroll steps")
+            if anchor is None:
+                anchor = self.locate("Remove selected") or self.locate("Selected visible", last=True)
+                if anchor is None:
+                    raise AssertionError("Could not locate the opened More menu's scroll area")
+            # Keep the pointer inside the actual popup viewport. Its initial
+            # content may scroll away; the viewport at this position remains.
+            subprocess.run(["xdotool", "mousemove", "--sync", str(anchor[0]), str(anchor[1]),
+                            "click", "--repeat", "3", "--delay", "80", "5"], check=True, timeout=5)
+            time.sleep(0.2)
+
+    def toggle_access_window(self):
+        position = wait_for(lambda: self.locate("Local agent access"), timeout=25)
+        subprocess.run(["xdotool", "mousemove", "--sync", str(position[0]), str(position[1]),
+                        "click", "--repeat", "2", "--delay", "100", "1"], check=True)
+        time.sleep(0.5)
+
     def attach(self, app):
         def window():
             assert app.poll() is None, "GUI exited before creating its native window; see application.log"
@@ -213,7 +313,10 @@ class Desktop:
         self.click("Add torrent", last=True, minimum_y=200)
 
     def grant(self, new=True):
-        self.click("Agent access")
+        self.more("Agent access")
+        wait_for(lambda: self.locate("Local agent access"), timeout=25)
+        if self.locate("Enable local IPC") is None:
+            self.toggle_access_window()
         self.click("Enable local IPC")
         token = None
         if new:
@@ -225,7 +328,11 @@ class Desktop:
             subprocess.run(["xclip", "-selection", "clipboard"], input=b"", check=True, timeout=5)
             self.click("Forget displayed token")
         self.screenshot("02-agent-approved")
-        self.click("Agent access")
+        # Agent access is an explicit open action in the compact More menu.
+        # Collapse the actual egui window by double-clicking its title; do not
+        # assume the action toggles it or bypass the trusted grant controls.
+        self.toggle_access_window()
+        wait_for(lambda: self.locate("Enable local IPC") is None, timeout=10)
         return token
 
     def close(self):
@@ -236,17 +343,27 @@ class Desktop:
 
     def done(self):
         # Read the actual first-row progress badge, not controller state. White
-        # text on the green badge needs a red-channel threshold; full-screen
-        # grayscale OCR can merge the rounded badge into the letters.
+        # Default Comfortable density places the first row 34px after its
+        # header. Check both actual selected-row palettes; full-screen OCR can
+        # merge badge fill and text. Only the complete word Done is accepted.
         header = self.locate("Progress")
         if header is None:
             return False
-        crop = self.report / "done-ocr.png"
-        geometry = f"150x24+{header[0] - 28}+{header[1] + 9}"
-        subprocess.run(["convert", str(self.report / "current.png"), "-crop", geometry, "+repage", "-channel", "R", "-separate", "+channel", "-threshold", "45%", "-negate", "-resize", "400%", "-bordercolor", "white", "-border", "12", str(crop)], check=True, timeout=10)
-        result = subprocess.run(["tesseract", str(crop), "stdout", "--psm", "7"], capture_output=True, check=True, timeout=15)
-        (self.report / "done-ocr.txt").write_bytes(result.stdout)
-        return self.normalize(result.stdout.decode()) == "done"
+        geometry = f"140x36+{header[0] - 28}+{header[1] + 18}"
+        for channel, threshold, negate in (("R", "75%", True), ("B", "45%", False), ("R", "45%", True)):
+            name = f"done-ocr-{channel}-{threshold.rstrip('%')}"
+            crop = self.report / f"{name}.png"
+            command = ["convert", str(self.report / "current.png"), "-crop", geometry,
+                       "+repage", "-channel", channel, "-separate", "+channel", "-threshold", threshold]
+            if negate:
+                command.append("-negate")
+            command += ["-resize", "400%", "-bordercolor", "white", "-border", "12", str(crop)]
+            subprocess.run(command, check=True, timeout=10)
+            result = subprocess.run(["tesseract", str(crop), "stdout", "--psm", "7"], capture_output=True, check=True, timeout=15)
+            (self.report / f"{name}.txt").write_bytes(result.stdout)
+            if self.normalize(result.stdout.decode()) == "done":
+                return True
+        return False
 
 
 def run(args):
@@ -256,26 +373,17 @@ def run(args):
     fixture = Fixtures()
     app = None
     try:
-        with tempfile.TemporaryDirectory(prefix="peerlume-native-") as temporary:
-            root = Path(temporary)
-            profile = root / "profile"
-            profile.mkdir()
-            downloads = root / "downloads"
-            downloads.mkdir()
-            installed = root / "installed"
-            installed.mkdir()
-            gui = Path(shutil.copy2(args.gui, installed / "peerlume"))
-            cli = Path(shutil.copy2(args.cli, installed / "peerlume-control"))
+        with tempfile.TemporaryDirectory(prefix="peerlume-native-") as temporary, \
+                NativePackage(args, temporary, report, desktop) as package:
+            root, profile, downloads = package.root, package.profile, package.downloads
+            cli = package.cli
             source = root / "fixture.torrent"
             source.write_bytes(fixture.metainfo)
             (profile / "settings.toml").write_text(isolated_settings(downloads), encoding="utf-8")
             log = (report / "application.log").open("wb")
 
             def launch(first):
-                command = [str(gui), "--profile", str(profile)]
-                if first:
-                    command += ["--open", str(source)]
-                return subprocess.Popen(command, cwd=installed, stdout=log, stderr=subprocess.STDOUT)
+                return package.launch(source if first else None, log)
 
             app = launch(True)
             desktop.attach(app)
@@ -308,10 +416,10 @@ def run(args):
                 return request("list", {"offset": 0, "limit": 1, "revision": None, "after_revision": None})["result"]["torrents"][0]
 
             wait_for(lambda: row()["completion"] == "verified")
-            desktop.click("Pause all")
+            desktop.more("Pause all")
             wait_for(lambda: row()["state"] == "paused")
             desktop.screenshot("03-native-pause")
-            desktop.click("Resume all")
+            desktop.more("Resume all")
             wait_for(lambda: row()["state"] == "seeding")
 
             def mutate(command, allow_failed=False):
@@ -344,13 +452,16 @@ def run(args):
             assert row()["active_mode"] == "normal"
             wait_for(desktop.done, timeout=30)
             desktop.screenshot("04-repaired-done")
-            desktop.click("Pause all")
+            desktop.more("Pause all")
             wait_for(lambda: row()["state"] == "paused")
             with sqlite3.connect(profile / "state.sqlite3") as database:
                 assert database.execute("SELECT state FROM torrents").fetchone()[0] == "paused"
             old_instance = instance
             desktop.close()
             assert app.wait(timeout=20) == 0, "GUI did not shut down cleanly before restart"
+            # Closing a frontend deliberately leaves its owner running.
+            assert request("discover")["instance_id"] == old_instance
+            package.stop_owner()
             app = launch(False)
             desktop.attach(app)
             desktop.grant(new=False)
@@ -363,24 +474,19 @@ def run(args):
             desktop.screenshot("05-restored-paused")
             desktop.close()
             assert app.wait(timeout=20) == 0, "Restored GUI did not shut down cleanly"
+            assert request("discover")["instance_id"] == instance
+            package.stop_owner()
             app = None
             log.close()
-            (report / "result.json").write_text(json.dumps({"native_window": True, "gui_mouse_add_pause_resume": True, "external_cli": True, "fresh_peer_download": True, "damaged_piece_refetched": after - before, "restart_preserved_pause": True, "clean_shutdowns": 2, "reporting_mode": "normal"}, indent=2), encoding="utf-8")
+            (report / "result.json").write_text(json.dumps({"native_window": True, "gui_mouse_add_pause_resume": True, "external_cli": True, "fresh_peer_download": True, "damaged_piece_refetched": after - before, "frontend_close_preserved_owner": True, "restart_preserved_pause": True, "clean_shutdowns": 2, "owner_profile_lock_releases": package.stops, "reporting_mode": "normal"}, indent=2), encoding="utf-8")
     finally:
-        if app is not None and app.poll() is None:
-            desktop.screenshot("failure")
-            app.terminate()
-            try:
-                app.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                app.kill()
-                app.wait(timeout=5)
         fixture.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gui", required=True)
+    parser.add_argument("--daemon", required=True)
     parser.add_argument("--cli", required=True)
     parser.add_argument("--report", required=True)
     run(parser.parse_args())

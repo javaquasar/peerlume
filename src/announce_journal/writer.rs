@@ -503,11 +503,17 @@ impl DiskWriter {
         Ok(next)
     }
     pub(crate) fn snapshot(&self, limit: Option<u64>) -> Result<Snapshot, String> {
+        self.snapshot_until(limit, Instant::now() + self.options.barrier_timeout)
+    }
+    pub(super) fn snapshot_until(
+        &self,
+        limit: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Snapshot, String> {
         if let Some(error) = self.state.error() {
             return Err(error);
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        let deadline = Instant::now() + self.options.barrier_timeout;
         let mut command = Command::Fence { limit, reply };
         loop {
             let admission = self
