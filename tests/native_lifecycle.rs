@@ -21,9 +21,14 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     time::{Duration, Instant},
 };
+
+// Serialize the tests that copy and spawn executables in this process. On
+// Linux a concurrent fork can hold a copied executable open for writing until
+// it execs, making a second exec fail with ETXTBSY even after copy() returns.
+static COPIED_PACKAGE_TESTS: Mutex<()> = Mutex::new(());
 
 fn installed(root: &Path, source: &str, name: &str) -> PathBuf {
     let target = root.join(format!("{name}{}", if cfg!(windows) { ".exe" } else { "" }));
@@ -92,6 +97,9 @@ fn capture_to_eof(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Result
 
 #[test]
 fn autolaunched_owner_does_not_keep_exited_frontend_capture_pipes_open() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("pipe-profile");
     std::fs::create_dir_all(profile.join("downloads")).unwrap();
@@ -320,6 +328,9 @@ fn verify_block(peer: &mut TcpStream, payload: &[u8], begin: u32) -> u64 {
 
 #[test]
 fn copied_frontends_preserve_one_owner_and_tcp_seed_until_explicit_durable_stop() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let downloads = profile.join("downloads");
@@ -511,6 +522,9 @@ fn receipt(client: &Client, label: &str) -> Receipt {
 
 #[test]
 fn installed_frontend_confirms_file_edits_and_saves_view_separately_from_preferences() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("command-profile");
     let downloads = profile.join("downloads");
