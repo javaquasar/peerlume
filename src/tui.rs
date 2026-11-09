@@ -52,6 +52,8 @@ use crate::{
 pub const SUPPORTED_COMPONENT_COUNT: usize = COMPONENTS.len();
 mod interaction;
 #[cfg(test)]
+mod native_tests;
+#[cfg(test)]
 mod parity_tests;
 mod preferences_editor;
 mod prompt;

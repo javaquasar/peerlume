@@ -1,13 +1,18 @@
-//! Installed native frontends share one real loopback seed across disconnects.
-#![cfg(all(feature = "gui", feature = "tui"))]
+//! Installed native frontends share one loopback owner and persist confirmed commands.
+#![cfg(feature = "tui")]
 
 use peerlume::{
     control::{
-        frontend::{Client, Snapshot},
+        TorrentCommand,
+        frontend::{AccessAction, Client, ConnectionStatus, Receipt, Snapshot, StorageAction},
         host::InstanceLock,
     },
+    file_selection::FileSelectionModel,
+    metainfo::TorrentMetainfo,
+    session::DetailInterest,
     settings::ClientSettings,
     state::{StateStore, StoredFile, TorrentRecord},
+    torrent::{TorrentItem, TorrentState},
 };
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -15,7 +20,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -24,6 +29,44 @@ fn installed(root: &Path, source: &str, name: &str) -> PathBuf {
     let target = root.join(format!("{name}{}", if cfg!(windows) { ".exe" } else { "" }));
     std::fs::copy(source, &target).unwrap();
     target
+}
+
+fn install_frontend(root: &Path) -> PathBuf {
+    #[cfg(feature = "gui")]
+    let (binary, name) = (env!("CARGO_BIN_EXE_peerlume"), "peerlume");
+    #[cfg(not(feature = "gui"))]
+    let (binary, name) = (env!("CARGO_BIN_EXE_peerlume-tui"), "peerlume-tui");
+    installed(root, binary, name)
+}
+
+fn isolated_settings(downloads: &Path) -> ClientSettings {
+    let mut settings = ClientSettings::default();
+    settings.download.download_directory = downloads.to_string_lossy().into_owned();
+    settings.connection.random_port_on_start = true;
+    settings.connection.utp_enabled = false;
+    settings.connection.port_forwarding = false;
+    settings.bittorrent.dht = false;
+    settings.bittorrent.pex = false;
+    settings.bittorrent.lsd = false;
+    settings.bittorrent.public_extra_trackers.clear();
+    settings.privacy.blocklist_enabled = false;
+    settings.privacy.blocklist_auto_update = false;
+    settings
+}
+
+fn wait_for_probe(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Native frontend probe did not exit within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn capture_to_eof(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Result<Vec<u8>, String>> {
@@ -57,25 +100,15 @@ fn autolaunched_owner_does_not_keep_exited_frontend_capture_pipes_open() {
         env!("CARGO_BIN_EXE_peerlume-daemon"),
         "peerlume-daemon",
     );
-    let gui = installed(root.path(), env!("CARGO_BIN_EXE_peerlume"), "peerlume");
-    let mut settings = ClientSettings::default();
-    settings.download.download_directory = profile.join("downloads").to_string_lossy().into_owned();
-    settings.connection.random_port_on_start = true;
-    settings.connection.utp_enabled = false;
-    settings.connection.port_forwarding = false;
-    settings.bittorrent.dht = false;
-    settings.bittorrent.pex = false;
-    settings.bittorrent.lsd = false;
-    settings.bittorrent.public_extra_trackers.clear();
-    settings.privacy.blocklist_enabled = false;
-    settings.privacy.blocklist_auto_update = false;
+    let frontend = install_frontend(root.path());
+    let settings = isolated_settings(&profile.join("downloads"));
     settings.save_to(&profile.join("settings.toml")).unwrap();
     let mut guard = OwnerGuard {
         daemon,
         profile: profile.clone(),
         stopped: false,
     };
-    let mut child = Command::new(gui)
+    let mut child = Command::new(frontend)
         .arg("--profile")
         .arg(&profile)
         .arg("--attach-check")
@@ -86,17 +119,7 @@ fn autolaunched_owner_does_not_keep_exited_frontend_capture_pipes_open() {
         .unwrap();
     let stdout = capture_to_eof(child.stdout.take().unwrap());
     let stderr = capture_to_eof(child.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(25);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Native pipe probe did not exit within25 seconds"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_probe(&mut child, Duration::from_secs(25));
     // Unlike Command::output, these checks have deadlines even if a detached
     // descendant leaked a capture-pipe handle. OwnerGuard stops it on failure.
     let output = stdout
@@ -184,17 +207,7 @@ fn attach(executable: &Path, profile: &Path) -> Value {
         .stderr(errors.try_clone().unwrap())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Native frontend probe did not exit within20 seconds"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_for_probe(&mut child, Duration::from_secs(20));
     errors.seek(SeekFrom::Start(0)).unwrap();
     let mut stderr = Vec::new();
     errors.take(64 * 1024).read_to_end(&mut stderr).unwrap();
@@ -306,7 +319,7 @@ fn verify_block(peer: &mut TcpStream, payload: &[u8], begin: u32) -> u64 {
 }
 
 #[test]
-fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_stop() {
+fn copied_frontends_preserve_one_owner_and_tcp_seed_until_explicit_durable_stop() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let downloads = profile.join("downloads");
@@ -316,7 +329,7 @@ fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_sto
         env!("CARGO_BIN_EXE_peerlume-daemon"),
         "peerlume-daemon",
     );
-    let gui = installed(root.path(), env!("CARGO_BIN_EXE_peerlume"), "peerlume");
+    let frontend = install_frontend(root.path());
     let tui = installed(
         root.path(),
         env!("CARGO_BIN_EXE_peerlume-tui"),
@@ -324,20 +337,11 @@ fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_sto
     );
     let reserved = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = reserved.local_addr().unwrap().port();
-    let mut settings = ClientSettings::default();
-    settings.download.download_directory = downloads.to_string_lossy().into_owned();
+    let mut settings = isolated_settings(&downloads);
     // IP/interface binding is deliberately unsupported on Windows. Disable all
     // discovery and trackers; this fixture makes only explicit loopback TCP I/O.
-    settings.connection.utp_enabled = false;
     settings.connection.listen_port = port;
     settings.connection.random_port_on_start = false;
-    settings.connection.port_forwarding = false;
-    settings.bittorrent.dht = false;
-    settings.bittorrent.pex = false;
-    settings.bittorrent.lsd = false;
-    settings.bittorrent.public_extra_trackers.clear();
-    settings.privacy.blocklist_enabled = false;
-    settings.privacy.blocklist_auto_update = false;
     assert!(settings.validate().is_empty());
     settings.save_to(&profile.join("settings.toml")).unwrap();
     let payload: Vec<u8> = (0..262_144)
@@ -397,9 +401,12 @@ fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_sto
         profile: profile.clone(),
         stopped: false,
     };
-    let first_gui = attach(&gui, &profile); // exact production auto-launch path
-    let owner_id = first_gui["owner_instance"].as_str().unwrap().to_owned();
-    assert_eq!(first_gui["torrents"], 1);
+    let first_frontend = attach(&frontend, &profile); // exact production auto-launch path
+    let owner_id = first_frontend["owner_instance"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(first_frontend["torrents"], 1);
     let first = Client::connect(&profile).unwrap();
     let second = Client::connect(&profile).unwrap();
     let initial_snapshot = snapshot(&first, 0);
@@ -424,7 +431,7 @@ fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_sto
     received += verify_block(&mut peer, &payload, 16_384);
     assert_eq!(snapshot(&second, received).instance_id, owner_id);
     drop(second);
-    assert_eq!(attach(&gui, &profile)["owner_instance"], owner_id);
+    assert_eq!(attach(&frontend, &profile)["owner_instance"], owner_id);
     received += verify_block(&mut peer, &payload, 32_768);
     let reconnected = Client::connect(&profile).unwrap();
     let final_snapshot = snapshot(&reconnected, received);
@@ -474,4 +481,233 @@ fn copied_gui_and_tui_preserve_one_owner_and_tcp_seed_until_explicit_durable_sto
         !root.path().join("absent").exists(),
         "Stop must not create a missing profile"
     );
+}
+
+fn wait_for_native<T>(description: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(value) = poll() {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for {description}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn receipt(client: &Client, label: &str) -> Receipt {
+    wait_for_native(label, || {
+        client.take_receipts().into_iter().find(|receipt| {
+            if receipt.label != label || receipt.queued {
+                return false;
+            }
+            assert!(receipt.error.is_none(), "{label}: {}", receipt.message);
+            true
+        })
+    })
+}
+
+#[test]
+fn installed_frontend_confirms_file_edits_and_saves_view_separately_from_preferences() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("command-profile");
+    let downloads = profile.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    let settings_path = profile.join("settings.toml");
+    let settings = isolated_settings(&downloads);
+    settings.save_to(&settings_path).unwrap();
+    let daemon = installed(
+        root.path(),
+        env!("CARGO_BIN_EXE_peerlume-daemon"),
+        "peerlume-daemon",
+    );
+    let tui = installed(
+        root.path(),
+        env!("CARGO_BIN_EXE_peerlume-tui"),
+        "peerlume-tui",
+    );
+    let mut guard = OwnerGuard {
+        daemon,
+        profile: profile.clone(),
+        stopped: false,
+    };
+    let attached = attach(&tui, &profile);
+    let client = Client::connect(&profile).unwrap();
+    let snapshot = wait_for_native("initial owner snapshot", || client.sync());
+    assert!(snapshot.torrents.is_empty());
+    let instance = snapshot.instance_id;
+    assert_eq!(attached["owner_instance"], instance);
+    assert_eq!(client.connection().status, ConnectionStatus::Connected);
+
+    let source = profile.join("fixture.torrent");
+    let mut metainfo = b"d4:infod5:filesld6:lengthi16384e4:pathl9:first.bineed6:lengthi16384e4:pathl10:second.bineee4:name7:fixture12:piece lengthi32768e6:pieces20:".to_vec();
+    metainfo.extend_from_slice(&Sha1::digest(vec![17; 32_768]));
+    metainfo.extend_from_slice(b"7:privatei1eee");
+    std::fs::write(&source, metainfo).unwrap();
+    let metadata = TorrentMetainfo::load(&source).unwrap();
+    let id = format!("v1: {}", metadata.info_hash_v1_hex.unwrap());
+    let item = TorrentItem {
+        name: metadata.name,
+        source: source.to_string_lossy().into_owned(),
+        info_hashes: vec![id.clone()],
+        trackers: vec![],
+        peer_id: "-NT0001-012345678901".into(),
+        files: FileSelectionModel::from_metainfo_files(metadata.files),
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        download_rate: 0,
+        upload_rate: 0,
+        peers: 0,
+        seeds: 0,
+        state: TorrentState::Paused,
+        is_private: true,
+        overrides: Default::default(),
+        runtime: Default::default(),
+        completion: Default::default(),
+    };
+    client.add(&item, &settings, None).unwrap();
+    let added = receipt(&client, "Torrent registration");
+    assert_eq!(added.owner_instance, instance);
+    assert!(!added.completed_by_reply);
+    client.set_visible_torrent(Some(id.clone()));
+    client.set_detail_interest(Some((
+        id.clone(),
+        DetailInterest {
+            files: true,
+            peers: true,
+        },
+    )));
+    let row = wait_for_native("hydrated file paths", || {
+        let snapshot = client.sync()?;
+        assert_eq!(snapshot.instance_id, instance);
+        let row = snapshot.torrents.into_iter().next()?;
+        row.item.files.selected_indices().is_some().then_some(row)
+    });
+    assert_eq!(row.item.state, TorrentState::Paused);
+    assert_eq!(row.item.files.file_count(), 2);
+    assert_eq!(row.item.files.selected_indices().unwrap(), [0, 1]);
+    assert_eq!(client.cached_revision(&id), Some(row.command_revision));
+    wait_for_native("selected torrent audit projection", || {
+        client.audit_ready(&id).then_some(())
+    });
+    assert!(client.audit_profile(&id).is_none());
+    assert!(
+        client
+            .take_audits()
+            .into_iter()
+            .any(|(torrent, profile)| torrent == id && profile.is_none())
+    );
+
+    let initial_file_revision = row.file_revision;
+    client
+        .enqueue_submit(
+            &id,
+            TorrentCommand::SetFiles(vec![1]),
+            Some(row.command_revision),
+        )
+        .unwrap();
+    let selected = receipt(&client, "Torrent command");
+    assert!(selected.accepted.is_some());
+    let row = wait_for_native("new selection and file generation", || {
+        let snapshot = client.sync()?;
+        let row = snapshot.torrents.into_iter().next()?;
+        (row.item.files.selected_indices().as_deref() == Some(&[1])
+            && row.file_revision != 0
+            && row.file_revision != initial_file_revision)
+            .then_some(row)
+    });
+    assert_eq!(row.item.state, TorrentState::Paused);
+    client
+        .storage(&id, StorageAction::Priorities { high: vec![1] })
+        .unwrap();
+    let prioritized = receipt(&client, "Storage command");
+    assert_eq!(prioritized.operation, "Change file priorities");
+    wait_for_native("high priority projection", || {
+        let snapshot = client.sync()?;
+        let row = snapshot.torrents.first()?;
+        (row.file_revision != 0 && row.item.files.high_priority() == [1]).then_some(())
+    });
+
+    let mut draft = client.settings();
+    draft.download.show_add_dialog = !settings.download.show_add_dialog;
+    client.apply_settings(&draft).unwrap();
+    let applied = receipt(&client, "Apply preferences");
+    assert!(!applied.completed_by_reply);
+    assert_eq!(
+        client.settings().download.show_add_dialog,
+        draft.download.show_add_dialog
+    );
+    assert_eq!(
+        ClientSettings::load_from(&settings_path)
+            .unwrap()
+            .download
+            .show_add_dialog,
+        settings.download.show_add_dialog
+    );
+    draft.ui.search = "second.bin".into();
+    client.save_view(&draft.ui).unwrap();
+    let saved_view = receipt(&client, "View");
+    assert!(saved_view.completed_by_reply);
+    assert_eq!(saved_view.ui_saved.unwrap().search, "second.bin");
+    let saved = ClientSettings::load_from(&settings_path).unwrap();
+    assert_eq!(saved.ui.search, "second.bin");
+    assert_eq!(
+        saved.download.show_add_dialog,
+        settings.download.show_add_dialog
+    );
+    client.save_settings(&draft).unwrap();
+    let saved_preferences = receipt(&client, "Preferences");
+    assert!(saved_preferences.completed_by_reply);
+    assert_eq!(
+        ClientSettings::load_from(&settings_path)
+            .unwrap()
+            .download
+            .show_add_dialog,
+        draft.download.show_add_dialog
+    );
+
+    client.access_action(AccessAction::Enable(true)).unwrap();
+    receipt(&client, "Agent access");
+    assert!(client.access_view().enabled);
+    client
+        .access_action(AccessAction::Grant(Default::default()))
+        .unwrap();
+    receipt(&client, "Agent access");
+    assert_eq!(client.take_access_token().unwrap().len(), 64);
+    assert!(client.take_access_token().is_none());
+    let grant = client.access_view().clients.pop().unwrap().id;
+    client.access_action(AccessAction::Revoke(grant)).unwrap();
+    receipt(&client, "Agent access");
+    assert!(client.access_view().clients.is_empty());
+    client.access_action(AccessAction::Enable(false)).unwrap();
+    receipt(&client, "Agent access");
+    assert!(!client.access_view().enabled);
+
+    client.set_journal_active(true);
+    wait_for_native("journal projection", || client.journal().path());
+    let export = profile.join("journal.jsonl");
+    client.export(Some(id.clone()), export.clone()).unwrap();
+    let exported = receipt(&client, "Journal export");
+    assert!(exported.completed_by_reply);
+    assert!(std::fs::read(export).unwrap().is_empty());
+
+    let stop = client.enqueue_stop_owner(&instance).unwrap();
+    let shutdown = receipt(&client, "Stop background client");
+    assert_eq!(shutdown.job_id, stop);
+    assert!(!shutdown.completed_by_reply);
+    wait_for_native("owner shutdown and lock release", || {
+        (client.connection().status == ConnectionStatus::Stopped).then_some(())
+    });
+    let lock = InstanceLock::acquire(&profile).unwrap();
+    guard.stopped = true;
+    let store = StateStore::open(&profile.join("state.sqlite3")).unwrap();
+    let saved = store.load_torrent(&id).unwrap().unwrap();
+    assert!(!saved.files[0].selected);
+    assert!(saved.files[1].selected);
+    assert_eq!(saved.files[1].priority, 1);
+    assert_eq!(saved.state, "paused");
+    drop(store);
+    drop(lock);
 }
