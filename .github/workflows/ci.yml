@@ -101,7 +101,11 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ runner.os }}-tests-${{ matrix.cache }}-1.93.0-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
-      - name: Run application and vendored tracker unit and integration tests
+      - name: Run Windows application and tracker tests with bounded disk concurrency
+        if: runner.os == 'Windows'
+        run: cargo +1.93.0 test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms -- --test-threads=2
+      - name: Run Linux application and tracker unit and integration tests
+        if: runner.os == 'Linux'
         run: cargo +1.93.0 test --locked ${{ matrix.features }} --all-targets -p peerlume -p librqbit-tracker-comms
       - name: Run documentation tests
         # All fixtures below use isolated temporary payloads, never a user profile.

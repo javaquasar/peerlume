@@ -110,6 +110,8 @@ jobs:
           BUILD_FLAVOR: ${{ matrix.flavor }}
         run: |
           [string[]]$features = if ($env:BUILD_FLAVOR -eq 'tui') { @('--no-default-features', '--features', 'tui') } else { @('--all-features') }
+          # Match the Windows coverage job's limit for disk-backed test fixtures.
+          if ($env:RUNNER_OS -eq 'Windows') { $env:RUST_TEST_THREADS = '2' }
           cargo +1.93.0 test --locked @features --target $env:BUILD_TARGET --lib -p peerlume -p librqbit-tracker-comms
           if ($LASTEXITCODE -ne 0) { throw 'Library tests failed' }
           cargo +1.93.0 test --locked @features --target $env:BUILD_TARGET --test core_workflows
