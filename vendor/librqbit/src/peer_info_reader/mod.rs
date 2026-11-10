@@ -39,9 +39,50 @@ pub(crate) async fn read_metainfo_from_peer(
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
 ) -> anyhow::Result<TorrentAndInfoBytes> {
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
-        Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), bencode::DeserializeError>,
-    >();
+    let bytes = read_metadata_bytes_from_peer(
+        MetadataPeer {
+            addr,
+            peer_id,
+            info_hash,
+            max_bytes: 32 * 1024 * 1024,
+            preview: false,
+        },
+        peer_connection_options,
+        spawner,
+        connector,
+        client_name_and_version,
+    )
+    .await?;
+    use clone_to_owned::CloneToOwned;
+    let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&bytes.0)
+        .map_err(|error| error.into_kind())?
+        .clone_to_owned(Some(&bytes.0));
+    Ok((info, bytes))
+}
+
+pub(crate) struct MetadataPeer {
+    pub addr: SocketAddr,
+    pub peer_id: Id20,
+    pub info_hash: Id20,
+    pub max_bytes: u32,
+    pub preview: bool,
+}
+
+pub(crate) async fn read_metadata_bytes_from_peer(
+    request: MetadataPeer,
+    peer_connection_options: Option<PeerConnectionOptions>,
+    spawner: BlockingSpawner,
+    connector: Arc<StreamConnector>,
+    client_name_and_version: String,
+) -> anyhow::Result<ByteBufOwned> {
+    let MetadataPeer {
+        addr,
+        peer_id,
+        info_hash,
+        max_bytes,
+        preview,
+    } = request;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<ByteBufOwned>();
     let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel::<WriterRequest>();
     let handler = Handler {
         addr,
@@ -50,6 +91,8 @@ pub(crate) async fn read_metainfo_from_peer(
         result_tx: Mutex::new(Some(result_tx)),
         locked: RwLock::new(None),
         client_name_and_version,
+        max_bytes,
+        preview,
     };
     let connection = PeerConnection::new(
         addr,
@@ -66,7 +109,7 @@ pub(crate) async fn read_metainfo_from_peer(
     let connection_runner = async move { connection.manage_peer_outgoing(writer_rx, brx).await };
 
     tokio::select! {
-        result = result_reader => Ok(result??),
+        result = result_reader => Ok(result?),
         whatever = connection_runner => match whatever {
             Ok(_) => anyhow::bail!("connection runner completed first"),
             Err(e) => Err(e.into())
@@ -83,8 +126,8 @@ struct HandlerLocked {
 }
 
 impl HandlerLocked {
-    fn new(metadata_size: u32) -> anyhow::Result<Self> {
-        if metadata_size > 32 * 1024 * 1024 {
+    fn new(metadata_size: u32, max_bytes: u32) -> anyhow::Result<Self> {
+        if metadata_size == 0 || metadata_size > max_bytes {
             anyhow::bail!("metadata size {} is too big", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
@@ -153,18 +196,20 @@ struct Handler {
     addr: SocketAddr,
     info_hash: Id20,
     writer_tx: UnboundedSender<WriterRequest>,
-    result_tx: Mutex<
-        Option<
-            tokio::sync::oneshot::Sender<Result<TorrentAndInfoBytes, bencode::DeserializeError>>,
-        >,
-    >,
+    result_tx: Mutex<Option<tokio::sync::oneshot::Sender<ByteBufOwned>>>,
     locked: RwLock<Option<HandlerLocked>>,
     client_name_and_version: String,
+    max_bytes: u32,
+    preview: bool,
 }
 
 impl PeerConnectionHandler for Handler {
     fn should_send_bitfield(&self) -> bool {
         false
+    }
+
+    fn should_send_initial_unchoke(&self) -> bool {
+        !self.preview
     }
 
     fn serialize_bitfield_message_to_buf(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
@@ -184,30 +229,19 @@ impl PeerConnectionHandler for Handler {
         trace!("{}: received message: {:?}", self.addr, msg);
 
         if let Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(utdata))) = msg {
-            let piece_ready = self
-                .locked
-                .write()
+            let mut locked = self.locked.write();
+            let piece_ready = locked
                 .as_mut()
-                .unwrap()
+                .ok_or_else(|| anyhow::anyhow!("unexpected metadata data before negotiation"))?
                 .record_piece(&utdata, &self.info_hash)?;
             if piece_ready {
-                let buf = Bytes::from(self.locked.write().take().unwrap().buffer);
-                let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
-                    .map(|i| {
-                        use clone_to_owned::CloneToOwned;
-                        i.clone_to_owned(Some(&buf))
-                    })
-                    .map_err(|e| {
-                        trace!("error deserializing TorrentMetaV1Info: {e:#}");
-                        e.into_kind()
-                    })
-                    .map(|i| (i, ByteBufOwned(buf)));
+                let buf = Bytes::from(locked.take().expect("validated metadata buffer").buffer);
 
                 self.result_tx
                     .lock()
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("oneshot is consumed"))?
-                    .send(info)
+                    .send(ByteBufOwned(buf))
                     .map_err(|_| {
                         anyhow::anyhow!("torrent info deserialized, but consumer closed")
                     })?;
@@ -231,25 +265,43 @@ impl PeerConnectionHandler for Handler {
             None => anyhow::bail!("peer does not have metadata_size"),
         };
 
-        if extended_handshake.m.ut_metadata.is_none() {
+        if !extended_handshake.m.ut_metadata.is_some_and(|id| id > 0) {
             anyhow::bail!("peer does not support ut_metadata");
         }
 
-        self.writer_tx
-            .send(WriterRequest::Message(Message::Unchoke))?;
-        self.writer_tx
-            .send(WriterRequest::Message(Message::Interested))?;
+        let mut locked = self.locked.write();
+        if locked.is_some() || self.result_tx.lock().is_none() {
+            anyhow::bail!("duplicate metadata negotiation");
+        }
+        if !self.preview {
+            self.writer_tx
+                .send(WriterRequest::Message(Message::Unchoke))?;
+            self.writer_tx
+                .send(WriterRequest::Message(Message::Interested))?;
+        }
 
-        let inner = HandlerLocked::new(metadata_size)?;
+        let inner = HandlerLocked::new(metadata_size, self.max_bytes)?;
         let total_pieces = inner.total_pieces;
 
-        self.locked.write().replace(inner);
+        locked.replace(inner);
 
         for i in 0..total_pieces {
             self.writer_tx
                 .send(WriterRequest::Message(Message::Extended(
                     ExtendedMessage::UtMetadata(UtMetadata::Request(i.try_into()?)),
                 )))?;
+        }
+        Ok(())
+    }
+
+    fn update_my_extended_handshake(
+        &self,
+        handshake: &mut ExtendedHandshake<ByteBuf>,
+    ) -> anyhow::Result<()> {
+        if self.preview {
+            // BEP 10 uses zero to disable an extension. This pinned
+            // serializer also requires an integer for each mapping.
+            handshake.m.ut_pex = Some(0);
         }
         Ok(())
     }

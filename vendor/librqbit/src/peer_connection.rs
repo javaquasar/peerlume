@@ -36,6 +36,9 @@ use crate::{
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
     fn should_send_bitfield(&self) -> bool;
+    fn should_send_initial_unchoke(&self) -> bool {
+        true
+    }
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()>;
     fn on_extended_handshake(
@@ -332,14 +335,16 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
+            if self.handler.should_send_initial_unchoke() {
+                let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write.write_all(&write_buf[..len]).map_err(Error::Write),
+                )
+                .await?;
+                trace!("sent unchoke");
+            }
 
             let mut broadcast_closed = false;
 

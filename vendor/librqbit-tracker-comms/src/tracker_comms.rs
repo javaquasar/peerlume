@@ -23,10 +23,17 @@ pub const MAX_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const HTTP_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn bounded_response_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
-    if response.content_length().is_some_and(|n| n > MAX_TRACKER_RESPONSE_BYTES as u64) { anyhow::bail!("Tracker response exceeds the 1 MiB limit"); }
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_TRACKER_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("Tracker response exceeds the 1 MiB limit");
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > MAX_TRACKER_RESPONSE_BYTES.saturating_sub(body.len()) { anyhow::bail!("Tracker response exceeds the 1 MiB limit"); }
+        if chunk.len() > MAX_TRACKER_RESPONSE_BYTES.saturating_sub(body.len()) {
+            anyhow::bail!("Tracker response exceeds the 1 MiB limit");
+        }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
@@ -35,37 +42,73 @@ async fn bounded_response_body(mut response: reqwest::Response) -> anyhow::Resul
 #[cfg(test)]
 mod response_limit_tests {
     use super::*;
-    use std::{io::{BufRead, BufReader, Write}, net::TcpListener};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+    };
     #[test]
     fn http_body_limit_covers_advertised_chunked_and_exact_size_responses() {
         for (length, chunked, advertised, accepted) in [
             (0, false, Some(MAX_TRACKER_RESPONSE_BYTES + 1), false),
             (MAX_TRACKER_RESPONSE_BYTES + 1, false, None, false),
             (MAX_TRACKER_RESPONSE_BYTES + 1, true, None, false),
-            (MAX_TRACKER_RESPONSE_BYTES, false, Some(MAX_TRACKER_RESPONSE_BYTES), true),
+            (
+                MAX_TRACKER_RESPONSE_BYTES,
+                false,
+                Some(MAX_TRACKER_RESPONSE_BYTES),
+                true,
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}/announce", listener.local_addr().unwrap());
             let worker = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut reader = BufReader::new(&stream);
-                loop { let mut line = String::new(); if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; } }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
                 write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n").unwrap();
-                if let Some(n) = advertised { write!(stream, "Content-Length: {n}\r\n").unwrap(); }
-                if chunked { write!(stream, "Transfer-Encoding: chunked\r\n").unwrap(); }
+                if let Some(n) = advertised {
+                    write!(stream, "Content-Length: {n}\r\n").unwrap();
+                }
+                if chunked {
+                    write!(stream, "Transfer-Encoding: chunked\r\n").unwrap();
+                }
                 write!(stream, "\r\n").unwrap();
-                if chunked { let _ = write!(stream, "{length:x}\r\n"); }
+                if chunked {
+                    let _ = write!(stream, "{length:x}\r\n");
+                }
                 let _ = stream.write_all(&vec![b'x'; length]);
-                if chunked { let _ = stream.write_all(b"\r\n0\r\n\r\n"); }
+                if chunked {
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n");
+                }
             });
             let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let response = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap().get(url).send().await.unwrap();
+                let response = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .await
+                    .unwrap();
                 bounded_response_body(response).await
             });
             worker.join().unwrap();
-            assert_eq!(result.is_ok(), accepted, "length={length}, chunked={chunked}");
-            if let Ok(bytes) = result { assert_eq!(bytes.len(), MAX_TRACKER_RESPONSE_BYTES); }
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "length={length}, chunked={chunked}"
+            );
+            if let Ok(bytes) = result {
+                assert_eq!(bytes.len(), MAX_TRACKER_RESPONSE_BYTES);
+            }
         }
     }
 }
@@ -187,6 +230,66 @@ async fn udp_tracker_to_socket_addrs(
 }
 
 impl TrackerComms {
+    /// A bounded discovery request for unknown metadata. It has no transfer
+    /// lifecycle, reporting policy, or journal attachment.
+    pub async fn metadata_peers(
+        info_hash: Id20,
+        peer_id: Id20,
+        tracker: &Url,
+        reqwest_client: reqwest::Client,
+        udp_client: &UdpTrackerClient,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
+        struct MetadataStats;
+        impl TorrentStatsProvider for MetadataStats {
+            fn get(&self) -> TrackerCommsStats {
+                // The size is unknown. Keep this one-shot request from
+                // presenting itself as a seed without claiming payload bytes.
+                TrackerCommsStats {
+                    total_bytes: 1,
+                    ..Default::default()
+                }
+            }
+        }
+        let comms = Self {
+            info_hash,
+            peer_id,
+            stats: Box::new(MetadataStats),
+            force_tracker_interval: None,
+            tx: tokio::sync::mpsc::channel(1).0,
+            announce_port: 1,
+            reqwest_client,
+            key: rand::random(),
+            reporting: Arc::default(),
+            hooks: None,
+        };
+        let (_, peers) = match tracker.scheme() {
+            "http" | "https" => comms.tracker_one_request_http(tracker, None).await?,
+            "udp" => {
+                let addrs = udp_tracker_to_socket_addrs(
+                    tracker.host().context("missing tracker host")?,
+                    tracker.port().context("missing tracker port")?,
+                )
+                .await?;
+                match addrs {
+                    UdpTrackerResolveResult::One(addr) => {
+                        comms
+                            .tracker_one_request_udp(tracker, addr, udp_client, None)
+                            .await?
+                    }
+                    UdpTrackerResolveResult::Two(v4, v6) => {
+                        let (r4, r6) = tokio::join!(
+                            comms.tracker_one_request_udp(tracker, v4.into(), udp_client, None),
+                            comms.tracker_one_request_udp(tracker, v6.into(), udp_client, None),
+                        );
+                        r4.or(r6)?
+                    }
+                }
+            }
+            _ => anyhow::bail!("unsupported tracker route"),
+        };
+        Ok(peers)
+    }
+
     fn observe(
         &self,
         tracker: String,
@@ -268,19 +371,21 @@ impl TrackerComms {
         let reporting = crate::reporting::policy_for(info_hash.0, peer_id.0);
         let hooks = crate::observation::hooks_for(peer_id.0);
         let comms = Arc::new(Self {
-                info_hash,
-                peer_id,
-                stats,
-                force_tracker_interval: force_interval,
-                tx,
-                announce_port,
-                reqwest_client,
-                key: rand::random(),
-                reporting,
-                hooks,
-            });
-        let monitors: Vec<_> = trackers.into_iter().map(|tracker|
-            lifecycle::Monitor::new(comms.clone(), tracker, udp_client.clone())).collect();
+            info_hash,
+            peer_id,
+            stats,
+            force_tracker_interval: force_interval,
+            tx,
+            announce_port,
+            reqwest_client,
+            key: rand::random(),
+            reporting,
+            hooks,
+        });
+        let monitors: Vec<_> = trackers
+            .into_iter()
+            .map(|tracker| lifecycle::Monitor::new(comms.clone(), tracker, udp_client.clone()))
+            .collect();
         let s = async_stream::stream! {
             // JoinSet aborts workers when the engine drops this stream. Workers
             // keep lifecycle timers alive even while the peer consumer is not
@@ -351,8 +456,13 @@ impl TrackerComms {
         url.set_query(Some(&queries));
 
         let result = async {
-            let response: reqwest::Response =
-                self.reqwest_client.get(url).timeout(HTTP_ANNOUNCE_TIMEOUT).send().await.map_err(|e| {
+            let response: reqwest::Response = self
+                .reqwest_client
+                .get(url)
+                .timeout(HTTP_ANNOUNCE_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| {
                     log.record.outcome = if e.is_timeout() {
                         "timeout"
                     } else {
@@ -371,9 +481,19 @@ impl TrackerComms {
             let bytes = match bounded_response_body(response).await {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    log.record.outcome = if error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_timeout()) { "timeout" } else { "response_read_error" }.into();
+                    log.record.outcome = if error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|e| e.is_timeout())
+                    {
+                        "timeout"
+                    } else {
+                        "response_read_error"
+                    }
+                    .into();
                     // Fixed wording: never propagate an HTTP error containing a credential URL.
-                    log.record.reply.failure = Some("Tracker response could not be read within the size/time limits".into());
+                    log.record.reply.failure = Some(
+                        "Tracker response could not be read within the size/time limits".into(),
+                    );
                     return Err(error);
                 }
             };

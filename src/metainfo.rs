@@ -47,6 +47,18 @@ impl TorrentMetainfo {
     }
 
     pub fn parse_with_limits(bytes: &[u8], limits: &ResourceLimits) -> Result<Self, String> {
+        Self::parse_metadata(bytes, limits, false)
+    }
+
+    pub(crate) fn parse_v1_review(bytes: &[u8]) -> Result<Self, String> {
+        Self::parse_metadata(bytes, &ResourceLimits::default(), true)
+    }
+
+    fn parse_metadata(
+        bytes: &[u8],
+        limits: &ResourceLimits,
+        require_v1: bool,
+    ) -> Result<Self, String> {
         if bytes.len() as u64 > limits.max_torrent_bytes {
             return Err("torrent exceeds configured input limit".into());
         }
@@ -67,7 +79,13 @@ impl TorrentMetainfo {
         }
         validate_component(&name)?;
 
-        let files = parse_files(info, &name)?;
+        let has_v1_pieces = info.contains_key(b"pieces".as_slice());
+        if require_v1 && !has_v1_pieces {
+            return Err("Metadata review requires a v1 piece list".into());
+        }
+        // For a review, use the same v1 file layout as the transfer engine.
+        // This also avoids expanding an unrelated v2 tree before admission.
+        let files = parse_files(info, &name, require_v1)?;
         if files.is_empty() {
             return Err("torrent contains no files".into());
         }
@@ -103,7 +121,6 @@ impl TorrentMetainfo {
 
         let is_private = matches!(info.get(b"private".as_slice()), Some(BValue::Int(1)));
         let is_v2 = matches!(info.get(b"meta version".as_slice()), Some(BValue::Int(2)));
-        let has_v1_pieces = info.contains_key(b"pieces".as_slice());
         let info_hash_v1_hex =
             (!is_v2 || has_v1_pieces).then(|| format!("{:x}", Sha1::digest(info_bytes)));
         let info_hash_v2_hex = is_v2.then(|| format!("{:x}", Sha256::digest(info_bytes)));
@@ -155,7 +172,11 @@ fn push_tracker(trackers: &mut Vec<String>, tracker: String) {
     }
 }
 
-fn parse_files(info: &BDict<'_>, name: &str) -> Result<Vec<MetainfoFile>, String> {
+fn parse_files(
+    info: &BDict<'_>,
+    name: &str,
+    require_v1: bool,
+) -> Result<Vec<MetainfoFile>, String> {
     if let Some(BValue::List(values)) = info.get(b"files".as_slice()) {
         let mut files = Vec::with_capacity(values.len());
         for value in values {
@@ -180,7 +201,7 @@ fn parse_files(info: &BDict<'_>, name: &str) -> Result<Vec<MetainfoFile>, String
         return Ok(files);
     }
 
-    if let Some(BValue::Dict(tree)) = info.get(b"file tree".as_slice()) {
+    if !require_v1 && let Some(BValue::Dict(tree)) = info.get(b"file tree".as_slice()) {
         let mut files = Vec::new();
         let mut prefix = Vec::new();
         parse_v2_tree(tree, &mut prefix, &mut files)?;
@@ -487,6 +508,10 @@ mod tests {
     fn parses_v2_file_tree_and_sha256_info_hash() {
         let bytes =
             b"d4:infod9:file treed5:a.txtd0:d6:lengthi7eeee12:meta versioni2e4:name4:demoee";
+        assert_eq!(
+            TorrentMetainfo::parse_v1_review(bytes).unwrap_err(),
+            "Metadata review requires a v1 piece list"
+        );
         let parsed = TorrentMetainfo::parse(bytes).unwrap();
         assert_eq!(parsed.files[0].path, "a.txt");
         assert_eq!(parsed.files[0].size_bytes, 7);

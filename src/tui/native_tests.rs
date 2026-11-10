@@ -599,3 +599,22 @@ fn native_operations_panel_shows_durable_view_save_and_closes() {
             .is_none()
     );
 }
+
+#[test]
+fn native_magnet_review_is_cancellable_before_registration() {
+    let mut fixture = NativeTui::settings_only();
+    let before = fixture.app.control.torrents.len();
+    let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    key(&mut fixture.app, KeyCode::Char('m'));
+    assert!(render(&mut fixture.app).contains("Trackerless review shares the hash"));
+    enter(&mut fixture.app, uri);
+    assert!(fixture.app.magnet_review.is_open());
+    let screen = render(&mut fixture.app);
+    assert!(screen.contains("Resolving magnet metadata"));
+    assert!(!screen.contains(uri));
+    key(&mut fixture.app, KeyCode::Esc);
+    assert!(!fixture.app.magnet_review.is_open());
+    assert_eq!(fixture.app.control.torrents.len(), before);
+    assert_eq!(fixture.owner.lock().unwrap().torrents.len(), before);
+    assert_eq!(fixture.app.status, "Magnet review cancelled");
+}

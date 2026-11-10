@@ -153,6 +153,20 @@ pub enum Action {
         file_revision: u64,
     },
     Add(NewTorrent),
+    BeginMagnetReview {
+        magnet: String,
+    },
+    MagnetReview {
+        id: String,
+        offset: usize,
+    },
+    CancelMagnetReview {
+        id: String,
+    },
+    ConfirmMagnetReview {
+        id: String,
+        torrent: NewTorrent,
+    },
     Retry {
         id: String,
         revision: u64,
@@ -252,6 +266,7 @@ pub enum Reply {
         entries: Vec<SessionNotice>,
     },
     Operations(NativeOperationPage),
+    MagnetReview(MagnetReviewPage),
     Journal {
         entries: Vec<crate::announce_journal::JournalEntry>,
         total: usize,
@@ -338,6 +353,34 @@ pub struct NativeOperation {
 pub struct NativeOperationPage {
     pub entries: Vec<NativeOperation>,
     pub next_before: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MagnetReviewState {
+    Resolving,
+    Ready,
+    Cancelled,
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MagnetReviewFile {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MagnetReviewPage {
+    pub id: String,
+    pub state: MagnetReviewState,
+    pub name: Option<String>,
+    pub hashes: Vec<String>,
+    pub trackers: Vec<String>,
+    pub is_private: bool,
+    pub total_files: usize,
+    pub next_offset: Option<usize>,
+    pub files: Vec<MagnetReviewFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

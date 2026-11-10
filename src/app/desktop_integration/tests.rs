@@ -673,6 +673,7 @@ fn desktop_frame(
             app.appearance_state.apply(ctx, &app.settings.ui.appearance);
             app.show_desktop_footer(ctx);
             app.show_desktop_torrents(ctx);
+            app.show_magnet_lookup(ctx);
             app.show_desktop_dialogs(ctx);
         },
     )
@@ -954,8 +955,9 @@ fn actual_magnet_dialog_cancel_and_invalid_add_do_not_import_or_reopen() {
         vec![egui::Event::Text("invalid magnet text".into())],
     );
     assert_eq!(f.app.magnet_input, "invalid magnet text");
-    desktop_click(&ctx, &mut f.app, "Add magnet");
+    desktop_click(&ctx, &mut f.app, "Review metadata");
     assert!(!f.app.magnet_open);
+    assert!(f.app.pending_magnet.is_none());
     assert!(!f.app.add_status.is_empty());
     assert_eq!(f.app.control.torrents.len(), 1);
     assert!(f.receipts().into_iter().all(|receipt| !receipt.queued));
@@ -968,6 +970,41 @@ fn actual_magnet_dialog_cancel_and_invalid_add_do_not_import_or_reopen() {
     desktop_click(&ctx, &mut f.app, "Cancel");
     assert!(!f.app.magnet_open);
     assert!(f.receipts().into_iter().all(|receipt| !receipt.queued));
+}
+
+#[test]
+fn magnet_lookup_can_be_cancelled_before_any_registration_is_queued() {
+    let mut f = Connected::new(1);
+    let ctx = egui::Context::default();
+    desktop_click(&ctx, &mut f.app, "Add magnet");
+    f.app.magnet_input = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+    desktop_click(&ctx, &mut f.app, "Review metadata");
+    assert!(f.app.pending_magnet.is_some());
+    assert!(f.app.magnet_input.is_empty());
+    assert!(f.app.add_dialog.is_none());
+    let pending = desktop_settle(&ctx, &mut f.app);
+    first_text(&pending, "Retrieving magnet metadata");
+    assert!(!pending.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("urn:btih:"))));
+    desktop_click(&ctx, &mut f.app, "Cancel lookup");
+    assert!(f.app.pending_magnet.is_none());
+    f.app.poll_magnet_review();
+    assert!(f.app.add_dialog.is_none());
+    assert_eq!(f.app.control.torrents.len(), 1);
+    assert_eq!(
+        f.owner
+            .lock()
+            .unwrap()
+            .backend
+            .load_torrents()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        f.receipts()
+            .iter()
+            .all(|receipt| receipt.label != "Magnet registration")
+    );
 }
 
 #[test]

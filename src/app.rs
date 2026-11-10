@@ -24,6 +24,7 @@ mod file_location;
 mod file_scroll_tests;
 mod file_tree;
 mod icon;
+mod magnet_review;
 #[cfg(test)]
 mod message_tests;
 mod operation_tracking;
@@ -455,7 +456,7 @@ struct AddTorrentDialog {
     download_mode: DownloadMode,
     freeze_after_bytes: u64,
     upload_ratio: crate::download_mode::UploadRatioRange,
-    source_path: PathBuf,
+    source: AddSource,
     name: String,
     is_private: bool,
     info_hash_v1_hex: Option<String>,
@@ -469,9 +470,28 @@ struct AddTorrentDialog {
     error: String,
 }
 
+enum AddSource {
+    TorrentFile(PathBuf),
+    Magnet(magnet_review::ReviewedSource),
+}
+
 impl AddTorrentDialog {
     fn new(
         source_path: PathBuf,
+        metainfo: TorrentMetainfo,
+        settings: &ClientSettings,
+        download_directory: String,
+    ) -> Self {
+        Self::from_source(
+            AddSource::TorrentFile(source_path),
+            metainfo,
+            settings,
+            download_directory,
+        )
+    }
+
+    fn from_source(
+        source: AddSource,
         metainfo: TorrentMetainfo,
         settings: &ClientSettings,
         download_directory: String,
@@ -481,9 +501,13 @@ impl AddTorrentDialog {
         if !settings.download.select_all_files {
             files.select_all(false);
         }
-        let audit_tracker_url = metainfo.trackers.first().cloned().unwrap_or_default();
+        let audit_tracker_url = if matches!(source, AddSource::TorrentFile(_)) {
+            metainfo.trackers.first().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
         Self {
-            source_path,
+            source,
             verify_after_download: false,
             repair_policy: Default::default(),
             download_mode: DownloadMode::Normal,
@@ -506,6 +530,18 @@ impl AddTorrentDialog {
             error: String::new(),
         }
     }
+
+    fn transfer_overrides(&self) -> TorrentOverrides {
+        TorrentOverrides {
+            verify_after_download: self.verify_after_download,
+            repair_policy: self.repair_policy,
+            download_mode: self.download_mode,
+            freeze_after_bytes: self.freeze_after_bytes,
+            upload_ratio: self.upload_ratio,
+            download_directory: Some(self.download_directory.clone()),
+            ..Default::default()
+        }
+    }
 }
 
 pub struct PeerLumeApp {
@@ -524,6 +560,7 @@ pub struct PeerLumeApp {
     appearance_open: bool,
     updates: updates::UpdatesPanel,
     magnet_open: bool,
+    pending_magnet: Option<magnet_review::Pending>,
     open_agent_access: bool,
     batch_remove: Option<desktop_integration::RemovalReview>,
     stop_confirmation: Option<String>,
@@ -721,6 +758,7 @@ impl PeerLumeApp {
             appearance_open: false,
             updates: Default::default(),
             magnet_open: false,
+            pending_magnet: None,
             open_agent_access: false,
             batch_remove: None,
             stop_confirmation: None,
@@ -800,7 +838,7 @@ impl PeerLumeApp {
                 self.desktop_error("Operation receipts",None,format!("{lost} native receipts exceeded the bounded window; inspect current state before retrying"));
             }
             for receipt in client.take_receipts() {
-                if receipt.label == "Agent view" {
+                if matches!(receipt.label, "Agent view" | "Cancel magnet review") {
                     continue;
                 }
                 if let Err(error) = self
@@ -813,6 +851,7 @@ impl PeerLumeApp {
                 if receipt.queued {
                     continue;
                 }
+                self.apply_magnet_receipt(&receipt);
                 if let Some(ui) = &receipt.ui_saved {
                     self.saved_settings.ui = ui.clone();
                 }
@@ -879,6 +918,9 @@ impl PeerLumeApp {
                     self.settings_draft.queue = queue_draft;
                     self.settings_status = self.add_status.clone();
                 }
+            }
+            if lost > 0 {
+                self.mark_magnet_receipt_loss();
             }
             if client.connection().status == crate::control::frontend::ConnectionStatus::Connected
                 && let Some(view) = client.speed_view()
@@ -1356,6 +1398,15 @@ impl PeerLumeApp {
     }
 
     fn open_torrent_picker(&mut self) {
+        if self.pending_magnet.is_some()
+            || self
+                .add_dialog
+                .as_ref()
+                .is_some_and(|dialog| matches!(dialog.source, AddSource::Magnet(_)))
+        {
+            self.add_status = "Finish or cancel the magnet review first".into();
+            return;
+        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("BitTorrent metainfo", &["torrent"])
             .pick_file()
@@ -1463,7 +1514,10 @@ impl PeerLumeApp {
     }
 
     fn open_next_queued_torrent(&mut self) {
-        if self.add_dialog.is_some() || self.metainfo_loader.is_loading() {
+        if self.add_dialog.is_some()
+            || self.metainfo_loader.is_loading()
+            || self.pending_magnet.is_some()
+        {
             return;
         }
         if self.pending_torrent_paths.len() > 64 {
@@ -1479,64 +1533,20 @@ impl PeerLumeApp {
         }
     }
 
-    fn add_magnet(&mut self) {
-        match crate::magnet::MagnetLink::parse(self.magnet_input.trim()) {
-            Ok(magnet) => {
-                let name = magnet
-                    .display_name
-                    .unwrap_or_else(|| "Magnet metadata".into());
-                let id = magnet.exact_topics.join(";");
-                let torrent = TorrentItem {
-                    runtime: Default::default(),
-                    completion: crate::completion::CompletionStatus::Pending,
-                    name: name.clone(),
-                    source: self.magnet_input.clone(),
-                    info_hashes: magnet.exact_topics,
-                    trackers: magnet.trackers,
-                    peer_id: metainfo::generate_peer_id(&self.settings.bittorrent.peer_id_prefix),
-                    files: FileSelectionModel::default(),
-                    downloaded_bytes: 0,
-                    uploaded_bytes: 0,
-                    download_rate: 0,
-                    upload_rate: 0,
-                    peers: 0,
-                    seeds: 0,
-                    state: TorrentState::Paused,
-                    is_private: false,
-                    overrides: Default::default(),
-                };
-                if let Err(error) = self.control.add(torrent, &self.settings, None) {
-                    self.add_status = error;
-                    return;
-                }
-                if self.control.backend.attached_client().is_some() {
-                    self.add_status = format!("Awaiting owner registration of {name}");
-                    self.magnet_input.clear();
-                    return;
-                }
-                self.selected_torrent = self.control.torrents.len() - 1;
-                if let Some(torrent) = self.control.torrents.last() {
-                    self.tracker_audits.insert(
-                        id.clone(),
-                        TorrentTrackerAudit::new(
-                            torrent.trackers.first().cloned().unwrap_or_default(),
-                            torrent.selected_size(),
-                            self.settings.connection.listen_port,
-                        ),
-                    );
-                }
-                self.add_status = format!("Added {name}; waiting for metadata exchange");
-                self.magnet_input.clear();
-            }
-            Err(error) => self.add_status = error,
-        }
-    }
-
     fn show_add_torrent_dialog(&mut self, ctx: &egui::Context) {
         let mut picked_download_directory = None;
-        let Some(dialog) = self.add_dialog.as_mut() else {
+        let Some(draft) = self.add_dialog.as_ref() else {
             return;
         };
+        let (magnet, committing, can_confirm) = match &draft.source {
+            AddSource::TorrentFile(_) => (false, false, true),
+            AddSource::Magnet(source) => (
+                true,
+                source.commit_job.is_some(),
+                source.can_confirm(&self.desktop_connection()),
+            ),
+        };
+        let dialog = self.add_dialog.as_mut().expect("review is open");
         poll_tracker_audit(dialog);
         let mut add = false;
         let mut cancel = false;
@@ -1549,6 +1559,14 @@ impl PeerLumeApp {
             .show(ctx, |ui| {
                 ui.set_width(modal_width);
                 ui.heading("Review torrent before adding");
+                if committing {
+                    ui.spinner();
+                    ui.label("Waiting for the background owner to reply to your confirmation.");
+                    return;
+                }
+                if magnet {
+                    ui.label("Metadata is ready. File downloads require confirmation and your chosen start policy.");
+                }
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("add_torrent_dialog_scroll")
@@ -1558,7 +1576,10 @@ impl PeerLumeApp {
                     .num_columns(2)
                     .show(ui, |ui| {
                         ui.label("Source");
-                        ui.label(dialog.source_path.display().to_string());
+                        match &dialog.source {
+                            AddSource::TorrentFile(path) => ui.label(path.display().to_string()),
+                            AddSource::Magnet(_) => ui.label("Validated magnet metadata"),
+                        };
                         ui.end_row();
                         ui.label("Name");
                         ui.strong(&dialog.name);
@@ -1609,15 +1630,17 @@ impl PeerLumeApp {
                     }
                     dialog.tracker_audit.started_only = false;
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Tracker URL");
-                    ui.add(egui::TextEdit::singleline(&mut dialog.tracker_audit.tracker_url).desired_width(560.0));
-                });
-                show_tracker_account_identity(ui, &dialog.tracker_audit.tracker_url);
-                if dialog.download_mode == DownloadMode::Normal {
-                    ui.collapsing("Advanced tracker audit", |ui| {
-                        show_tracker_audit(ui, dialog, &mut self.behavior_catalog);
+                if !magnet {
+                    ui.horizontal(|ui| {
+                        ui.label("Tracker URL");
+                        ui.add(egui::TextEdit::singleline(&mut dialog.tracker_audit.tracker_url).desired_width(560.0));
                     });
+                    show_tracker_account_identity(ui, &dialog.tracker_audit.tracker_url);
+                    if dialog.download_mode == DownloadMode::Normal {
+                        ui.collapsing("Advanced tracker audit", |ui| {
+                            show_tracker_audit(ui, dialog, &mut self.behavior_catalog);
+                        });
+                    }
                 }
 
                 ui.separator();
@@ -1697,6 +1720,7 @@ impl PeerLumeApp {
                 for (index,selected) in selection_changes { dialog.files.set_selected(index,selected); }
 
                 ui.separator();
+                if !magnet {
                 ui.heading("Identity");
                 ui.label(
                     "The info hash identifies the content and cannot be changed. The editable Peer ID below is used by tracker audit requests.",
@@ -1719,6 +1743,7 @@ impl PeerLumeApp {
                 ui.label(
                     "The Tracker URL above is attached to this download.",
                 );
+                }
                 if dialog.tracker_audit.started_only {
                     dialog.start_immediately = false;
                 }
@@ -1737,9 +1762,12 @@ impl PeerLumeApp {
                 if !dialog.error.is_empty() {
                     ui.colored_label(egui::Color32::RED, &dialog.error);
                 }
+                if magnet && !can_confirm && dialog.error.is_empty() {
+                    ui.label("Confirmation is unavailable on this connection. Reconnect to the same owner or close this review.");
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Add torrent").clicked() {
+                    if ui.add_enabled(can_confirm, egui::Button::new(if magnet { "Confirm add" } else { "Add torrent" })).clicked() {
                         add = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1753,7 +1781,7 @@ impl PeerLumeApp {
             self.last_download_directory = Some(directory);
         }
 
-        if cancel || modal.should_close() {
+        if !committing && (cancel || modal.should_close()) {
             self.add_dialog = None;
             self.open_next_queued_torrent();
             return;
@@ -1775,7 +1803,15 @@ impl PeerLumeApp {
                 return;
             }
         };
+        if magnet {
+            self.confirm_magnet_review();
+            return;
+        }
         let dialog = self.add_dialog.take().expect("dialog exists");
+        let overrides = dialog.transfer_overrides();
+        let AddSource::TorrentFile(source_path) = dialog.source else {
+            unreachable!("magnet uses confirmed owner preview")
+        };
         self.last_download_directory = Some(dialog.download_directory.clone());
         let tracker_audit = dialog.tracker_audit.to_profile();
         let start_observation = tracker_audit.started_only;
@@ -1789,7 +1825,7 @@ impl PeerLumeApp {
             runtime: Default::default(),
             completion: crate::completion::CompletionStatus::Pending,
             name: name.clone(),
-            source: dialog.source_path.display().to_string(),
+            source: source_path.display().to_string(),
             info_hashes: [
                 dialog.info_hash_v1_hex.map(|hash| format!("v1: {hash}")),
                 dialog.info_hash_v2_hex.map(|hash| format!("v2: {hash}")),
@@ -1808,15 +1844,7 @@ impl PeerLumeApp {
             seeds: 0,
             state,
             is_private: dialog.is_private,
-            overrides: TorrentOverrides {
-                verify_after_download: dialog.verify_after_download,
-                repair_policy: dialog.repair_policy,
-                download_mode: dialog.download_mode,
-                freeze_after_bytes: dialog.freeze_after_bytes,
-                upload_ratio: dialog.upload_ratio,
-                download_directory: Some(dialog.download_directory),
-                ..Default::default()
-            },
+            overrides,
         };
         let id = torrent.info_hashes.join(";");
         if let Err(error) =
@@ -2896,6 +2924,7 @@ impl eframe::App for PeerLumeApp {
             )
         });
         self.handle_dropped_files(dropped_count, dropped_paths);
+        self.poll_magnet_review();
         self.poll_metainfo_import();
         self.poll_session_events();
         let connection = self.desktop_connection();
@@ -2918,6 +2947,7 @@ impl eframe::App for PeerLumeApp {
             MainPage::Preferences => self.show_settings(ctx),
         }
         self.show_add_torrent_dialog(ctx);
+        self.show_magnet_lookup(ctx);
         self.show_import_status(ctx);
         self.show_trash_confirmation(ctx);
         self.show_desktop_dialogs(ctx);
@@ -3985,6 +4015,19 @@ fn validate_add_dialog(dialog: &AddTorrentDialog) -> Result<Vec<String>, String>
     }
     if dialog.download_directory.trim().is_empty() {
         return Err("Choose a download directory".into());
+    }
+    if let AddSource::Magnet(review) = &dialog.source {
+        metainfo::validate_peer_id(&dialog.peer_id)?;
+        if !Path::new(&dialog.download_directory).is_absolute() {
+            return Err("Choose an absolute download directory".into());
+        }
+        if dialog.is_private && dialog.start_immediately && !review.has_trackers {
+            return Err(
+                "A private torrent needs a tracker from its magnet link before it can start".into(),
+            );
+        }
+        // The owner reuses the original, validated tracker list for this review.
+        return Ok(Vec::new());
     }
     if Path::new(dialog.download_directory.trim()).is_file() {
         return Err("Download location points to a file, not a directory".into());

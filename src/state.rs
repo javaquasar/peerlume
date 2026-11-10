@@ -1040,6 +1040,14 @@ impl StateStore {
         Ok(Some(profile.clone()))
     }
 
+    pub(crate) fn torrent_uses_source(&self, id: &str, source: &str) -> rusqlite::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM torrents WHERE id=?1 AND source=?2)",
+            params![id, source],
+            |row| row.get(0),
+        )
+    }
+
     pub fn remove_torrent(&self, id: &str) -> rusqlite::Result<bool> {
         let removed = self
             .connection

@@ -958,6 +958,18 @@ impl ClientBackend {
         )
     }
 
+    pub(crate) fn persisted_torrent_uses_source(
+        &self,
+        id: &str,
+        source: &str,
+    ) -> Result<bool, String> {
+        self.state_store.as_ref().map_or(Ok(false), |store| {
+            store
+                .torrent_uses_source(id, source)
+                .map_err(|error| error.to_string())
+        })
+    }
+
     pub fn send(&self, command: SessionCommand) -> Result<(), String> {
         if self.attached.is_some() {
             return Err("Native frontends must submit validated owner commands".into());
@@ -990,6 +1002,12 @@ impl ClientBackend {
 
     pub fn session_available(&self) -> bool {
         self.session_runtime.is_some() || self.attached.is_some()
+    }
+
+    pub(crate) fn metadata_engine(&self) -> Option<std::sync::Arc<librqbit::Session>> {
+        self.session_runtime
+            .as_ref()
+            .and_then(SessionRuntime::engine)
     }
 
     pub(crate) fn request_live_speed(&self, plan: crate::settings::speed_policy::SpeedPlan) {

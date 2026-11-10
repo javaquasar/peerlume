@@ -1,6 +1,7 @@
 //! Authenticated current-user native frontend channel. This is intentionally
 //! separate from the restricted external-agent protocol and its observations.
 mod client;
+mod magnet_review;
 pub(super) mod operations;
 mod recovery;
 mod server;
@@ -10,14 +11,16 @@ mod wire;
 pub use client::{
     Client, ConnectionStatus, ConnectionView, OperationView, Receipt, finish_pending_actions,
 };
+pub use magnet_review::{MagnetReview, MagnetReviewTask, MagnetReviewToken, MagnetSelection};
 pub use recovery::Recovery;
 pub use server::Server;
 pub use wire::{
-    AccessAction, AccessView, NativeOperation, NativeOperationPage, NativeOperationProgress,
-    NativeOperationState, NativeTorrent, Snapshot, StorageAction, TrashPlan, TrashScope,
+    AccessAction, AccessView, MagnetReviewFile, MagnetReviewPage, MagnetReviewState,
+    NativeOperation, NativeOperationPage, NativeOperationProgress, NativeOperationState,
+    NativeTorrent, Snapshot, StorageAction, TrashPlan, TrashScope,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
 

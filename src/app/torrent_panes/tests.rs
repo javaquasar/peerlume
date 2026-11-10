@@ -31,6 +31,7 @@ pub(in crate::app) fn fixture(count: usize, file_count: usize) -> PeerLumeApp {
         appearance_open: false,
         updates: Default::default(),
         magnet_open: false,
+        pending_magnet: None,
         open_agent_access: false,
         batch_remove: None,
         stop_confirmation: None,

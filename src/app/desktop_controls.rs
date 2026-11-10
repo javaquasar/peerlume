@@ -445,19 +445,21 @@ pub(super) fn magnet_dialog(
     let modal = egui::Modal::new(egui::Id::new("desktop_add_magnet")).show(ctx, |ui| {
         ui.set_width(modal_width(ctx));
         ui.heading("Add magnet link");
+        ui.label("Retrieve metadata first. Choose the files, location and start policy after review.");
+        ui.label("A link with explicit trackers uses those trackers for lookup. Without trackers, an enabled DHT can share the info hash before the metadata reveals whether the torrent is private.");
         ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(ui.available_width())
                 .hint_text("magnet:?xt=..."),
         );
         if !connected {
-            ui.label("Background client disconnected; reconnect before adding.");
+            ui.label("Background client disconnected. Reconnect before requesting metadata.");
         }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     connected && !text.trim().is_empty(),
-                    egui::Button::new("Add magnet").wrap(),
+                    egui::Button::new("Review metadata").wrap(),
                 )
                 .clicked()
             {

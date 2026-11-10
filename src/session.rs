@@ -279,8 +279,7 @@ pub struct SessionRuntime {
     live_speed: Arc<LiveSpeed>,
     #[cfg(test)]
     test_bulk_budget: Arc<crate::storage::relocation::BulkBudget>,
-    #[cfg(test)]
-    test_engine: Arc<std::sync::Mutex<std::sync::Weak<Session>>>,
+    engine: Arc<std::sync::Mutex<std::sync::Weak<Session>>>,
 }
 
 impl SessionRuntime {
@@ -400,10 +399,8 @@ impl SessionRuntime {
         #[cfg(test)]
         let test_bulk_budget = bulk_budget.clone();
         let thread_journal = journal.clone();
-        #[cfg(test)]
-        let test_engine = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
-        #[cfg(test)]
-        let observed_engine = test_engine.clone();
+        let engine = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
+        let observed_engine = engine.clone();
         let thread = thread::Builder::new()
             .name("peerlume-session".into())
             .spawn(move || {
@@ -444,8 +441,7 @@ impl SessionRuntime {
                         Err(_)=>{let _=ready.send(Err((StartupFailureCode::TransferEngineUnavailable, "Transfer engine initialization exceeded five seconds".into())));return;}
                     };
                     // The provider samples network payload independently of checked disk pieces.
-                    #[cfg(test)]
-                    { *observed_engine.lock().unwrap() = Arc::downgrade(&session); }
+                    *observed_engine.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&session);
                     // Carry totals across pause/resume/recheck live-state generations.
                     let weak_session = Arc::downgrade(&session);
                     let counters = Arc::new(std::sync::Mutex::new(HashMap::<[u8;20], TransferCounter>::new()));
@@ -1114,8 +1110,7 @@ impl SessionRuntime {
             live_speed,
             #[cfg(test)]
             test_bulk_budget,
-            #[cfg(test)]
-            test_engine,
+            engine,
         };
         initialized
             .recv_timeout(Duration::from_secs(6))
@@ -1140,7 +1135,14 @@ impl SessionRuntime {
 
     #[cfg(test)]
     pub(crate) fn test_engine(&self) -> Option<Arc<Session>> {
-        self.test_engine.lock().unwrap().upgrade()
+        self.engine()
+    }
+
+    pub(crate) fn engine(&self) -> Option<Arc<Session>> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
     }
 
     pub fn try_send(&self, command: SessionCommand) -> Result<(), String> {

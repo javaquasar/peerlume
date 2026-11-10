@@ -51,6 +51,7 @@ use crate::{
 
 pub const SUPPORTED_COMPONENT_COUNT: usize = COMPONENTS.len();
 mod interaction;
+mod magnet_review;
 #[cfg(test)]
 mod native_tests;
 mod operations;
@@ -76,6 +77,7 @@ enum PromptKind {
     ExportJournal,
     ExportSessionJournal,
     Magnet,
+    MagnetDirectory,
     DownloadDirectory,
     TrackerUrl,
     BehaviorProfile,
@@ -92,6 +94,7 @@ struct InputPrompt {
 pub struct TuiApp {
     view_cache: RefCell<crate::torrent_view::ViewCache>,
     metainfo_loader: MetainfoLoader,
+    magnet_review: magnet_review::Panel,
     ui_dirty: bool,
     focus: Focus,
     split_percent: u16,
@@ -180,6 +183,7 @@ impl TuiApp {
         Self {
             view_cache: Default::default(),
             metainfo_loader: Default::default(),
+            magnet_review: Default::default(),
             ui_dirty: true,
             focus: Focus::Torrents,
             split_percent: if settings.ui.torrent_pane_percent == 0 {
@@ -224,9 +228,14 @@ impl TuiApp {
 
     fn poll(&mut self) {
         self.agent_panel.poll(&self.control);
+        if let Some(message) = self.magnet_review.poll(&self.settings) {
+            self.status = message;
+            self.ui_dirty = true;
+        }
         self.ui_dirty |= self.operations.poll(self.control.backend.attached_client());
         if let Some(client) = self.control.backend.attached_client() {
             for receipt in client.take_receipts() {
+                self.magnet_review.apply_receipt(&receipt);
                 if receipt.label == "Agent view" {
                     self.ui_dirty = true;
                     continue;
@@ -237,6 +246,11 @@ impl TuiApp {
                     self.settings = settings;
                     self.preferences_draft = None;
                 }
+            }
+            if client.take_receipt_overflow() > 0 && self.magnet_review.mark_receipt_loss() {
+                self.status =
+                    "Registration reply was lost. Inspect the torrent list before retrying.".into();
+                self.ui_dirty = true;
             }
             let live_speed = if client.connection().status
                 == crate::control::frontend::ConnectionStatus::Connected
@@ -405,6 +419,14 @@ impl TuiApp {
             && key.code == KeyCode::Char('c')
         {
             self.handle_interaction(key);
+            return;
+        }
+        if key.kind == KeyEventKind::Press && self.magnet_review.is_open() {
+            if self.input.is_some() {
+                self.handle_prompt_key(key);
+            } else {
+                self.handle_magnet_review_key(key.code);
+            }
             return;
         }
         if key.kind == KeyEventKind::Press && self.operations.is_open() {
@@ -692,6 +714,7 @@ impl TuiApp {
             PromptKind::ExportJournal => self.export_journal(Path::new(&prompt.value), false),
             PromptKind::ExportSessionJournal => self.export_journal(Path::new(&prompt.value), true),
             PromptKind::Magnet => self.add_magnet(&prompt.value),
+            PromptKind::MagnetDirectory => self.magnet_review.set_directory(prompt.value),
             PromptKind::DownloadDirectory => self.set_download_directory(prompt.value),
             PromptKind::TrackerUrl => self.set_tracker_url(prompt.value),
             PromptKind::BehaviorProfile => self.apply_behavior_profile(prompt.value.trim()),
@@ -703,13 +726,14 @@ impl TuiApp {
             }
             Err(error) => {
                 self.status = error;
-                if self.pending_add.is_some()
-                    && matches!(
-                        retry.kind,
-                        PromptKind::DownloadMode
-                            | PromptKind::FreezeAfterBytes
-                            | PromptKind::UploadRatioRange
-                    )
+                if retry.kind == PromptKind::MagnetDirectory
+                    || self.pending_add.is_some()
+                        && matches!(
+                            retry.kind,
+                            PromptKind::DownloadMode
+                                | PromptKind::FreezeAfterBytes
+                                | PromptKind::UploadRatioRange
+                        )
                 {
                     self.input = Some(retry);
                 }
@@ -1179,35 +1203,18 @@ impl TuiApp {
     }
 
     fn add_magnet(&mut self, uri: &str) -> Result<String, String> {
-        let magnet = MagnetLink::parse(uri.trim())?;
-        let name = magnet
-            .display_name
-            .unwrap_or_else(|| "Magnet metadata".into());
-        let torrent = TorrentItem {
-            runtime: Default::default(),
-            completion: crate::completion::CompletionStatus::Pending,
-            name: name.clone(),
-            source: uri.trim().to_owned(),
-            info_hashes: magnet.exact_topics,
-            trackers: magnet.trackers,
-            peer_id: metainfo::generate_peer_id(&self.settings.bittorrent.peer_id_prefix),
-            files: FileSelectionModel::default(),
-            downloaded_bytes: 0,
-            uploaded_bytes: 0,
-            download_rate: 0,
-            upload_rate: 0,
-            peers: 0,
-            seeds: 0,
-            state: TorrentState::Paused,
-            is_private: false,
-            overrides: TorrentOverrides::default(),
-        };
-        self.control.add(torrent, &self.settings, None)?;
-        if self.control.backend.attached_client().is_some() {
-            return Ok(format!("Awaiting owner registration of {name}"));
+        let uri = uri.trim();
+        MagnetLink::parse(uri)?;
+        if self.metainfo_loader.is_loading() {
+            return Err("Wait for the current torrent import".into());
         }
-        self.selected_torrent = self.control.torrents.len() - 1;
-        Ok(format!("Added {name}"))
+        let client = self
+            .control
+            .backend
+            .attached_client()
+            .ok_or("Background client unavailable")?;
+        self.magnet_review.begin(client, uri.to_owned())?;
+        Ok("Requesting magnet metadata for review".into())
     }
 
     fn set_download_directory(&mut self, directory: String) -> Result<String, String> {
@@ -1434,6 +1441,11 @@ impl TuiApp {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
+        if self.magnet_review.is_open() {
+            self.magnet_review
+                .render(frame, self.input.as_ref(), &self.status);
+            return;
+        }
         if self.operations.is_open() {
             self.operations.render(frame);
             return;
@@ -1494,6 +1506,11 @@ impl TuiApp {
                 (usize::from(frame.area().width) * 80 / 100).saturating_sub(3),
             );
             let mut lines = vec![Line::from(display)];
+            if prompt.kind == PromptKind::Magnet {
+                lines.push(Line::from(
+                    "Trackerless review shares the hash with DHT when enabled.",
+                ));
+            }
             if mode_prompt {
                 lines.push(Line::from(format!(
                     "Verify after download: {} · F3 toggles",
@@ -2163,7 +2180,9 @@ pub fn run() -> io::Result<()> {
             app.poll();
             app.refresh_detail_interest();
             let revision = app.control.frontend_revision();
-            let pending = app.metainfo_loader.is_loading() || app.audit_result.is_some();
+            let pending = app.metainfo_loader.is_loading()
+                || app.magnet_review.is_open()
+                || app.audit_result.is_some();
             let interval =
                 crate::torrent_view::refresh_interval(&app.control.torrents, pending, false);
             let timed_refresh = (pending

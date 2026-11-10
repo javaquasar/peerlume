@@ -47,6 +47,7 @@ use buffers::{ByteBuf, ByteBufOwned};
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
 use dht::{Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr};
+mod magnet_preview;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt,
     future::BoxFuture,
@@ -132,6 +133,7 @@ pub struct Session {
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
+    metadata_http_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
 
@@ -720,7 +722,7 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
-            let reqwest_client = {
+            let build_http = |metadata_only: bool| -> anyhow::Result<reqwest::Client> {
                 let builder = if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
@@ -735,11 +737,18 @@ impl Session {
                     b
                 };
 
+                let builder = if metadata_only {
+                    builder.redirect(reqwest::redirect::Policy::none())
+                } else {
+                    builder
+                };
                 builder
                     .user_agent(&client_name_and_version)
                     .build()
-                    .context("error building HTTP(S) client")?
+                    .context("error building HTTP(S) client")
             };
+            let reqwest_client = build_http(false)?;
+            let metadata_http_client = build_http(true)?;
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
@@ -810,6 +819,7 @@ impl Session {
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                metadata_http_client,
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
@@ -1562,12 +1572,14 @@ impl Session {
             trackers.clear();
         }
 
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
+        if is_private {
+            if trackers.len() > 1 {
+                warn!(
+                    ?info_hash,
+                    "private trackers are not fully implemented, so using only the first tracker"
+                );
+                trackers.truncate(1);
+            }
         } else if !self.disable_trackers {
             trackers.extend(self.trackers.iter().cloned());
         }

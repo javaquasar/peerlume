@@ -96,7 +96,10 @@ impl Intent {
                 Some(*revision),
                 Effect::Start,
             ),
-            Action::Add(request) => (
+            Action::Add(request)
+            | Action::ConfirmMagnetReview {
+                torrent: request, ..
+            } => (
                 "Register torrent",
                 safe_target(&request.hashes.join(";")),
                 None,

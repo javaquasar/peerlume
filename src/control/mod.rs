@@ -890,7 +890,17 @@ impl Controller {
         settings: &crate::settings::ClientSettings,
         prepared: crate::session::PreparedTorrent,
     ) -> Result<(), String> {
-        self.add_internal(torrent, settings, None, Some(prepared))
+        self.add_prepared_with_audit(torrent, settings, prepared, None)
+    }
+
+    pub(crate) fn add_prepared_with_audit(
+        &mut self,
+        torrent: TorrentItem,
+        settings: &crate::settings::ClientSettings,
+        prepared: crate::session::PreparedTorrent,
+        audit: Option<crate::state::StoredTrackerAuditProfile>,
+    ) -> Result<(), String> {
+        self.add_internal(torrent, settings, audit, Some(prepared))
     }
 
     fn add_internal(

@@ -84,11 +84,88 @@ Trusted native protocol version 3 introduced the speed commands and readback.
 - The occupied-listener integration scenario targets Linux. The Windows run
   covers the platform-independent startup classification and record handling.
 
+### GitHub evidence for the first two increments
+
+All 19 jobs passed for commit `527adf9`, which includes the fuzz lockfile
+correction and predates the third increment.
+[Tests](https://github.com/javaquasar/peerlume/actions/runs/42827324181),
+[Reliability](https://github.com/javaquasar/peerlume/actions/runs/42827324547),
+[Coverage](https://github.com/javaquasar/peerlume/actions/runs/42827324182),
+[Build packages](https://github.com/javaquasar/peerlume/actions/runs/42827324753).
+
+## Third increment
+
+In the GUI, open **Add magnet**, enter the link and choose **Review metadata**.
+In the TUI, press `m` on the Torrents page, enter the link and press Enter.
+The review shows the resolved name, privacy flag and selected size before
+confirmation. The GUI uses the existing file tree and add dialog. In the TUI,
+use the arrow keys and Space to toggle files, `a` or `n` to select all or none,
+`d` to set the absolute download directory, and `s` to choose whether to start
+or add paused. Enter confirms the review. Esc cancels a lookup or an unsubmitted
+review.
+
+The link must include a BitTorrent v1 topic. Review requires a v1 file layout
+and verifies any supplied v2 identity for hybrid links. The lookup creates no
+registered torrent, saved torrent row or payload files. An accepted confirmation
+queues registration. Engine and durable results continue through the owner
+operation history.
+
+Metadata lookup is network activity. A link with explicit trackers starts
+discovery through those trackers under the existing proxy and tracker rules.
+Metadata HTTP requests do not follow redirects. A trackerless link can use
+enabled DHT and disclose its info hash before the privacy flag is known. A
+private result from that route requires a new link with an explicit tracker.
+Preview excludes LSD and PEX and uses an ephemeral peer ID. Its tracker lookup
+is separate from the confirmed torrent's announce accounting and discovery.
+
+The owner admits two active lookups and retains up to eight review records.
+Network discovery has a 30-second deadline. Each lookup examines up to 64
+candidate addresses with four peer readers and at most 8 MiB of raw info per
+peer. The URI limit is 16 KiB and the input accepts up to eight explicit
+trackers. A ready result can be confirmed for up to five minutes while retained.
+File pages contain up to 128 rows and are limited by encoded path size.
+Cancellation invalidates the result, including validation that finishes after
+cancellation.
+
+The owner checks the raw v1 info hash, requested hybrid identity, metainfo
+limits, file paths and piece geometry. It scopes each review to the requesting
+frontend and owner. Confirmation checks the selection, destination and duplicate
+identity again, then saves the exact reviewed info bytes. The cached source omits
+tracker URLs. Tracker credentials use the existing platform secret provider.
+Native protocol version 5 carries the review commands and requires matching
+frontend and daemon binaries. The restricted public control protocol and grants
+remain separate.
+
+After submission, the frontend waits for the confirmation reply. If it loses
+that reply or the owner cannot establish whether a failed admission left a
+durable row, the frontend asks the user to inspect the torrent list before
+retrying. The owner retains the reviewed metadata when a remaining row could
+depend on it. A confirmed rollback releases the temporary metadata file.
+
+### Local Windows evidence
+
+- The cumulative all-feature library suite passed 859 tests, with seven
+  ignored workloads. All five installed native lifecycle tests and 18 Python
+  packaging contract tests passed. Rustfmt, strict Clippy for all-feature and
+  TUI-only targets, the fuzz patch consistency check and the English repository
+  check passed.
+- All 12 focused all-feature magnet tests passed. A synthetic private
+  two-file torrent used a loopback tracker and peer. The review requested
+  BEP 9 metadata with PEX disabled and issued zero piece requests. The
+  destination was empty and both the engine and owner had zero torrents
+  before confirmation. The tracker probe reported zero uploaded and downloaded
+  bytes without a lifecycle event. After confirmation, the selected file
+  downloaded and verified. The peer received only the selected piece request.
+- Cancelling a lookup closed the pending peer connection. Tests also checked
+  cross-client access rejection and cache retention after an injected admission
+  and rollback failure. The 30-second lookup deadline is implemented. The
+  focused tests exercised cancellation before that deadline.
+
 ## Remaining acceptance
 
-Magnet review, watched imports, category rules, completion moves, tray
-notifications and upgrade activation remain in the release plan. Upgrade activation includes a trusted release channel,
-profile backup, compatible handoff and rollback.
+Watched imports, category rules, completion moves, tray notifications and upgrade
+activation remain in the release plan. Upgrade activation includes a trusted
+release channel, profile backup, compatible handoff and rollback.
 
-Linux runtime, installed desktop interaction, GitHub workflows, coverage
-measurement and a bounded soak remain open for this increment.
+Linux runtime, installed GUI and TUI magnet interactions, GitHub workflows,
+coverage measurement and a bounded soak remain open for the third increment.

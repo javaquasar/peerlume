@@ -372,15 +372,15 @@ fn magnet_and_appearance_dialogs_emit_only_explicit_add_or_save() {
     let size = egui::vec2(700.0, 650.0);
     let ctx = egui::Context::default();
     let mut f = Fixture::new(Surface::Magnet);
-    click_text(&ctx, &mut f, size, "Add magnet");
+    click_text(&ctx, &mut f, size, "Review metadata");
     assert!(f.actions.is_empty());
     assert!(f.open);
     f.text = "magnet:?xt=urn:btih:synthetic".into();
     f.props.connected = false;
-    click_text(&ctx, &mut f, size, "Add magnet");
+    click_text(&ctx, &mut f, size, "Review metadata");
     assert!(f.actions.is_empty());
     f.props.connected = true;
-    click_text(&ctx, &mut f, size, "Add magnet");
+    click_text(&ctx, &mut f, size, "Review metadata");
     assert_eq!(f.actions, [DesktopAction::AddMagnet]);
     assert!(!f.open);
     let ctx = egui::Context::default();

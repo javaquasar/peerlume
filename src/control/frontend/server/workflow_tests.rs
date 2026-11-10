@@ -8,6 +8,7 @@ use crate::{
 };
 use sha1::{Digest, Sha1};
 use std::{path::Path, thread, time::Instant};
+mod magnet_loopback;
 
 struct NativeOwner {
     server: Server,
@@ -26,25 +27,29 @@ impl NativeOwner {
         engine: bool,
         listen: Option<librqbit::ListenerOptions>,
     ) -> Self {
+        Self::new_with_options(
+            items,
+            engine.then_some(librqbit::SessionOptions {
+                dht: None,
+                listen,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            }),
+        )
+    }
+    fn new_with_options(
+        items: Vec<TorrentItem>,
+        options: Option<librqbit::SessionOptions>,
+    ) -> Self {
         let profile = tempfile::tempdir().unwrap();
         let root = profile.path().join("payloads");
         std::fs::create_dir(&root).unwrap();
         let mut settings = ClientSettings::default();
         settings.download.download_directory = root.to_string_lossy().into_owned();
         let store = StateStore::open(&profile.path().join("state.sqlite3")).unwrap();
-        let mut backend = if engine {
-            let runtime = SessionRuntime::start_with_options(
-                32,
-                root.clone(),
-                librqbit::SessionOptions {
-                    dht: None,
-                    listen,
-                    disable_trackers: true,
-                    disable_local_service_discovery: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let mut backend = if let Some(options) = options {
+            let runtime = SessionRuntime::start_with_options(32, root.clone(), options).unwrap();
             ClientBackend::with_session_and_store(runtime, store)
         } else {
             ClientBackend::with_state_store(store)
@@ -200,7 +205,7 @@ fn native_import_rejects_changed_identity_and_invalid_metadata_before_persisting
 }
 
 #[test]
-fn magnet_metadata_preview_keeps_identity_and_validates_unresolved_file_selection() {
+fn native_magnet_cannot_bypass_metadata_review() {
     let fixture = NativeOwner::new(vec![], false);
     let source = fixture.profile.path().join("synthetic.torrent");
     let root = PathBuf::from(&fixture.settings.download.download_directory);
@@ -211,19 +216,14 @@ fn magnet_metadata_preview_keeps_identity_and_validates_unresolved_file_selectio
     request.hashes = vec![topic];
     assert!(matches!(
         prepare_new(request.clone(), &fixture.settings),
-        Err(Error::Stale)
+        Err(Error::Failed(message)) if message.contains("Review magnet metadata")
     ));
     request.selected = PackedIndices::new(0, &[]).unwrap();
     request.high = PackedIndices::new(0, &[]).unwrap();
-    let (prepared, _) = prepare_new(request.clone(), &fixture.settings).unwrap();
-    assert_eq!(prepared.name, "Magnet metadata");
-    assert_eq!(prepared.info_hashes, request.hashes);
-    assert_eq!(prepared.files.file_count(), 0);
-    assert_eq!(prepared.state, TorrentState::Paused);
-    assert_eq!(
-        prepared.overrides.download_directory.as_deref(),
-        root.to_str()
+    assert!(
+        matches!(fixture.rpc(Action::Add(request)), Err(Error::Failed(message)) if message.contains("Review magnet metadata"))
     );
+    assert!(fixture.owner.lock().unwrap().torrents.is_empty());
 }
 
 #[test]

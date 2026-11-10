@@ -61,6 +61,7 @@ fn fixture() -> Fixture {
         stop: Default::default(),
         wake: Default::default(),
         imports: tokio::sync::Semaphore::new(1),
+        reviews: Default::default(),
         plans: Default::default(),
     });
     Fixture {

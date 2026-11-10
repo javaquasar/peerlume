@@ -702,6 +702,43 @@ impl Client {
             item.info_hashes.join(";"),
         )
     }
+    pub(super) fn review_request(&self, owner: &str, action: Action) -> Result<Reply, Error> {
+        let request = self.inner.request(action)?;
+        if request.instance_id.as_deref() != Some(owner) {
+            return Err(Error::Stale);
+        }
+        transport::call_blocking(self.inner.directory.clone(), request)?.result
+    }
+
+    pub(super) fn confirm_magnet(
+        &self,
+        owner: &str,
+        review_id: &str,
+        request: NewTorrent,
+    ) -> Result<u64, String> {
+        let target = request.hashes.join(";");
+        self.queue_for_instance(
+            Action::ConfirmMagnetReview {
+                id: review_id.into(),
+                torrent: request,
+            },
+            "Magnet registration",
+            target,
+            Some(owner),
+        )
+    }
+
+    pub(super) fn cancel_magnet(&self, owner: &str, review_id: &str) {
+        let _ = self.queue_for_instance(
+            Action::CancelMagnetReview {
+                id: review_id.into(),
+            },
+            "Cancel magnet review",
+            String::new(),
+            Some(owner),
+        );
+    }
+
     pub fn retry_start(&self, id: &str, _settings: &ClientSettings) -> Result<(), String> {
         self.queue(
             Action::Retry {
@@ -817,7 +854,10 @@ impl Client {
         if !self.inner.snapshot_allows(&action, &owner_instance) {
             return Err("Wait for an authoritative snapshot of the current background owner; the action was not queued".into());
         }
-        let quiet = matches!(&action, Action::Access(AccessAction::View));
+        let quiet = matches!(
+            &action,
+            Action::Access(AccessAction::View) | Action::CancelMagnetReview { .. }
+        );
         let mut shared = self
             .inner
             .shared
@@ -1090,6 +1130,8 @@ impl Inner {
                 | Action::Snapshot { .. }
                 | Action::SpeedState
                 | Action::Operations { .. }
+                | Action::MagnetReview { .. }
+                | Action::CancelMagnetReview { .. }
                 | Action::Files { .. }
                 | Action::Interest { .. }
                 | Action::ConfigureAgents { .. }
@@ -1359,6 +1401,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                 ..Default::default()
             };
             let requests_stop = matches!(&job.action, Action::Stop);
+            let silent = matches!(&job.action, Action::CancelMagnetReview { .. });
             inner.inflight.store(true, Ordering::Release);
             inner.queued.fetch_sub(1, Ordering::AcqRel);
             let quiet = matches!(&job.action, Action::Access(AccessAction::View));
@@ -1391,6 +1434,11 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
             } else {
                 Err(Error::Stale)
             };
+            if silent {
+                inner.inflight.store(false, Ordering::Release);
+                next = Instant::now();
+                continue;
+            }
             let (response, operation_id) = match response {
                 Ok(response) => (response.result, response.operation_id),
                 Err(error) => (Err(error), None),

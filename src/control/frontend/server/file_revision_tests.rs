@@ -34,6 +34,7 @@ fn service() -> (tempfile::TempDir, Arc<Service>) {
         stop: Default::default(),
         wake: Default::default(),
         imports: tokio::sync::Semaphore::new(1),
+        reviews: Default::default(),
         plans: Default::default(),
     });
     (directory, service)
@@ -252,7 +253,7 @@ fn native_wire_requires_a_valid_file_generation_without_changing_agent_protocol(
         serde_json::from_value::<Action>(encoded).is_err(),
         "the file fence is mandatory on the wire"
     );
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     assert_eq!(crate::control::PROTOCOL_VERSION, 1);
 }
 

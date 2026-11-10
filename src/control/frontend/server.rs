@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+mod magnet_review;
 mod trash_plan;
 use trash_plan::PreparedTrash;
 #[cfg(test)]
@@ -52,6 +53,7 @@ struct Service {
     stop: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
     imports: tokio::sync::Semaphore,
+    reviews: Arc<magnet_review::Reviews>,
     plans: Mutex<std::collections::BTreeMap<String, PreparedTrash>>,
 }
 impl Server {
@@ -92,6 +94,7 @@ impl Server {
             stop: stop.clone(),
             wake: wake.clone(),
             imports: tokio::sync::Semaphore::new(1),
+            reviews: Default::default(),
             plans: Default::default(),
         });
         let (ready, started) = std::sync::mpsc::sync_channel(1);
@@ -358,6 +361,21 @@ impl Service {
         action: Action,
         ticket: Option<Ticket>,
     ) -> Result<Reply, Error> {
+        let action = match action {
+            Action::BeginMagnetReview { magnet } => {
+                return self.begin_magnet_review(client, &magnet);
+            }
+            Action::MagnetReview { id, offset } => {
+                return self.magnet_review_page(&client, &id, offset);
+            }
+            Action::CancelMagnetReview { id } => return self.cancel_magnet_review(&client, &id),
+            Action::ConfirmMagnetReview { id, torrent } => {
+                return self
+                    .confirm_magnet_review(&client, &id, torrent, ticket)
+                    .await;
+            }
+            other => other,
+        };
         if let Action::Operations { before, limit } = action {
             return self
                 .history
@@ -891,6 +909,10 @@ impl Service {
                 "Background shutdown requested; waiting for final persistence".into(),
             )),
             Action::Add(_)
+            | Action::BeginMagnetReview { .. }
+            | Action::MagnetReview { .. }
+            | Action::CancelMagnetReview { .. }
+            | Action::ConfirmMagnetReview { .. }
             | Action::Export { .. }
             | Action::Trash { .. }
             | Action::PrepareTrash { .. }
@@ -992,37 +1014,43 @@ fn prepare_new(
     request: NewTorrent,
     settings: &ClientSettings,
 ) -> Result<(TorrentItem, Option<crate::state::StoredTrackerAuditProfile>), Error> {
-    let (name, hashes, _trackers, files, is_private) = if request.source.starts_with("magnet:") {
-        let magnet = crate::magnet::MagnetLink::parse(&request.source).map_err(Error::Failed)?;
-        (
-            magnet
-                .display_name
-                .unwrap_or_else(|| "Magnet metadata".into()),
-            magnet.exact_topics,
-            magnet.trackers,
-            FileSelectionModel::default(),
-            false,
-        )
-    } else {
-        let metadata =
-            crate::metainfo::TorrentMetainfo::load(std::path::Path::new(&request.source))
-                .map_err(Error::Failed)?;
-        let hashes = [
-            metadata.info_hash_v1_hex.map(|hash| format!("v1: {hash}")),
-            metadata.info_hash_v2_hex.map(|hash| format!("v2: {hash}")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        (
-            metadata.name,
-            hashes,
-            metadata.trackers,
-            FileSelectionModel::from_metainfo_files(metadata.files),
-            metadata.is_private,
-        )
-    };
-    if hashes != request.hashes || files.file_count() != request.selected.count {
+    if request.source.starts_with("magnet:") {
+        return Err(Error::Failed(
+            "Review magnet metadata before adding the torrent".into(),
+        ));
+    }
+    let metadata = crate::metainfo::TorrentMetainfo::load(std::path::Path::new(&request.source))
+        .map_err(Error::Failed)?;
+    prepare_resolved_metadata(request, settings, metadata)
+}
+
+fn metainfo_hashes(metadata: &crate::metainfo::TorrentMetainfo) -> Vec<String> {
+    [
+        metadata
+            .info_hash_v1_hex
+            .as_ref()
+            .map(|hash| format!("v1: {hash}")),
+        metadata
+            .info_hash_v2_hex
+            .as_ref()
+            .map(|hash| format!("v2: {hash}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn prepare_resolved_metadata(
+    request: NewTorrent,
+    settings: &ClientSettings,
+    metadata: crate::metainfo::TorrentMetainfo,
+) -> Result<(TorrentItem, Option<crate::state::StoredTrackerAuditProfile>), Error> {
+    let hashes = metainfo_hashes(&metadata);
+    let files = FileSelectionModel::from_metainfo_files(metadata.files);
+    if hashes != request.hashes
+        || files.file_count() != request.selected.count
+        || files.file_count() != request.high.count
+    {
         return Err(Error::Stale);
     }
     crate::metainfo::validate_peer_id(&request.peer_id).map_err(Error::Failed)?;
@@ -1032,7 +1060,7 @@ fn prepare_new(
         return Err(Error::TooLarge);
     }
     let mut item = TorrentItem {
-        name,
+        name: metadata.name,
         source: request.source,
         info_hashes: hashes,
         trackers: request.trackers,
@@ -1049,7 +1077,7 @@ fn prepare_new(
         } else {
             TorrentState::Paused
         },
-        is_private,
+        is_private: metadata.is_private,
         overrides: request.overrides,
         runtime: Default::default(),
         completion: Default::default(),

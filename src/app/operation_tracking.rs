@@ -449,7 +449,7 @@ fn kind_from_label(label: &str) -> OperationKind {
         OperationKind::ViewSettings
     } else if label.contains("settings") || label.contains("preferences") {
         OperationKind::Preferences
-    } else if label.contains("add") || label.contains("import") {
+    } else if label.contains("add") || label.contains("import") || label == "magnet registration" {
         OperationKind::Add
     } else if label.contains("pause") {
         OperationKind::Pause
