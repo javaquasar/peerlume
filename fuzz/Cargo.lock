@@ -2545,6 +2545,7 @@ dependencies = [
  "anyhow",
  "cap-fs-ext",
  "cap-std",
+ "chrono",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
