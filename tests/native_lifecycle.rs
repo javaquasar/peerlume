@@ -11,6 +11,7 @@ use peerlume::{
     metainfo::TorrentMetainfo,
     session::DetailInterest,
     settings::ClientSettings,
+    startup_recovery::{StartupFailureCode, read_failure},
     state::{StateStore, StoredFile, TorrentRecord},
     torrent::{TorrentItem, TorrentState},
 };
@@ -506,6 +507,170 @@ fn wait_for_native<T>(description: &str, mut poll: impl FnMut() -> Option<T>) ->
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn daemon_probe(daemon: &Path, profile: &Path, args: &[&str]) -> ExitStatus {
+    let mut child = Command::new(daemon)
+        .arg("--profile")
+        .arg(profile)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_probe(&mut child, Duration::from_secs(20))
+}
+
+#[test]
+fn installed_daemon_records_sanitized_failure_then_clears_after_successful_start() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let daemon = installed(
+        root.path(),
+        env!("CARGO_BIN_EXE_peerlume-daemon"),
+        "peerlume-daemon",
+    );
+    let frontend = install_frontend(root.path());
+    let profile = root.path().join("startup-recovery");
+    let downloads = profile.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    let settings_path = profile.join("settings.toml");
+    let failure_path = profile.join("startup-failure.json");
+    let invalid = b"[download]\ndownload_directory = 'private_fixture_directory'\n[invalid";
+    std::fs::write(&settings_path, invalid).unwrap();
+
+    assert!(!daemon_probe(&daemon, &profile, &["--check-config"]).success());
+    assert!(!profile.join("instance.lock").exists());
+    assert!(!failure_path.exists());
+    assert!(!daemon_probe(&daemon, &profile, &[]).success());
+    let failed = read_failure(&profile).unwrap().unwrap();
+    assert_eq!(failed.code, StartupFailureCode::InvalidSettings);
+    let bytes = std::fs::read(&failure_path).unwrap();
+    assert!(bytes.len() < 1024);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains("private_fixture_directory"));
+    assert!(!text.contains(profile.to_str().unwrap()));
+    assert_eq!(std::fs::read(&settings_path).unwrap(), invalid);
+
+    let locked = InstanceLock::acquire(&profile).unwrap();
+    assert!(!daemon_probe(&daemon, &profile, &[]).success());
+    assert_eq!(std::fs::read(&failure_path).unwrap(), bytes);
+    drop(locked);
+    assert!(!daemon_probe(&daemon, &profile, &["--stop"]).success());
+    assert_eq!(std::fs::read(&failure_path).unwrap(), bytes);
+
+    // The installed frontend must use fresh typed evidence from its child,
+    // even when the same error was already recorded by an earlier attempt.
+    let mut diagnostics = tempfile::tempfile().unwrap();
+    let mut child = Command::new(&frontend)
+        .arg("--profile")
+        .arg(&profile)
+        .arg("--attach-check")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(diagnostics.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    assert!(!wait_for_probe(&mut child, Duration::from_secs(20)).success());
+    diagnostics.seek(SeekFrom::Start(0)).unwrap();
+    let mut display = String::new();
+    diagnostics.take(4096).read_to_string(&mut display).unwrap();
+    assert!(
+        display.contains(StartupFailureCode::InvalidSettings.message()),
+        "{display}"
+    );
+    assert!(!display.contains("private_fixture_directory"));
+    assert!(!display.contains(profile.to_str().unwrap()));
+    let retried = read_failure(&profile).unwrap().unwrap();
+    assert_eq!(retried.code, failed.code);
+    assert_ne!(retried, failed);
+
+    // Repair the fixture configuration without an owner. The read-only probe
+    // leaves the previous evidence, and the real healthy startup clears it.
+    std::fs::remove_file(&settings_path).unwrap();
+    isolated_settings(&downloads)
+        .save_to(&settings_path)
+        .unwrap();
+    assert!(daemon_probe(&daemon, &profile, &["--check-config"]).success());
+    assert_eq!(read_failure(&profile).unwrap(), Some(retried));
+    let mut guard = OwnerGuard {
+        daemon,
+        profile: profile.clone(),
+        stopped: false,
+    };
+    assert_eq!(attach(&frontend, &profile)["torrents"], 0);
+    wait_for_native(
+        "healthy startup to clear previous recovery information",
+        || read_failure(&profile).unwrap().is_none().then_some(()),
+    );
+    guard.stop();
+    assert_eq!(read_failure(&profile).unwrap(), None);
+    assert!(InstanceLock::acquire(&profile).is_ok());
+}
+
+#[test]
+fn installed_daemon_distinguishes_unreadable_saved_state_from_invalid_settings() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let daemon = installed(
+        root.path(),
+        env!("CARGO_BIN_EXE_peerlume-daemon"),
+        "peerlume-daemon",
+    );
+    let profile = root.path().join("invalid-saved-state");
+    let downloads = profile.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    isolated_settings(&downloads)
+        .save_to(&profile.join("settings.toml"))
+        .unwrap();
+    let state = profile.join("state.sqlite3");
+    let invalid = b"synthetic invalid SQLite database";
+    std::fs::write(&state, invalid).unwrap();
+    assert!(!daemon_probe(&daemon, &profile, &[]).success());
+    assert_eq!(
+        read_failure(&profile).unwrap().unwrap().code,
+        StartupFailureCode::StateUnavailable
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), invalid);
+    assert!(InstanceLock::acquire(&profile).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_daemon_records_a_real_occupied_listener_without_an_address() {
+    let _package_test = COPIED_PACKAGE_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let daemon = installed(
+        root.path(),
+        env!("CARGO_BIN_EXE_peerlume-daemon"),
+        "peerlume-daemon",
+    );
+    let profile = root.path().join("occupied-listener");
+    let downloads = profile.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    // Linux refuses the real listener bind while this socket remains owned.
+    // Windows SO_REUSEADDR does not supply that same test precondition.
+    let reserved = TcpListener::bind("[::1]:0").unwrap();
+    let mut settings = isolated_settings(&downloads);
+    settings.connection.listen_port = reserved.local_addr().unwrap().port();
+    settings.connection.random_port_on_start = false;
+    settings.save_to(&profile.join("settings.toml")).unwrap();
+    assert!(!daemon_probe(&daemon, &profile, &[]).success());
+    assert_eq!(
+        read_failure(&profile).unwrap().unwrap().code,
+        StartupFailureCode::ListenerAddressInUse
+    );
+    let record = std::fs::read_to_string(profile.join("startup-failure.json")).unwrap();
+    assert!(!record.contains("::1"));
+    assert!(!record.contains(profile.to_str().unwrap()));
+    assert!(InstanceLock::acquire(&profile).is_ok());
 }
 
 fn receipt(client: &Client, label: &str) -> Receipt {

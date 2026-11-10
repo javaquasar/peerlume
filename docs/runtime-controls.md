@@ -4,6 +4,21 @@ These controls belong to each torrent. Both egui and ratatui use the same comman
 event reducer, persisted configuration and status-card model. They do not change
 the standalone tracker-audit scenario editor.
 
+## Background startup and operation history
+
+When startup needs attention, use **Retry connection** or **Validate
+configuration** on the recovery screen. The profile path is available to copy.
+Validation uses the daemon's configuration-only check. A successful validation
+confirms settings syntax and supported values. Starting the owner also requires
+the profile lock, storage, credentials and a working listener.
+
+Open **Operations** from the desktop menu to see the history stored by the
+owner. TUI opens the same history with `:operations` or **3**. Accepted requests
+may still be running. An engine effect and its durable write can arrive
+separately. **Needs review** means the last known evidence requires inspection
+before retrying. After a restart, the owner retains unresolved entries for
+manual review.
+
 ## Confirmed transfer settings and durable state
 
 GUI **Torrent settings** now edits a draft. **Apply transfer settings** uses the
@@ -30,9 +45,19 @@ normal hashing. Accepted hints still get the engine's sampled piece validation.
 This is metadata-assisted fast resume, not proof against deliberate modifications
 that preserve timestamps; use **Force recheck and repair** for a full audit.
 
-Global download/upload caps now configure the session-wide limiter, in addition
-to per-torrent limits. Listener port/protocols, forwarding, connect timeout, DHT
-and LSD also configure the engine on restart. SOCKS5 without embedded credentials
+In GUI, open **More → Speed profiles** or **Preferences → Speed**. In TUI, use
+`:speed` to see the confirmed profile, caps and download slots. Select Normal,
+Quiet or Automatic. A profile switch saves the policy and applies it to the
+running owner. The selection persists until changed. Automatic checks the
+configured local days and time window in the daemon. The start time is inclusive
+and the end time is exclusive. Overnight windows use the day on which they begin.
+Equal times define an empty window.
+
+Apply or Save can update the session-wide download and upload caps and the
+active download queue limit. A cap of zero means unlimited. Explicit per-torrent
+limits still apply. The confirmed values appear after the existing engine applies
+them. Requests already in flight can finish. Listener port and protocols,
+forwarding, connect timeout, DHT and LSD configure the engine on restart. SOCKS5 without embedded credentials
 routes peer TCP and HTTP(S) trackers; direct incoming, DHT, LSD and UDP trackers
 are disabled in that mode. It is not a VPN or a UDP proxy. Enable
 `proxy_peer_connections`; other proxy schemes and proxy/interface combinations
@@ -40,8 +65,7 @@ are rejected rather than silently bypassed. Linux interface binding is supported
 Windows all-transport interface binding and explicit IP binding are not supported
 and nonempty values stop startup. Authentication can be provided by a local proxy
 bridge, not plaintext proxy credentials in settings. Per-field support labels
-remain authoritative; alternate scheduling and other stored-only fields are not
-implemented by this change. Existing sessions are not restarted by Apply.
+show whether each setting applies live, applies on restart or is stored only.
 
 ## Copying or adopting existing payload
 
@@ -101,7 +125,8 @@ files outrank global sequential ordering. Skip uses the existing selection map:
 pieces shared with selected files may still be received. Priorities persist and
 survive rechecks; the saved model changes only after an engine acknowledgement.
 
-Status reports observed activity, not guessed network diagnoses. GUI graphs keep
+Status shows an observed reason and a next action when evidence is available.
+A disconnected frontend marks its displayed state as last known. GUI graphs keep
 at most 120 sampled rate points on a real elapsed-time axis; gaps over three
 seconds are not connected. Engine-confirmed queue admission distinguishes
 waiting for a slot from an idle connected swarm. Peers displays

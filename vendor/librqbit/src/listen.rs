@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
-use librqbit_dualstack_sockets::{BindOpts, TcpListener};
+use librqbit_dualstack_sockets::{BindOpts, Error as SocketError, TcpListener};
 use librqbit_utp::{BindDevice, UtpSocketUdp, UtpSocketUdpOpts};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
@@ -106,6 +106,13 @@ impl ListenerOptions {
                     device: bind_device,
                 },
             )
+            // The socket wrapper's tuple variants do not expose Error::source.
+            // Keep the listener context while preserving the real OS error kind.
+            .map_err(|error| match error {
+                SocketError::Bind(cause) => anyhow::Error::new(cause).context("error binding"),
+                SocketError::Listen(cause) => anyhow::Error::new(cause).context("error listening"),
+                error => anyhow::Error::new(error),
+            })
             .context("error starting TCP listener")?;
             listen_addr = listener.bind_addr();
             info!(

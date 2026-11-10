@@ -52,6 +52,8 @@ fn fixture() -> Fixture {
         owner: Arc::new(Mutex::new(owner)),
         directory: directory.path().to_owned(),
         settings: Mutex::new(settings),
+        saved_speed: Default::default(),
+        history: Some(History::memory()),
         instance: "synthetic-native-owner".into(),
         token_hash: "not-used-by-direct-dispatch-tests".into(),
         requested: Default::default(),
@@ -68,6 +70,33 @@ fn fixture() -> Fixture {
         explicit_root,
         replacement_root,
     }
+}
+
+#[test]
+fn native_history_unavailable_preserves_existing_preference_command() {
+    let mut fixture = fixture();
+    Arc::get_mut(&mut fixture.service).unwrap().history = None;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let view = crate::settings::UiSettings {
+        search: "durable without optional history".into(),
+        ..Default::default()
+    };
+    let (operation, result) = runtime.block_on(fixture.service.dispatch_tracked(
+        "synthetic-client".into(),
+        &"a".repeat(64),
+        Action::SaveView(view.clone()),
+    ));
+    assert!(operation.is_none());
+    assert!(matches!(result, Ok(Reply::Done(_))));
+    let saved = ClientSettings::load_from(&fixture.directory.path().join("settings.toml")).unwrap();
+    assert_eq!(saved.ui, view);
+    assert!(matches!(
+        dispatch(&fixture.service, Action::Operations { before: None, limit: 8 }),
+        Err(Error::Failed(message)) if message == "Owner operation history is unavailable"
+    ));
 }
 
 #[test]
@@ -270,7 +299,7 @@ fn dispatch(service: &Arc<Service>, action: Action) -> Result<Reply, Error> {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(service.dispatch("synthetic-client".into(), action))
+        .block_on(service.dispatch("synthetic-client".into(), action, None))
 }
 fn revision(service: &Service, id: &str) -> u64 {
     service.owner.lock().unwrap().command_revision(id).unwrap()

@@ -7,6 +7,7 @@ use peerlume::{
         host::{Host, InstanceLock},
     },
     settings::{ClientSettings, data_directory},
+    startup_recovery::{StartupFailureCode as Failure, StartupRecovery},
     state::PersistenceIntent,
     torrent::EffectiveTorrentSettings,
 };
@@ -85,29 +86,74 @@ pub(crate) fn main() -> io::Result<()> {
     if options.stop {
         return stop_existing(&directory);
     }
-    let (settings, new_settings) = load_settings(&directory)?;
-    validate_settings(&settings)?;
     if options.check_config {
+        let (settings, _) = load_settings(&directory)?;
+        validate_settings(&settings)?;
         println!(
             "Configuration valid; no engine, profile lock, configuration write or network started"
         );
         return Ok(());
     }
-    let _instance = InstanceLock::acquire(&directory)?;
-    if new_settings {
-        settings.save_to(&directory.join("settings.toml"))?;
+    // A concurrent owner must win before any startup diagnostics are written.
+    let recovery = StartupRecovery::acquire(&directory)?;
+    run_owner(&directory, options.enable_control, &recovery)
+}
+
+fn record_startup_failure(recovery: &StartupRecovery, code: Failure) {
+    if recovery.record_failure(code).is_err() {
+        eprintln!("Could not save local startup recovery information");
     }
-    let mut backend = ClientBackend::try_start(&settings).map_err(io::Error::other)?;
-    let mut torrents: Vec<_> = backend
-        .load_deferred_torrents()
-        .map_err(io::Error::other)?
-        .into_iter()
-        .map(|record| torrent_from_deferred(record, &settings))
-        .collect();
+}
+
+fn startup_step<T>(
+    recovery: &StartupRecovery,
+    code: Failure,
+    result: io::Result<T>,
+) -> io::Result<T> {
+    result.inspect_err(|_| record_startup_failure(recovery, code))
+}
+
+fn run_owner(directory: &Path, enable_control: bool, recovery: &StartupRecovery) -> io::Result<()> {
+    let (settings, new_settings) = load_settings(directory).inspect_err(|error| {
+        record_startup_failure(
+            recovery,
+            if error.kind() == io::ErrorKind::InvalidData {
+                Failure::InvalidSettings
+            } else {
+                Failure::SettingsUnavailable
+            },
+        );
+    })?;
+    startup_step(
+        recovery,
+        Failure::InvalidSettings,
+        validate_settings(&settings),
+    )?;
+    if new_settings {
+        startup_step(
+            recovery,
+            Failure::SettingsSaveFailed,
+            settings.save_to(&directory.join("settings.toml")),
+        )?;
+    }
+    let mut backend =
+        ClientBackend::try_start_with_diagnostics(&settings).map_err(|(code, detail)| {
+            record_startup_failure(recovery, code);
+            io::Error::other(detail)
+        })?;
+    let mut torrents: Vec<_> = startup_step(
+        recovery,
+        Failure::StateUnavailable,
+        backend.load_deferred_torrents().map_err(io::Error::other),
+    )?
+    .into_iter()
+    .map(|record| torrent_from_deferred(record, &settings))
+    .collect();
     for torrent in &mut torrents {
         let resolved =
             EffectiveTorrentSettings::resolve(&settings, &torrent.overrides, torrent.is_private);
         if !Path::new(&resolved.download_directory).is_absolute() {
+            record_startup_failure(recovery, Failure::InvalidRestoredPath);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "A restored torrent has a relative data directory; make it absolute before running as a service",
@@ -117,41 +163,76 @@ pub(crate) fn main() -> io::Result<()> {
         // edits must not implicitly move a cold restored torrent.
         if torrent.overrides.download_directory.is_none() {
             torrent.overrides.download_directory = Some(resolved.download_directory);
-            backend
-                .persist_torrent_update(torrent, PersistenceIntent::STORAGE, None)
-                .map_err(io::Error::other)?;
+            startup_step(
+                recovery,
+                Failure::StorageRecoveryFailed,
+                backend
+                    .persist_torrent_update(torrent, PersistenceIntent::STORAGE, None)
+                    .map_err(io::Error::other),
+            )?;
         }
     }
     let mut control = Controller::new(backend, torrents);
     // Trusted native Access needs the service store even while the separate
     // public agent endpoint is disabled.
-    control
-        .configure_agents(
-            &directory,
-            settings.download.download_directory.clone().into(),
-        )
-        .map_err(|error| io::Error::other(format!("Control initialization failed: {error:?}")))?;
-    control
-        .set_agent_settings(&settings)
-        .map_err(|error| io::Error::other(format!("Control settings failed: {error:?}")))?;
-    if options.enable_control {
-        let agent = control
-            .agent_access()
-            .ok_or_else(|| io::Error::other("Control unavailable"))?;
+    startup_step(
+        recovery,
+        Failure::ControlStoreUnavailable,
+        control
+            .configure_agents(
+                directory,
+                settings.download.download_directory.clone().into(),
+            )
+            .map_err(|error| io::Error::other(format!("Control initialization failed: {error:?}"))),
+    )?;
+    startup_step(
+        recovery,
+        Failure::ControlStoreUnavailable,
+        control
+            .set_agent_settings(&settings)
+            .map_err(|error| io::Error::other(format!("Control settings failed: {error:?}"))),
+    )?;
+    if enable_control {
+        let agent = startup_step(
+            recovery,
+            Failure::ControlStoreUnavailable,
+            control
+                .agent_access()
+                .ok_or_else(|| io::Error::other("Control unavailable")),
+        )?;
         for root in [&agent.import_root, &agent.export_root] {
-            std::fs::create_dir_all(root)?;
+            startup_step(
+                recovery,
+                Failure::ControlStoreUnavailable,
+                std::fs::create_dir_all(root),
+            )?;
         }
         agent.enabled = true;
     }
     let mut restore_queue = control.begin_restores();
     let diagnostic_wake = control.owner_diagnostic_wake();
     let owner = Arc::new(Mutex::new(control));
-    let host = Host::start(owner.clone(), |control| control, directory.clone())?;
-    let native = Server::start(owner.clone(), directory, settings.clone())?;
+    let runtime = startup_step(
+        recovery,
+        Failure::RuntimeUnavailable,
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+    )?;
+    let host = startup_step(
+        recovery,
+        Failure::ControlEndpointUnavailable,
+        Host::start(owner.clone(), |control| control, directory.to_owned()),
+    )?;
+    let native = startup_step(
+        recovery,
+        Failure::NativeEndpointUnavailable,
+        Server::start(owner.clone(), directory.to_owned(), settings.clone()),
+    )?;
+    if recovery.clear_failure().is_err() {
+        eprintln!("Could not clear previous startup recovery information");
+    }
     println!("PeerLume daemon ready");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
     let outcome = runtime.block_on(async {
         let restore = async {
             while !restore_queue.is_empty() {

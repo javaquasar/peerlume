@@ -25,6 +25,8 @@ fn service() -> (tempfile::TempDir, Arc<Service>) {
         owner: Arc::new(Mutex::new(owner)),
         directory: directory.path().into(),
         settings: Mutex::new(ClientSettings::default()),
+        saved_speed: Default::default(),
+        history: Some(History::memory()),
         instance: "synthetic-file-fence-owner".into(),
         token_hash: String::new(),
         requested: Default::default(),
@@ -41,7 +43,7 @@ fn dispatch(service: &Arc<Service>, action: Action) -> Result<Reply, Error> {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(service.dispatch("synthetic-file-client".into(), action))
+        .block_on(service.dispatch("synthetic-file-client".into(), action, None))
 }
 fn revisions(service: &Service) -> (u64, u64) {
     let owner = service.owner.lock().unwrap();
@@ -228,7 +230,7 @@ fn invalid_or_incomplete_file_generations_and_unfenced_mutation_routes_are_rejec
 }
 
 #[test]
-fn native_two_wire_requires_a_valid_file_generation_without_changing_agent_protocol() {
+fn native_wire_requires_a_valid_file_generation_without_changing_agent_protocol() {
     let item = torrent();
     let metadata = item.files.metadata_revision();
     let wire = WireTorrent::capture(&item, 17, true, false);
@@ -250,7 +252,7 @@ fn native_two_wire_requires_a_valid_file_generation_without_changing_agent_proto
         serde_json::from_value::<Action>(encoded).is_err(),
         "the file fence is mandatory on the wire"
     );
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 4);
     assert_eq!(crate::control::PROTOCOL_VERSION, 1);
 }
 

@@ -39,6 +39,9 @@ pub mod secrets;
 pub mod session;
 pub mod settings;
 pub mod settings_support;
+#[cfg(any(feature = "gui", feature = "tui"))]
+mod speed_presentation;
+pub mod startup_recovery;
 pub mod state;
 pub mod storage;
 pub mod table_view;

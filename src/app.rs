@@ -27,7 +27,10 @@ mod icon;
 #[cfg(test)]
 mod message_tests;
 mod operation_tracking;
+mod owner_operations;
+mod startup;
 mod torrent_table;
+mod updates;
 pub use icon::application_icon;
 #[cfg(test)]
 mod header_tests;
@@ -516,8 +519,10 @@ pub struct PeerLumeApp {
     identities: desktop_integration::IdentityCache,
     appearance_state: crate::appearance::AppearanceState,
     operation_tracker: operation_tracking::Tracker,
+    owner_operations: owner_operations::Panel,
     operations_open: bool,
     appearance_open: bool,
+    updates: updates::UpdatesPanel,
     magnet_open: bool,
     open_agent_access: bool,
     batch_remove: Option<desktop_integration::RemovalReview>,
@@ -554,31 +559,19 @@ pub struct PeerLumeApp {
 /// Synchronizes frontend transactions with the independent controller owner pump.
 /// The transfer engine and canonical models are never cloned for an adapter.
 pub struct HostedGui {
-    app: PeerLumeApp,
+    app: Option<PeerLumeApp>,
     access: crate::control::frontends::AccessPanel,
+    startup: startup::Startup,
 }
 
 impl HostedGui {
     pub fn start() -> std::io::Result<Self> {
-        let directory = crate::settings::data_directory();
-        let mut app = PeerLumeApp::default();
-        if app.control.backend.attached_client().is_none() {
-            return Err(std::io::Error::other(app.add_status.clone()));
-        }
-        app.pending_torrent_paths
-            .extend(crate::settings::open_torrent_arguments(
-                &std::env::args().skip(1).collect::<Vec<_>>(),
-            )?);
-        app.open_next_queued_torrent();
-        let download_root = PathBuf::from(&app.settings.download.download_directory);
-        app.control
-            .configure_agents(&directory, download_root)
-            .map_err(|e| {
-                std::io::Error::other(format!("Agent control initialization failed: {e:?}"))
-            })?;
-        let _ = app.control.set_agent_settings(&app.settings);
+        let directory = std::path::absolute(crate::settings::data_directory())?;
+        let paths =
+            crate::settings::open_torrent_arguments(&std::env::args().skip(1).collect::<Vec<_>>())?;
         Ok(Self {
-            app,
+            app: None,
+            startup: startup::Startup::new(directory, paths),
             access: {
                 let mut access = crate::control::frontends::AccessPanel::default();
                 access.compact = true;
@@ -590,8 +583,9 @@ impl HostedGui {
 
 impl eframe::App for HostedGui {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(client) = self.app.control.backend.attached_client() {
-            for (id, audit) in &self.app.tracker_audits {
+        let Some(app) = &mut self.app else { return };
+        if let Some(client) = app.control.backend.attached_client() {
+            for (id, audit) in &app.tracker_audits {
                 if let Some(snapshot) =
                     audit.exit_snapshot(client.cached_revision(id), client.audit_ready(id))
                 {
@@ -619,21 +613,28 @@ impl eframe::App for HostedGui {
                 }
             }
         }
-        if let Err(error) = self.app.control.shutdown() {
+        if let Err(error) = app.control.shutdown() {
             eprintln!("PeerLume shutdown: {error}");
         }
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if let Some(client) = self.app.control.backend.attached_client() {
+        if self.app.is_none() {
+            self.app = self.startup.poll(ctx);
+        }
+        let Some(app) = &mut self.app else {
+            self.startup.show(ctx);
+            return;
+        };
+        if let Some(client) = app.control.backend.attached_client() {
             let context = ctx.clone();
             client.set_ui_waker(Arc::new(move || context.request_repaint()));
         }
-        if self.app.open_agent_access {
+        if app.open_agent_access {
             self.access.open = true;
-            self.app.open_agent_access = false;
+            app.open_agent_access = false;
         }
-        self.access.show(&mut self.app.control, ctx);
-        self.app.update(ctx, frame);
+        self.access.show(&mut app.control, ctx);
+        app.update(ctx, frame);
     }
 }
 
@@ -651,10 +652,20 @@ impl Default for PeerLumeApp {
             .attached_client()
             .map(|client| client.settings())
             .unwrap_or_else(|| loaded.as_ref().cloned().unwrap_or_default());
+        Self::from_backend(backend, settings, startup::ProfileResources::load())
+    }
+}
+
+impl PeerLumeApp {
+    fn from_backend(
+        backend: ClientBackend,
+        settings: ClientSettings,
+        resources: startup::ProfileResources,
+    ) -> Self {
         let saved_settings = settings.clone();
         let settings_draft = settings.clone();
         let preferences_tab = PreferencesTab::from_index(settings.ui.last_preferences_tab);
-        let blocklist = Blocklist::load_cache().unwrap_or_default();
+        let blocklist = resources.blocklist;
         let blocklist_status = if blocklist.rule_count() == 0 {
             "No cached rules".into()
         } else {
@@ -705,8 +716,10 @@ impl Default for PeerLumeApp {
             identities: Default::default(),
             appearance_state: Default::default(),
             operation_tracker: Default::default(),
+            owner_operations: Default::default(),
             operations_open: false,
             appearance_open: false,
+            updates: Default::default(),
             magnet_open: false,
             open_agent_access: false,
             batch_remove: None,
@@ -734,7 +747,7 @@ impl Default for PeerLumeApp {
             magnet_input: String::new(),
             control: Controller::new(backend, torrents),
             tracker_audits,
-            behavior_catalog: BehaviorCatalog::load(),
+            behavior_catalog: resources.behaviors,
             trash_confirmation: None,
             pending_trash: None,
             native_trash_plan: None,
@@ -807,6 +820,9 @@ impl PeerLumeApp {
                 if receipt.label == "Agent view" {
                     continue;
                 }
+                if receipt.label == "Speed profile" {
+                    self.settings_status = receipt.message.clone();
+                }
                 self.add_status = receipt.message;
                 if let Some(plan) = receipt.trash_plan {
                     let scope = match plan.scope {
@@ -835,6 +851,22 @@ impl PeerLumeApp {
                 }
                 if let Some(settings) = receipt.settings {
                     let ui = self.settings.ui.clone();
+                    let mut speed_draft = self.settings_draft.speed.clone();
+                    crate::speed_presentation::merge_draft(
+                        &mut speed_draft,
+                        &self.settings.speed,
+                        &settings.speed,
+                    );
+                    let mut queue_draft = settings.queue.clone();
+                    queue_draft.enabled = self.settings_draft.queue.enabled;
+                    queue_draft.max_active_downloads =
+                        self.settings_draft.queue.max_active_downloads;
+                    crate::speed_presentation::merge_queue_draft(
+                        &mut queue_draft,
+                        &self.settings.queue,
+                        settings.queue.enabled,
+                        settings.queue.max_active_downloads,
+                    );
                     self.settings = settings.clone();
                     self.settings.ui = ui;
                     if receipt.label == "Preferences" {
@@ -843,7 +875,27 @@ impl PeerLumeApp {
                     let ui_draft = self.settings_draft.ui.clone();
                     self.settings_draft = settings;
                     self.settings_draft.ui = ui_draft;
+                    self.settings_draft.speed = speed_draft;
+                    self.settings_draft.queue = queue_draft;
                     self.settings_status = self.add_status.clone();
+                }
+            }
+            if client.connection().status == crate::control::frontend::ConnectionStatus::Connected
+                && let Some(view) = client.speed_view()
+            {
+                crate::speed_presentation::accept_view(
+                    &mut self.settings,
+                    Some(&mut self.settings_draft),
+                    &view,
+                );
+                if let Some(enabled) = view.saved_queue_enabled {
+                    self.saved_settings.queue.enabled = enabled;
+                }
+                if let Some(slots) = view.saved_max_active_downloads {
+                    self.saved_settings.queue.max_active_downloads = slots;
+                }
+                if let Some(saved) = view.saved {
+                    self.saved_settings.speed = saved;
                 }
             }
             authoritative_audits = client.take_audits();
@@ -1854,7 +1906,7 @@ impl PeerLumeApp {
                         .iter()
                         .find_map(|h| j.latest(h.strip_prefix("v1: ")?))
                 });
-                show_runtime_status(ui, torrent, last.as_deref());
+                show_runtime_status(ui, torrent, last.as_deref(), connected);
             }
             DetailsTab::Files => {
                 let (selection, reveal, high) =
@@ -2601,6 +2653,62 @@ impl PeerLumeApp {
         }
     }
 
+    fn show_live_speed_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::control::frontend::ConnectionStatus;
+        use crate::settings::speed_policy::SpeedPolicy;
+        use crate::speed_presentation::applied_label;
+
+        let Some(client) = self.control.backend.attached_client() else {
+            ui.label("Connect the background client to see active speed limits.");
+            return;
+        };
+        if client.connection().status != ConnectionStatus::Connected {
+            ui.label("Waiting for the background client to confirm active limits.");
+            return;
+        }
+        let Some(view) = client.speed_view() else {
+            ui.label("Reading speed limits from the background client.");
+            return;
+        };
+        ui.label(applied_label(&view));
+        ui.label(format!(
+            "Requested profile: {} · Saved profile: {}",
+            view.desired.policy().label(),
+            view.saved
+                .as_ref()
+                .map_or("Unavailable", |saved| saved.policy().label()),
+        ));
+        if view.pending {
+            ui.label("Awaiting engine confirmation.");
+        }
+        let mut switch = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Switch and save profile");
+            for policy in [
+                SpeedPolicy::Normal,
+                SpeedPolicy::Quiet,
+                SpeedPolicy::Automatic,
+            ] {
+                if ui
+                    .add_enabled(
+                        !view.pending && policy != view.desired.policy(),
+                        egui::Button::new(policy.label()),
+                    )
+                    .clicked()
+                {
+                    switch = Some(policy);
+                }
+            }
+        });
+        if let Some(policy) = switch {
+            self.settings_status = client
+                .set_speed_policy(policy)
+                .map(|()| "Speed profile requested; awaiting the background client".into())
+                .unwrap_or_else(|error| error);
+        }
+        ui.separator();
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
         let connected = self.desktop_connection().status
             == crate::control::frontend::ConnectionStatus::Connected;
@@ -2621,6 +2729,10 @@ impl PeerLumeApp {
                         self.preferences_tab = tab;
                         self.settings_draft.ui.last_preferences_tab = tab.index();
                     }
+                }
+                ui.separator();
+                if ui.button("Updates...").clicked() {
+                    self.updates.open();
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     if self.settings != self.saved_settings {
@@ -2660,6 +2772,9 @@ impl PeerLumeApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.preferences_tab == PreferencesTab::Speed {
+                self.show_live_speed_controls(ui);
+            }
             let mut runtime = PrivacyRuntime {
                 blocklist_status: &self.blocklist_status,
                 blocklist_rules: self.blocklist.rule_count(),
@@ -2806,6 +2921,7 @@ impl eframe::App for PeerLumeApp {
         self.show_import_status(ctx);
         self.show_trash_confirmation(ctx);
         self.show_desktop_dialogs(ctx);
+        self.updates.show(ctx);
         if self.add_dialog.is_none() {
             show_file_drop_overlay(ctx);
         }
@@ -3993,6 +4109,7 @@ fn show_runtime_status(
     ui: &mut egui::Ui,
     torrent: &TorrentItem,
     last: Option<&crate::announce_journal::JournalEntry>,
+    owner_connected: bool,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         let samples = &torrent.runtime.diagnostics.history;
@@ -4041,13 +4158,13 @@ fn show_runtime_status(
         if ui.button("Export redacted diagnostics...").clicked()
             && let Some(path) = rfd::FileDialog::new().set_file_name("peerlume-diagnostics.json").save_file() {
             // Never overwrite an existing report. A failed export is visible.
-            let result = crate::diagnostics::export(torrent,&path);
+            let result = crate::diagnostics::export_for_connection(torrent,&path,owner_connected);
             ui.label(match result { Ok(())=>"Diagnostics exported".to_owned(), Err(error)=>format!("Export failed: {error}") });
         }
         egui::Grid::new("shared_runtime_status")
             .striped(true)
             .show(ui, |ui| {
-                for (label, value) in crate::runtime_status::status_card(torrent, last) {
+                for (label, value) in crate::runtime_status::status_card_for_connection(torrent, last, owner_connected) {
                     ui.label(label);
                     ui.label(value);
                     ui.end_row();
@@ -4266,7 +4383,7 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            show_runtime_status(ui, torrent, None);
+                            show_runtime_status(ui, torrent, None, true);
                         });
                     },
                 );
@@ -4345,7 +4462,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        show_runtime_status(ui, &torrent, None);
+                        show_runtime_status(ui, &torrent, None, true);
                     });
                 },
             );

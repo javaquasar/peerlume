@@ -91,8 +91,18 @@ impl TransferSettings {
             item.is_private,
         );
         Self {
-            download_kib: effective.download_limit_kib.min(u64::from(u32::MAX / 1024)) as u32,
-            upload_kib: effective.upload_limit_kib.min(u64::from(u32::MAX / 1024)) as u32,
+            // The session limiter owns inherited rates so a live global change
+            // also reaches torrents that were registered under an earlier cap.
+            download_kib: item
+                .overrides
+                .download_limit_kib
+                .unwrap_or(0)
+                .min(u64::from(u32::MAX / 1024)) as u32,
+            upload_kib: item
+                .overrides
+                .upload_limit_kib
+                .unwrap_or(0)
+                .min(u64::from(u32::MAX / 1024)) as u32,
             max_peers: effective.max_peers.clamp(1, 4096) as u16,
             sequential: effective.sequential_download,
             priority: match item.overrides.priority {
@@ -153,6 +163,26 @@ impl SeedingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_rates_are_inherited_live_without_pinning_the_torrent_limiter() {
+        let mut item = crate::client::tests::torrent();
+        item.overrides = Default::default();
+        let mut global = crate::settings::ClientSettings::default();
+        global.speed.download_limit_kib = 40;
+        global.speed.upload_limit_kib = 20;
+        let inherited = TransferSettings::from_item(&item, &global);
+        assert_eq!((inherited.download_kib, inherited.upload_kib), (0, 0));
+        item.overrides.download_limit_kib = Some(12);
+        assert_eq!(TransferSettings::from_item(&item, &global).download_kib, 12);
+        let saved = TransferSettings {
+            download_kib: 6,
+            upload_kib: 5,
+            ..inherited
+        };
+        item.overrides.transfer_settings = Some(saved);
+        assert_eq!(TransferSettings::from_item(&item, &global), saved);
+    }
     #[test]
     fn fixed_point_ratios_survive_round_trip_through_the_gui_override_draft() {
         let mut item = crate::client::tests::torrent();

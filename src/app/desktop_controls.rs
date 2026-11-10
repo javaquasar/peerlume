@@ -21,6 +21,7 @@ pub(super) enum DesktopAction {
     SaveView,
     ResetColumns,
     Appearance,
+    SpeedProfiles,
     AgentAccess,
     ShowOperations,
     ClearHiddenSelection,
@@ -248,6 +249,14 @@ pub(super) fn more_actions(ui: &mut egui::Ui, props: ToolbarProps) -> Vec<Deskto
         "Appearance...",
         true,
         "Theme, density and text zoom. Save through the UI-only settings path.",
+    );
+    action_button(
+        ui,
+        &mut actions,
+        DesktopAction::SpeedProfiles,
+        "Speed profiles...",
+        true,
+        "View the active limits and switch the background client's speed profile.",
     );
     action_button(
         ui,

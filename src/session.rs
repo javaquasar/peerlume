@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use crate::completion::CompletionStatus;
+use crate::settings::speed_policy::{EffectiveSpeed, LiveSpeed, SpeedPlan};
 use crate::{announce_journal::AnnounceJournal, download_mode::DownloadMode};
 use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
@@ -275,6 +276,7 @@ pub struct SessionRuntime {
     events: events::Receiver,
     thread: Option<thread::JoinHandle<()>>,
     detail_interest: interest::Shared,
+    live_speed: Arc<LiveSpeed>,
     #[cfg(test)]
     test_bulk_budget: Arc<crate::storage::relocation::BulkBudget>,
     #[cfg(test)]
@@ -286,9 +288,23 @@ impl SessionRuntime {
         capacity: usize,
         settings: &crate::settings::ClientSettings,
     ) -> Result<Self, String> {
-        let options = crate::network_settings::options(settings)?;
-        let cache = crate::resume::Cache::begin(&crate::settings::data_directory())
-            .map_err(|_| "Cannot invalidate the old clean-resume cache")?;
+        Self::start_configured_with_diagnostics(capacity, settings).map_err(|(_, detail)| detail)
+    }
+
+    pub(crate) fn start_configured_with_diagnostics(
+        capacity: usize,
+        settings: &crate::settings::ClientSettings,
+    ) -> Result<Self, (crate::startup_recovery::StartupFailureCode, String)> {
+        use crate::startup_recovery::StartupFailureCode;
+        let options = crate::network_settings::options(settings)
+            .map_err(|detail| (StartupFailureCode::InvalidSettings, detail))?;
+        let cache =
+            crate::resume::Cache::begin(&crate::settings::data_directory()).map_err(|_| {
+                (
+                    StartupFailureCode::StorageRecoveryFailed,
+                    "Cannot invalidate the old clean-resume cache".into(),
+                )
+            })?;
         Self::start_with_cache(
             capacity,
             PathBuf::from(&settings.download.download_directory),
@@ -298,6 +314,10 @@ impl SessionRuntime {
             (
                 settings.storage.max_active_bulk_jobs,
                 settings.storage.bulk_io_limit_kib,
+            ),
+            Some(
+                SpeedPlan::from_settings(settings)
+                    .map_err(|detail| (StartupFailureCode::InvalidSettings, detail))?,
             ),
         )
     }
@@ -344,7 +364,9 @@ impl SessionRuntime {
             journal,
             None,
             (1, 32768),
+            None,
         )
+        .map_err(|(_, detail)| detail)
     }
 
     fn start_with_cache(
@@ -354,15 +376,26 @@ impl SessionRuntime {
         journal: AnnounceJournal,
         mut resume_cache: Option<crate::resume::Cache>,
         bulk_config: (usize, u64),
-    ) -> Result<Self, String> {
+        initial_speed: Option<SpeedPlan>,
+    ) -> Result<Self, (crate::startup_recovery::StartupFailureCode, String)> {
+        use crate::startup_recovery::StartupFailureCode;
         if capacity == 0 {
-            return Err("channel capacity must be greater than zero".into());
+            return Err((
+                StartupFailureCode::TransferEngineUnavailable,
+                "channel capacity must be greater than zero".into(),
+            ));
         }
         let (commands, mut command_rx) = tokio_mpsc::channel(capacity);
         let (event_tx, events) = events::channel(capacity);
-        let (ready, initialized) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let (ready, initialized) =
+            std::sync::mpsc::sync_channel::<Result<(), (StartupFailureCode, String)>>(1);
         let detail_interest = interest::Shared::default();
         let interests = detail_interest.clone();
+        let live_speed = Arc::new(LiveSpeed::default());
+        if let Some(plan) = initial_speed {
+            live_speed.request(plan);
+        }
+        let actor_speed = live_speed.clone();
         let bulk_budget = crate::storage::relocation::BulkBudget::new(bulk_config.0, bulk_config.1);
         #[cfg(test)]
         let test_bulk_budget = bulk_budget.clone();
@@ -379,7 +412,7 @@ impl SessionRuntime {
                     .enable_all()
                     .build() {
                         Ok(runtime)=>runtime,
-                        Err(error)=>{let _=ready.send(Err(format!("Could not create transfer runtime: {error}")));return;}
+                        Err(error)=>{let _=ready.send(Err((StartupFailureCode::RuntimeUnavailable, format!("Could not create transfer runtime: {error}"))));return;}
                     };
                 runtime.block_on(async move {
                     // Keep the pinned librqbit 9.0.1 default fingerprint while
@@ -396,14 +429,19 @@ impl SessionRuntime {
                     {
                         Ok(Ok(session)) => session,
                         Ok(Err(error)) => {
-                            let _=ready.send(Err(format!("Could not start transfer engine: {error:#}")));
+                            let code = if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)) {
+                                StartupFailureCode::ListenerAddressInUse
+                            } else {
+                                StartupFailureCode::TransferEngineUnavailable
+                            };
+                            let _=ready.send(Err((code, format!("Could not start transfer engine: {error:#}"))));
                             let _ = event_tx.send(SessionEvent::Error {
                                 id: String::new(),
                                 message: format!("Could not start transfer engine: {error:#}"),
                             });
                             return;
                         }
-                        Err(_)=>{let _=ready.send(Err("Transfer engine initialization exceeded five seconds".into()));return;}
+                        Err(_)=>{let _=ready.send(Err((StartupFailureCode::TransferEngineUnavailable, "Transfer engine initialization exceeded five seconds".into())));return;}
                     };
                     // The provider samples network payload independently of checked disk pieces.
                     #[cfg(test)]
@@ -434,7 +472,7 @@ impl SessionRuntime {
                     });
                     let _observer = match librqbit_tracker_comms::register_observer(session_peer_id.0, thread_journal.observer(), transfers.clone()) {
                         Ok(guard) => guard,
-                        Err(message) => {let _=ready.send(Err(message.into()));session.stop().await;let _ = event_tx.send(SessionEvent::Error { id: String::new(), message: message.into() }); return; }
+                        Err(message) => {let _=ready.send(Err((StartupFailureCode::TransferEngineUnavailable, message.into())));session.stop().await;let _ = event_tx.send(SessionEvent::Error { id: String::new(), message: message.into() }); return; }
                     };
                     let mut torrents: HashMap<String, Arc<ManagedTorrent>> = HashMap::new();
                     let mut storage_roots: HashMap<String,crate::storage::sandbox::Directory> = HashMap::new();
@@ -457,11 +495,13 @@ impl SessionRuntime {
                     let mut pending_storage = HashMap::<String,(crate::storage::sandbox::Directory,String)>::new();
                     let mut ticker = tokio::time::interval(Duration::from_millis(500));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    actor_speed.refresh(&session);
                     if ready.send(Ok(())).is_err(){session.stop().await;return;}
 
                     loop {
                         tokio::select! {
                             _ = ticker.tick() => {
+                                actor_speed.refresh(&session);
                                 let mut finished=Vec::new();
                                 for (id,job) in &copy_jobs {
                                     let _=event_tx.send(SessionEvent::Storage{id:id.clone(),status:crate::storage::relocation::StorageStatus::Copying{bytes:job.bytes.load(std::sync::atomic::Ordering::Relaxed),destination:job.destination.clone()}});
@@ -772,7 +812,10 @@ impl SessionRuntime {
                                         })();
                                         if let Err(message)=result{let _=event_tx.send(SessionEvent::Storage{id,status:crate::storage::relocation::StorageStatus::Failed{message}});}
                                     }
-                                    SessionCommand::ConfigureQueue { max_active_downloads } => { session.max_active_downloads.store(max_active_downloads, std::sync::atomic::Ordering::Relaxed); }
+                                    SessionCommand::ConfigureQueue { max_active_downloads } => {
+                                        actor_speed.set_queue(max_active_downloads);
+                                        session.max_active_downloads.store(max_active_downloads, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     SessionCommand::SetTransferSettings { id, settings } => {
                                         if let Err(message) = settings.validate() { let _ = event_tx.send(SessionEvent::Error { id, message }); continue; }
                                         if checks.contains_key(&id) { let _ = event_tx.send(SessionEvent::Error { id, message: "Wait for the integrity check before changing transfer settings".into() }); continue; }
@@ -1061,13 +1104,14 @@ impl SessionRuntime {
                     }
                 });
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| (StartupFailureCode::RuntimeUnavailable, error.to_string()))?;
         let runtime = Self {
             journal,
             commands,
             events,
             thread: Some(thread),
             detail_interest,
+            live_speed,
             #[cfg(test)]
             test_bulk_budget,
             #[cfg(test)]
@@ -1076,7 +1120,10 @@ impl SessionRuntime {
         initialized
             .recv_timeout(Duration::from_secs(6))
             .map_err(|_| {
-                "Transfer engine initialization worker stopped or timed out".to_owned()
+                (
+                    StartupFailureCode::TransferEngineUnavailable,
+                    "Transfer engine initialization worker stopped or timed out".to_owned(),
+                )
             })??;
         Ok(runtime)
     }
@@ -1100,6 +1147,17 @@ impl SessionRuntime {
         self.commands
             .try_send(command)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn request_live_speed(&self, plan: SpeedPlan) {
+        self.live_speed.request(plan);
+    }
+
+    pub(crate) fn speed_readback(&self) -> (Option<EffectiveSpeed>, bool) {
+        if self.commands.is_closed() {
+            return (None, false);
+        }
+        self.live_speed.readback()
     }
 
     pub(crate) fn send_checked(&self, command: SessionCommand) -> Result<(), SessionSendError> {

@@ -1,9 +1,9 @@
 //! Construct the real engine configuration. Never silently bypass a requested proxy.
-use crate::settings::{ClientSettings, TrackerReportingMode};
+use crate::settings::{ClientSettings, TrackerReportingMode, speed_policy::SpeedPlan};
 use librqbit::{
     ConnectionOptions, ListenerMode, ListenerOptions, PeerConnectionOptions, SessionOptions,
 };
-use std::{num::NonZeroU32, time::Duration};
+use std::time::Duration;
 
 pub fn options(settings: &ClientSettings) -> Result<SessionOptions, String> {
     let connection = &settings.connection;
@@ -39,13 +39,7 @@ pub fn options(settings: &ClientSettings) -> Result<SessionOptions, String> {
             );
         }
     }
-    let limit = |kib: u64| -> Result<Option<NonZeroU32>, String> {
-        let bytes = kib
-            .checked_mul(1024)
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or("Rate limit exceeds the engine range")?;
-        Ok(NonZeroU32::new(bytes))
-    };
+    let speed = SpeedPlan::from_settings(settings)?;
     let mode = match (connection.tcp_enabled, connection.utp_enabled) {
         (true, true) => ListenerMode::TcpAndUtp,
         (true, false) => ListenerMode::TcpOnly,
@@ -82,10 +76,7 @@ pub fn options(settings: &ClientSettings) -> Result<SessionOptions, String> {
                 ..Default::default()
             }),
         }),
-        ratelimits: librqbit::limits::LimitsConfig {
-            download_bps: limit(settings.speed.download_limit_kib)?,
-            upload_bps: limit(settings.speed.upload_limit_kib)?,
-        },
+        ratelimits: speed.initial_limits(),
         ..Default::default()
     })
 }

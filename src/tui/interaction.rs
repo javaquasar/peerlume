@@ -277,14 +277,41 @@ impl TuiApp {
             .split_once(' ')
             .unwrap_or((command.trim(), ""));
         match verb {
+            "speed" => {
+                use crate::settings::speed_policy::SpeedPolicy;
+                let client = self
+                    .control
+                    .backend
+                    .attached_client()
+                    .ok_or("Background client unavailable")?;
+                if argument.trim().is_empty() {
+                    let view = self
+                        .live_speed
+                        .as_ref()
+                        .ok_or("Waiting for confirmed limits from the background client")?;
+                    return Ok(crate::speed_presentation::applied_label(view));
+                }
+                let policy = match argument.trim().to_ascii_lowercase().as_str() {
+                    "normal" => SpeedPolicy::Normal,
+                    "quiet" => SpeedPolicy::Quiet,
+                    "automatic" => SpeedPolicy::Automatic,
+                    _ => return Err("Use :speed normal|quiet|automatic".into()),
+                };
+                client.set_speed_policy(policy)?;
+                return Ok("Speed profile requested; awaiting the background client".into());
+            }
             "diagnostics" => {
                 let torrent = self.selected().ok_or("No selected torrent")?;
                 let path = std::path::Path::new(argument);
                 if !path.is_absolute() {
                     return Err("Use an absolute report path".into());
                 }
-                crate::diagnostics::export(torrent, path)
-                    .map_err(|_| "Could not create report; existing files are never overwritten")?;
+                crate::diagnostics::export_for_connection(
+                    torrent,
+                    path,
+                    self.diagnostics_owner_connected(),
+                )
+                .map_err(|_| "Could not create report; existing files are never overwritten")?;
                 return Ok("Redacted diagnostics exported".into());
             }
             "file-priority" => {
@@ -418,6 +445,7 @@ impl TuiApp {
             }
             "set" => return self.set_transfer_field(argument),
             "help" => self.help = true,
+            "operations" => self.operations.open(),
             "pause" => self.execute_batch(BatchAction::Pause, None),
             "resume" => self.execute_batch(BatchAction::Resume, None),
             "check" => self.execute_batch(BatchAction::Check, None),
@@ -643,7 +671,8 @@ impl TuiApp {
                 "F7 edits transfer limits/priority/seeding. :set FIELD VALUE changes one field.",
                 "M changes announce mode/bounds; H toggles repair; L edits its attempt limit.",
                 "F8: agent access. q/Ctrl+C exits. Never share a profile between running clients.",
-                "Palette: pause/resume/check/repair/remove, search TEXT, split 20..80, clear, help.",
+                "3 opens background operations. PgUp/PgDn pages and Esc closes.",
+                "Palette: pause/resume/check/repair/remove, operations, search TEXT, split 20..80, clear, help.",
             ].into_iter().map(Line::from).collect()
         } else {
             return;

@@ -3,6 +3,7 @@ use crate::{
     client::SessionNotice,
     control::{AcceptedCommand, CommandError, TorrentCommand},
     settings::ClientSettings,
+    settings::speed_policy::{SpeedPolicy, SpeedView},
     state::{StoredFile, StoredTrackerAuditProfile},
     torrent::TorrentItem,
 };
@@ -38,11 +39,25 @@ pub struct ConnectionView {
     pub owner_instance: Option<String>,
     pub snapshot_serial: u64,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationView {
+    pub before: Option<u64>,
+    pub owner_instance: String,
+    pub page: Arc<NativeOperationPage>,
+    pub stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperationQuery {
+    before: Option<u64>,
+}
+
 struct Inner {
     directory: PathBuf,
     client_id: String,
     credentials: Mutex<(String, String)>,
     settings: Mutex<ClientSettings>,
+    speed_view: Mutex<Option<SpeedView>>,
     shared: Mutex<Shared>,
     jobs: mpsc::SyncSender<Job>,
     stop: AtomicBool,
@@ -101,6 +116,8 @@ struct Shared {
     counts: HashMap<String, usize>,
     visible: Option<String>,
     journal_active: bool,
+    operation_query: Option<OperationQuery>,
+    operation_view: Option<OperationView>,
     tokens: VecDeque<String>,
     audits: HashMap<String, (u64, Option<StoredTrackerAuditProfile>)>,
     audit_updates: VecDeque<(String, Option<StoredTrackerAuditProfile>)>,
@@ -133,6 +150,8 @@ pub struct Receipt {
     pub label: &'static str,
     pub message: String,
     pub settings: Option<ClientSettings>,
+    pub speed_view: Option<SpeedView>,
+    pub operation_id: Option<String>,
     pub trash_plan: Option<TrashPlan>,
     pub id: String,
     pub audit_saved: Option<(String, Option<StoredTrackerAuditProfile>)>,
@@ -142,16 +161,16 @@ pub struct Receipt {
 
 impl Client {
     pub fn connect_or_launch(directory: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-        let directory = directory
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
+        const PROFILE_ACCESS: &str =
+            "Could not access the profile directory. Check its location and permissions.";
+        std::fs::create_dir_all(directory).map_err(|_| PROFILE_ACCESS)?;
+        let directory = directory.canonicalize().map_err(|_| PROFILE_ACCESS)?;
         if let Ok(client) = Self::connect(&directory) {
             return Ok(client);
         }
         let lock = match crate::control::host::InstanceLock::acquire(&directory) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while Instant::now() < deadline {
                     if let Ok(client) = Self::connect(&directory) {
@@ -159,85 +178,70 @@ impl Client {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                return Err("Another or legacy PeerLume owns this profile but does not expose a compatible native endpoint. Close it normally or use its existing interface; no replacement engine was started.".into());
+                return Err("The profile is locked by an owner without a compatible native endpoint. Use the matching frontend or close that owner normally before retrying.".into());
             }
+            Err(_) => return Err(PROFILE_ACCESS.into()),
         };
-        if !directory.join("settings.toml").exists() && !directory.join("state.sqlite3").exists() {
-            let mut settings = ClientSettings::default();
-            settings.download.download_directory =
-                directory.join("downloads").to_string_lossy().into_owned();
-            settings.download.incomplete_directory = directory
-                .join("downloads/incomplete")
-                .to_string_lossy()
-                .into_owned();
-            settings
-                .save_to(&directory.join("settings.toml"))
-                .map_err(|error| error.to_string())?;
-        }
+        let previous_failure = crate::startup_recovery::read_failure(&directory)
+            .ok()
+            .flatten();
         drop(lock);
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let daemon = executable.with_file_name(if cfg!(windows) {
-            "peerlume-daemon.exe"
-        } else {
-            "peerlume-daemon"
-        });
-        if !daemon.is_file() {
-            return Err("peerlume-daemon is missing beside the frontend; build/install the complete application package".into());
-        }
-        let mut command = Command::new(daemon);
-        command
-            .arg("--profile")
-            .arg(&directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe extern "C" {
-                fn setsid() -> i32;
-            }
-            // SAFETY: only the async-signal-safe setsid syscall runs between fork
-            // and exec; stdin/stdout/stderr are detached before the child starts.
-            unsafe {
-                command.pre_exec(|| {
-                    if setsid() < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-        }
-        let mut child = spawn_owner(&mut command)
-            .map_err(|error| format!("Could not start background owner: {error}"))?;
+        let mut child = spawn_owner(&mut owner_command(&directory, false)?)
+            .map_err(|_| "Could not start the background client. Check the installed package.")?;
         let deadline = Instant::now() + Duration::from_secs(12);
-        let mut last = "Background owner is starting".to_owned();
         while Instant::now() < deadline {
-            match Self::connect(&directory) {
-                Ok(client) => return Ok(client),
-                Err(error) => last = error,
+            if let Ok(client) = Self::connect(&directory) {
+                return Ok(client);
             }
             if child
                 .try_wait()
-                .map_err(|error| error.to_string())?
+                .map_err(|_| "Could not check background startup")?
                 .is_some()
             {
-                // A concurrent frontend may have won InstanceLock. Connect once
-                // more, but never kill or replace that winning owner.
+                // A concurrent frontend may have won the same profile lock.
                 std::thread::sleep(Duration::from_millis(100));
-                return Self::connect(&directory).map_err(|_|format!("Background owner could not start. Check absolute download paths, configuration and credential availability. {last}"));
+                if let Ok(client) = Self::connect(&directory) {
+                    return Ok(client);
+                }
+                let failure = crate::startup_recovery::read_failure(&directory)
+                    .ok()
+                    .flatten()
+                    .filter(|record| {
+                        record.native_protocol == PROTOCOL_VERSION
+                            && previous_failure.as_ref() != Some(record)
+                    });
+                return Err(failure.map_or_else(
+                    || "Background startup failed. Validate the configuration and retry.".into(),
+                    |record| record.code.message().to_owned(),
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        Err(format!(
-            "Background startup timed out; no second engine was started. {last}"
-        ))
+        Err("Background startup timed out. Retry to attach to the existing owner if it is still starting.".into())
+    }
+
+    pub(super) fn validate_configuration(directory: &Path) -> Result<(), String> {
+        let directory =
+            std::path::absolute(directory).map_err(|_| "Could not locate the profile directory")?;
+        let mut child = spawn_owner(&mut owner_command(&directory, true)?).map_err(
+            |_| "Could not start the configuration validator. Check the installed package.",
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("Configuration validation failed. Inspect settings.toml and check that the download path is absolute.".into())
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Configuration validation timed out.".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn connect(directory: &Path) -> Result<Self, String> {
@@ -263,6 +267,7 @@ impl Client {
             client_id,
             credentials: Mutex::new(credentials),
             settings: Mutex::new(*settings),
+            speed_view: Default::default(),
             shared: Mutex::new(Shared {
                 connection: ConnectionStatus::Connecting,
                 stopping_owner: None,
@@ -278,6 +283,8 @@ impl Client {
                 counts: HashMap::new(),
                 visible: None,
                 journal_active: false,
+                operation_query: None,
+                operation_view: None,
                 tokens: VecDeque::new(),
                 audits: HashMap::new(),
                 audit_updates: VecDeque::new(),
@@ -316,6 +323,25 @@ impl Client {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    pub fn speed_view(&self) -> Option<SpeedView> {
+        if self.connection().status != ConnectionStatus::Connected {
+            return None;
+        }
+        self.inner
+            .speed_view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_speed_policy(&self, policy: SpeedPolicy) -> Result<(), String> {
+        self.queue(
+            Action::SetSpeedPolicy(policy),
+            "Speed profile",
+            String::new(),
+        )
     }
     pub fn connection(&self) -> ConnectionView {
         let current = self
@@ -417,6 +443,35 @@ impl Client {
             .unwrap_or_else(|error| error.into_inner())
             .journal_active = active;
     }
+    pub fn set_operations_interest(&self, active: bool, before: Option<u64>) {
+        let mut shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let query = active.then_some(OperationQuery { before });
+        if shared.operation_query != query {
+            shared.operation_query = query;
+            if let Some(view) = &mut shared.operation_view {
+                view.stale = true;
+            }
+        }
+    }
+
+    pub fn operation_view(&self) -> Option<OperationView> {
+        let shared = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let query = shared.operation_query?;
+        shared
+            .operation_view
+            .as_ref()
+            .filter(|view| view.before == query.before)
+            .cloned()
+    }
+
     pub fn audit_ready(&self, id: &str) -> bool {
         let shared = self
             .inner
@@ -788,6 +843,7 @@ impl Client {
             &action,
             Action::SaveView(_)
                 | Action::SaveSettings(_)
+                | Action::SetSpeedPolicy(_)
                 | Action::SaveEditable { .. }
                 | Action::SaveAudit { .. }
                 | Action::Export { .. }
@@ -877,6 +933,53 @@ fn operation_name(action: &Action, fallback: &'static str) -> &'static str {
         },
         _ => fallback,
     }
+}
+
+fn owner_command(directory: &Path, validate: bool) -> Result<Command, String> {
+    let executable =
+        std::env::current_exe().map_err(|_| "Could not locate the installed frontend")?;
+    let daemon = executable.with_file_name(if cfg!(windows) {
+        "peerlume-daemon.exe"
+    } else {
+        "peerlume-daemon"
+    });
+    if !daemon.is_file() {
+        return Err("peerlume-daemon is missing beside the frontend; build/install the complete application package".into());
+    }
+    let mut command = Command::new(daemon);
+    command
+        .arg("--profile")
+        .arg(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if validate {
+        command.arg("--check-config");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+        // SAFETY: only the async-signal-safe setsid syscall runs between fork
+        // and exec; stdin/stdout/stderr are detached before the child starts.
+        unsafe {
+            command.pre_exec(|| {
+                if setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    Ok(command)
 }
 
 #[cfg(windows)]
@@ -985,6 +1088,8 @@ impl Inner {
             action,
             Action::Hello
                 | Action::Snapshot { .. }
+                | Action::SpeedState
+                | Action::Operations { .. }
                 | Action::Files { .. }
                 | Action::Interest { .. }
                 | Action::ConfigureAgents { .. }
@@ -1032,13 +1137,91 @@ impl Inner {
         shared.counts.clear();
         shared.audits.clear();
         shared.audit_updates.clear();
+        shared.operation_view = None;
         shared.connection = ConnectionStatus::Connecting;
         shared.stopping_owner = None;
         drop(shared);
+        self.clear_speed_view();
         let _ = self
             .journal
             .replace_frontend_entries(Vec::new(), None, None);
         true
+    }
+
+    fn update_operation_view(
+        &self,
+        query: OperationQuery,
+        instance: &str,
+        result: Result<Reply, Error>,
+    ) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if shared.operation_query != Some(query) {
+            return;
+        }
+        let current = shared
+            .operation_view
+            .as_mut()
+            .filter(|view| view.before == query.before && view.owner_instance == instance);
+        let changed = match result {
+            Ok(Reply::Operations(page)) => {
+                if current.is_some_and(|view| !view.stale && *view.page == page) {
+                    false
+                } else {
+                    shared.operation_view = Some(OperationView {
+                        before: query.before,
+                        owner_instance: instance.to_owned(),
+                        page: Arc::new(page),
+                        stale: false,
+                    });
+                    true
+                }
+            }
+            _ => {
+                if let Some(view) = current {
+                    !std::mem::replace(&mut view.stale, true)
+                } else {
+                    shared.operation_view = Some(OperationView {
+                        before: query.before,
+                        owner_instance: instance.to_owned(),
+                        page: Arc::new(NativeOperationPage {
+                            entries: Vec::new(),
+                            next_before: None,
+                        }),
+                        stale: true,
+                    });
+                    true
+                }
+            }
+        };
+        drop(shared);
+        if changed {
+            self.notify();
+        }
+    }
+
+    fn apply_speed_view(&self, view: SpeedView) {
+        {
+            let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            settings.speed = view.desired.clone();
+            settings.queue.enabled = view.desired_queue_enabled;
+            settings.queue.max_active_downloads = view.desired_max_active_downloads;
+        }
+        let mut current = self.speed_view.lock().unwrap_or_else(|e| e.into_inner());
+        if current.as_ref() != Some(&view) {
+            *current = Some(view);
+            drop(current);
+            self.notify();
+        }
+    }
+
+    fn clear_speed_view(&self) {
+        self.speed_view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
     fn selected_audit_current(
         &self,
@@ -1088,10 +1271,12 @@ impl Inner {
             action,
         })
     }
+    async fn call_response(&self, action: Action) -> Result<Response, Error> {
+        transport::call(&self.directory, &self.request(action)?).await
+    }
+
     async fn call(&self, action: Action) -> Result<Reply, Error> {
-        transport::call(&self.directory, &self.request(action)?)
-            .await?
-            .result
+        self.call_response(action).await?.result
     }
     fn notify(&self) {
         if let Some(wake) = &*self.wake.lock().unwrap_or_else(|error| error.into_inner()) {
@@ -1142,6 +1327,9 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
     let mut owner_instance = String::new();
     let mut audit_key: Option<(String, u64)> = None;
     let mut journal_updated = Instant::now() - Duration::from_secs(2);
+    let mut speed_checked = Instant::now() - Duration::from_secs(1);
+    let mut operation_checked = Instant::now() - Duration::from_secs(1);
+    let mut last_operation_query = None;
     let mut last_revision = None;
     let mut last_view = None;
     let mut was_live = false;
@@ -1199,17 +1387,41 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
             };
             let ui_saved = view.clone();
             let response = if inner.job_is_current(&job) {
-                runtime.block_on(inner.call(job.action))
+                runtime.block_on(inner.call_response(job.action))
             } else {
                 Err(Error::Stale)
             };
+            let (response, operation_id) = match response {
+                Ok(response) => (response.result, response.operation_id),
+                Err(error) => (Err(error), None),
+            };
+            let receipt_context = Receipt {
+                operation_id,
+                ..receipt_context
+            };
             match response {
                 Ok(reply) => {
+                    let speed_view = match &reply {
+                        Reply::SpeedState(view) => Some(view.clone()),
+                        _ if settings.is_some() => {
+                            match runtime.block_on(inner.call(Action::SpeedState)) {
+                                Ok(Reply::SpeedState(view)) => Some(view),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
                     if let Some(settings) = &settings {
                         *inner
                             .settings
                             .lock()
                             .unwrap_or_else(|error| error.into_inner()) = settings.clone();
+                    }
+                    if let Some(speed) = &speed_view {
+                        inner.apply_speed_view(speed.clone());
+                        speed_checked = Instant::now();
+                    } else if settings.is_some() {
+                        inner.clear_speed_view();
                     }
                     if let Some(view) = view {
                         inner
@@ -1222,6 +1434,13 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                     let mut accepted = None;
                     let message = match reply {
                         Reply::Done(message) => message,
+                        Reply::SpeedState(view) => {
+                            if view.pending {
+                                "Speed policy saved. Engine confirmation pending.".into()
+                            } else {
+                                "Speed policy saved.".into()
+                            }
+                        }
                         Reply::TrashPlan(plan) => {
                             trash_plan = Some(plan);
                             "Review the exact Recycle Bin plan before confirming".into()
@@ -1250,6 +1469,7 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                             label: job.label,
                             message,
                             settings,
+                            speed_view,
                             trash_plan,
                             id: job.id.clone(),
                             audit_saved,
@@ -1339,6 +1559,8 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
             failed_detail = None;
             audit_key = None;
             last_revision = None;
+            speed_checked = Instant::now() - Duration::from_secs(1);
+            last_operation_query = None;
             inner
                 .shared
                 .lock()
@@ -1346,6 +1568,29 @@ fn worker(weak: Weak<Inner>, receiver: mpsc::Receiver<Job>) {
                 .audits
                 .clear();
         }
+        if speed_checked.elapsed() >= Duration::from_secs(1) {
+            if let Ok(Reply::SpeedState(view)) = runtime.block_on(inner.call(Action::SpeedState)) {
+                inner.apply_speed_view(view);
+            }
+            speed_checked = Instant::now();
+        }
+        let operation_query = inner
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operation_query;
+        if let Some(query) = operation_query
+            && (last_operation_query != Some(query)
+                || operation_checked.elapsed() >= Duration::from_secs(1))
+        {
+            let result = runtime.block_on(inner.call(Action::Operations {
+                before: query.before,
+                limit: 16,
+            }));
+            inner.update_operation_view(query, &owner_instance, result);
+            operation_checked = Instant::now();
+        }
+        last_operation_query = operation_query;
         if let Ok(Reply::Notices {
             cursor,
             resync,
@@ -2144,6 +2389,7 @@ mod tests {
             client_id: "test".into(),
             credentials: Mutex::new(("owner".into(), "a".repeat(64))),
             settings: Mutex::new(ClientSettings::default()),
+            speed_view: Default::default(),
             shared: Mutex::new(Shared {
                 connection: ConnectionStatus::Connected,
                 stopping_owner: None,
@@ -2159,6 +2405,8 @@ mod tests {
                 counts: HashMap::from([("id".into(), 3)]),
                 visible: None,
                 journal_active: false,
+                operation_query: None,
+                operation_view: None,
                 tokens: VecDeque::new(),
                 audits: HashMap::new(),
                 audit_updates: VecDeque::new(),

@@ -516,3 +516,86 @@ fn command_palette_exports_redacted_diagnostics_to_a_new_absolute_path() {
     assert!(app.status.contains("existing files are never overwritten"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), report);
 }
+
+#[test]
+fn native_speed_command_applies_and_saves_policy_without_overwriting_the_draft() {
+    use crate::settings::speed_policy::SpeedPolicy;
+
+    let mut fixture = NativeTui::live();
+    let app = &mut fixture.app;
+    tests::wait_for_tui(app, |app| app.live_speed.is_some());
+    let mut draft = app.settings.clone();
+    draft.speed.download_limit_kib = 777;
+    app.preferences_draft = Some(draft);
+    command(app, "speed quiet");
+    tests::wait_for_tui(app, |app| {
+        app.live_speed.as_ref().is_some_and(|view| {
+            !view.pending
+                && view
+                    .applied
+                    .as_ref()
+                    .is_some_and(|applied| applied.policy == SpeedPolicy::Quiet && applied.quiet)
+                && view
+                    .saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.policy() == SpeedPolicy::Quiet)
+        })
+    });
+    assert_eq!(
+        app.preferences_draft
+            .as_ref()
+            .unwrap()
+            .speed
+            .download_limit_kib,
+        777
+    );
+    assert_eq!(
+        app.preferences_draft.as_ref().unwrap().speed.policy(),
+        SpeedPolicy::Quiet
+    );
+    app.page = MainPage::Preferences;
+    app.preferences_tab = PreferencesTab::Speed;
+    assert!(render(app).contains("Active: Quiet"));
+    assert_eq!(fixture.disk_settings().speed.policy(), SpeedPolicy::Quiet);
+    assert_ne!(fixture.disk_settings().speed.download_limit_kib, 777);
+}
+
+#[test]
+fn native_operations_panel_shows_durable_view_save_and_closes() {
+    let mut fixture = NativeTui::settings_only();
+    command(&mut fixture.app, "split 56");
+    command(&mut fixture.app, "save-view");
+    command(&mut fixture.app, "operations");
+    tests::wait_for_tui(&mut fixture.app, |app| {
+        app.control
+            .backend
+            .attached_client()
+            .and_then(|client| client.operation_view())
+            .is_some_and(|view| {
+                !view.stale
+                    && view.page.entries.iter().any(|entry| {
+                        entry.command == "Save view"
+                            && entry.state
+                                == crate::control::frontend::NativeOperationState::Succeeded
+                    })
+            })
+    });
+    assert_eq!(fixture.disk_settings().ui.torrent_pane_percent, 56);
+    let screen = render(&mut fixture.app);
+    assert!(screen.contains("Background operations"));
+    assert!(screen.contains("Save view"));
+    assert!(screen.contains("Succeeded"));
+    key(&mut fixture.app, KeyCode::Esc);
+    fixture.app.poll();
+    assert!(!fixture.app.operations.is_open());
+    assert!(
+        fixture
+            .app
+            .control
+            .backend
+            .attached_client()
+            .unwrap()
+            .operation_view()
+            .is_none()
+    );
+}

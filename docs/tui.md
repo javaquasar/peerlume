@@ -33,6 +33,11 @@ are described in [runtime controls](runtime-controls.md).
 - F1 opens help. `:` opens a fixed command palette (no shell execution): `pause`,
   `resume`, `check`, `repair`, `remove`, `search TEXT`, `split PERCENT`, `clear`,
   `preferences`, `torrents`, `help`, and `set FIELD VALUE`.
+- Press **3** or enter `:operations` for the background client's recent history.
+  Up and down select an entry. Page Up and Page Down move between pages. Enter
+  focuses the matching visible torrent from the current owner. Esc closes history.
+- In the startup recovery screen, **r** retries and **v** validates configuration.
+  The screen displays the profile location and the most recent startup outcome.
 - Ctrl+C exits even in a prompt. `q` exits outside prompts.
 
 ## Preferences
@@ -43,11 +48,14 @@ selects **any** field, Enter edits, Space toggles a boolean. Changes form a draf
 never replace the saved settings. Proxy/script values are masked in the list
 and entry prompt. There is no need to serialize a password into a command palette.
 
-Saving does not restart or reconfigure active transfers. Each field identifies
-its application scope. The shared GUI model has fields not implemented by the
-engine; those are explicitly labeled **stored only**, not promised to work after
-a restart. Queue admission and inherited transfer defaults take effect at next
-startup/new torrent registration. Existing per-torrent overrides win.
+Each field identifies its application scope. Saving live speed and download
+queue settings updates the running daemon. Other settings apply at startup,
+on new torrent registration or have a **stored only** label. Existing per-torrent
+overrides still apply.
+
+Use `:speed` to read the confirmed limits and `:speed normal`, `:speed quiet`
+or `:speed automatic` to persist and request a profile change. The Speed
+preferences show the confirmed owner state separately from the editable draft.
 
 ## Running without a terminal
 

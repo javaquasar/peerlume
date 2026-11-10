@@ -53,10 +53,12 @@ pub const SUPPORTED_COMPONENT_COUNT: usize = COMPONENTS.len();
 mod interaction;
 #[cfg(test)]
 mod native_tests;
+mod operations;
 #[cfg(test)]
 mod parity_tests;
 mod preferences_editor;
 mod prompt;
+mod recovery;
 use interaction::{Focus, PendingBatch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +100,8 @@ pub struct TuiApp {
     help: bool,
     confirmation: Option<PendingBatch>,
     preferences_draft: Option<ClientSettings>,
+    live_speed: Option<crate::settings::speed_policy::SpeedView>,
+    operations: operations::Panel,
     selected_preference: usize,
     editing_preference: Option<(PreferencesTab, String)>,
     journal_page: usize,
@@ -188,6 +192,8 @@ impl TuiApp {
             help: false,
             confirmation: None,
             preferences_draft: None,
+            live_speed: None,
+            operations: Default::default(),
             selected_preference: 0,
             editing_preference: None,
             settings,
@@ -218,6 +224,7 @@ impl TuiApp {
 
     fn poll(&mut self) {
         self.agent_panel.poll(&self.control);
+        self.ui_dirty |= self.operations.poll(self.control.backend.attached_client());
         if let Some(client) = self.control.backend.attached_client() {
             for receipt in client.take_receipts() {
                 if receipt.label == "Agent view" {
@@ -230,6 +237,24 @@ impl TuiApp {
                     self.settings = settings;
                     self.preferences_draft = None;
                 }
+            }
+            let live_speed = if client.connection().status
+                == crate::control::frontend::ConnectionStatus::Connected
+            {
+                client.speed_view()
+            } else {
+                None
+            };
+            if let Some(view) = &live_speed {
+                crate::speed_presentation::accept_view(
+                    &mut self.settings,
+                    self.preferences_draft.as_mut(),
+                    view,
+                );
+            }
+            if self.live_speed != live_speed {
+                self.live_speed = live_speed;
+                self.ui_dirty = true;
             }
             for (id, audit) in client.take_audits() {
                 if let Some(audit) = audit {
@@ -300,7 +325,9 @@ impl TuiApp {
     }
 
     fn refresh_detail_interest(&mut self) {
-        let interest = if self.page == MainPage::Torrents && !self.agent_panel.open {
+        let torrent_view =
+            self.page == MainPage::Torrents && !self.agent_panel.open && !self.operations.is_open();
+        let interest = if torrent_view {
             self.selected().map(|torrent| {
                 (
                     torrent.info_hashes.join(";"),
@@ -322,9 +349,7 @@ impl TuiApp {
                 .filter(|(_, detail)| detail.files || detail.peers),
         );
         if let Some(client) = self.control.backend.attached_client() {
-            client.set_journal_active(
-                self.page == MainPage::Torrents && self.details_tab == TorrentDetailsTab::Log,
-            );
+            client.set_journal_active(torrent_view && self.details_tab == TorrentDetailsTab::Log);
             client.set_visible_torrent(interest.map(|(id, _)| id));
         }
     }
@@ -334,6 +359,15 @@ impl TuiApp {
             self.log.pop_front();
         }
         self.log.push_back(message.into());
+    }
+
+    fn diagnostics_owner_connected(&self) -> bool {
+        self.control.backend.attached_client().map_or_else(
+            || self.control.backend.session_available(),
+            |client| {
+                client.connection().status == crate::control::frontend::ConnectionStatus::Connected
+            },
+        )
     }
 
     fn clamp_selection(&mut self) {
@@ -371,6 +405,10 @@ impl TuiApp {
             && key.code == KeyCode::Char('c')
         {
             self.handle_interaction(key);
+            return;
+        }
+        if key.kind == KeyEventKind::Press && self.operations.is_open() {
+            self.handle_operations_key(key.code);
             return;
         }
         if key.kind == KeyEventKind::Press && self.agent_panel.key(&mut self.control, key.code) {
@@ -426,6 +464,7 @@ impl TuiApp {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('1') => self.page = MainPage::Torrents,
             KeyCode::Char('2') => self.page = MainPage::Preferences,
+            KeyCode::Char('3') => self.operations.open(),
             KeyCode::Char('a') if self.page == MainPage::Torrents => {
                 self.open_prompt(PromptKind::TorrentPath, "Add .torrent path", String::new());
             }
@@ -1395,6 +1434,10 @@ impl TuiApp {
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
+        if self.operations.is_open() {
+            self.operations.render(frame);
+            return;
+        }
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1434,7 +1477,7 @@ impl TuiApp {
             areas[2],
         );
         let help = if self.page == MainPage::Torrents {
-            "Tab focus · ←→ detail tabs · ↑↓ move · Space mark/file · / search · : commands · F1 help · q quit"
+            "Tab focus · ←→ detail tabs · ↑↓ move · Space mark/file · / search · 3 operations · : commands · F1 help · q quit"
         } else {
             "←→ section · ↑↓ field · Enter edit · Space toggle · s save · Esc discard · F1 help"
         };
@@ -1667,10 +1710,14 @@ impl TuiApp {
                         .iter()
                         .find_map(|h| j.latest(h.strip_prefix("v1: ")?))
                 });
-                let lines: Vec<_> = crate::runtime_status::status_card(torrent, last.as_deref())
-                    .into_iter()
-                    .map(|(key, value)| Line::from(format!("{key}: {value}")))
-                    .collect();
+                let lines: Vec<_> = crate::runtime_status::status_card_for_connection(
+                    torrent,
+                    last.as_deref(),
+                    self.diagnostics_owner_connected(),
+                )
+                .into_iter()
+                .map(|(key, value)| Line::from(format!("{key}: {value}")))
+                .collect();
                 frame.render_widget(
                     Paragraph::new(lines)
                         .block(
@@ -2007,9 +2054,14 @@ impl TuiApp {
     }
 
     fn render_preferences(&self, frame: &mut Frame<'_>, area: Rect) {
+        let show_speed = self.preferences_tab == PreferencesTab::Speed;
         let areas = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(5)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(if show_speed { 2 } else { 0 }),
+                Constraint::Min(5),
+            ])
             .split(area);
         frame.render_widget(
             Tabs::new(PreferencesTab::ALL.map(|tab| Line::from(tab.label())))
@@ -2018,6 +2070,22 @@ impl TuiApp {
                 .highlight_style(Style::default().fg(Color::Cyan)),
             areas[0],
         );
+        if show_speed {
+            let active = self.live_speed.as_ref().map_or_else(
+                || "Waiting for confirmed limits from the background client".into(),
+                crate::speed_presentation::applied_label,
+            );
+            let hint = if self.live_speed.as_ref().is_some_and(|view| view.pending) {
+                "Awaiting engine confirmation"
+            } else {
+                ":speed normal|quiet|automatic switches and saves the profile"
+            };
+            frame.render_widget(
+                Paragraph::new(vec![Line::from(active), Line::from(hint)])
+                    .wrap(Wrap { trim: true }),
+                areas[1],
+            );
+        }
         let fields = preferences_editor::fields(
             self.preferences_draft.as_ref().unwrap_or(&self.settings),
             self.preferences_tab,
@@ -2038,7 +2106,7 @@ impl TuiApp {
                 .block(
                     Block::default()
                         .title(if self.preferences_draft.is_some() {
-                            " Preferences draft · s saves; active engine unchanged "
+                            " Preferences draft · s saves; see each field for application scope "
                         } else {
                             " Saved preferences · Enter edits selected field "
                         })
@@ -2046,7 +2114,7 @@ impl TuiApp {
                 )
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ "),
-            areas[1],
+            areas[2],
             &mut state,
         );
     }
@@ -2066,11 +2134,17 @@ impl Drop for TuiApp {
 pub fn run() -> io::Result<()> {
     crate::settings::configure_profile_from_args()?;
     let directory = crate::settings::data_directory();
-    let mut app = TuiApp::load();
-    if app.control.backend.attached_client().is_none() {
-        return Err(io::Error::other(app.status.clone()));
-    }
     let mut terminal = TerminalGuard::enter()?;
+    let Some(client) = recovery::attach(&mut terminal, directory.clone())? else {
+        return Ok(());
+    };
+    let settings = client.settings();
+    let mut app = TuiApp::from_parts(
+        settings,
+        ClientBackend::from_attached(client),
+        Vec::new(),
+        HashMap::new(),
+    );
     let download_root = PathBuf::from(&app.settings.download.download_directory);
     app.control
         .configure_agents(&directory, download_root)
@@ -2449,7 +2523,11 @@ mod tests {
         let mut app = app();
         app.focus = Focus::Details;
         app.details_tab = TorrentDetailsTab::Status;
-        let expected = crate::runtime_status::status_card(&app.control.torrents[0], None);
+        let expected = crate::runtime_status::status_card_for_connection(
+            &app.control.torrents[0],
+            None,
+            false,
+        );
         let mut terminal = Terminal::new(TestBackend::new(240, 70)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal

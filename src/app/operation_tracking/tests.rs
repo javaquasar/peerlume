@@ -41,6 +41,35 @@ fn phase(tracker: &Tracker, id: OperationId) -> OperationPhase {
 }
 
 #[test]
+fn only_matching_owner_receipt_hands_off_local_placeholder() {
+    let mut tracker = Tracker::default();
+    let items = [torrent()];
+    let local = tracker
+        .record_error("Show location", None, "fixture", "Unavailable")
+        .unwrap();
+    let placeholder = tracker
+        .receipt(&queued(1, TorrentCommand::Pause), &items)
+        .unwrap()
+        .unwrap();
+    let mut receipt = accepted(1, TorrentCommand::Pause);
+    receipt.operation_id = Some("owner-operation-1".into());
+    receipt.owner_instance = "different-owner".into();
+    tracker.receipt(&receipt, &items).unwrap();
+    assert_eq!(phase(&tracker, placeholder), OperationPhase::NeedsReview);
+
+    receipt.owner_instance = "owner-a".into();
+    assert!(tracker.receipt(&receipt, &items).unwrap().is_none());
+    assert!(tracker.history.get(placeholder).is_none());
+    assert_eq!(phase(&tracker, local), OperationPhase::Failed);
+    assert!(
+        tracker
+            .receipt(&queued(1, TorrentCommand::Pause), &items)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn pause_receipts_need_new_snapshot_matching_engine_action_and_saved_revision() {
     let mut tracker = Tracker::default();
     let mut items = vec![torrent()];

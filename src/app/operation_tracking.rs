@@ -145,6 +145,22 @@ impl Tracker {
             return Err(HistoryError::InvalidIdentity);
         }
         self.prune();
+        if !receipt.queued
+            && !receipt.ambiguous_error
+            && receipt.operation_id.as_deref().is_some_and(|id| {
+                !id.is_empty() && id.len() <= MAX_OWNER_BYTES && !id.chars().any(char::is_control)
+            })
+            && self
+                .jobs
+                .get(&receipt.job_id)
+                .is_none_or(|job| job.owner == receipt.owner_instance)
+        {
+            if let Some(job) = self.jobs.remove(&receipt.job_id) {
+                self.history.handoff_to_owner(job.operation_id)?;
+            }
+            self.retire(receipt.job_id);
+            return Ok(None);
+        }
         if !self.jobs.contains_key(&receipt.job_id) {
             if self.retired.contains(&receipt.job_id) {
                 return Ok(None);

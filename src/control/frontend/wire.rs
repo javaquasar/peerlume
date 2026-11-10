@@ -12,6 +12,7 @@ use crate::{
         ModeApplication, RepairStatus, RuntimeStatus, TransferAction, TransferFeedback,
     },
     settings::ClientSettings,
+    settings::speed_policy::{SpeedPolicy, SpeedView},
     state::{StoredFile, StoredTrackerAuditProfile},
     storage::relocation::StorageStatus,
     torrent::{TorrentItem, TorrentOverrides, TorrentState},
@@ -174,6 +175,8 @@ pub enum Action {
     SaveSettings(ClientSettings),
     SaveView(crate::settings::UiSettings),
     ApplySettings(ClientSettings),
+    SpeedState,
+    SetSpeedPolicy(SpeedPolicy),
     SaveEditable {
         id: String,
         revision: u64,
@@ -195,6 +198,10 @@ pub enum Action {
     },
     Notices {
         after: u64,
+        limit: usize,
+    },
+    Operations {
+        before: Option<u64>,
         limit: usize,
     },
     Export {
@@ -230,6 +237,7 @@ pub enum Reply {
         instance_id: String,
     },
     Snapshot(Page),
+    SpeedState(SpeedView),
     Files(FilePage),
     Accepted(AcceptedCommand),
     Access(AccessView),
@@ -243,6 +251,7 @@ pub enum Reply {
         resync: bool,
         entries: Vec<SessionNotice>,
     },
+    Operations(NativeOperationPage),
     Journal {
         entries: Vec<crate::announce_journal::JournalEntry>,
         total: usize,
@@ -288,7 +297,47 @@ pub struct Response {
     pub protocol: u32,
     pub request_id: String,
     pub instance_id: String,
+    pub operation_id: Option<String>,
     pub result: Result<Reply, Error>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperationState {
+    Queued,
+    Accepted,
+    Running,
+    EffectConfirmed,
+    Succeeded,
+    Failed,
+    NeedsReview,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperationProgress {
+    pub bytes: u64,
+    pub total: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperation {
+    pub id: String,
+    pub sequence: u64,
+    pub owner_instance: String,
+    pub request_id: String,
+    pub target: Option<String>,
+    pub command: String,
+    pub revision: Option<u64>,
+    pub state: NativeOperationState,
+    pub progress: Option<NativeOperationProgress>,
+    pub message: Option<String>,
+    pub created_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperationPage {
+    pub entries: Vec<NativeOperation>,
+    pub next_before: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

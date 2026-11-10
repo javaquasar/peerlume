@@ -557,14 +557,17 @@ impl ClientBackend {
     }
 
     pub fn attach(directory: &std::path::Path) -> Result<Self, String> {
-        let client = crate::control::frontend::Client::connect_or_launch(directory)?;
-        Ok(Self {
+        crate::control::frontend::Client::connect_or_launch(directory).map(Self::from_attached)
+    }
+
+    pub fn from_attached(client: crate::control::frontend::Client) -> Self {
+        Self {
             state_store: None,
             session_runtime: None,
             startup_error: None,
             attached: Some(client),
             file_loader: None,
-        })
+        }
     }
 
     pub(crate) fn set_event_wake(&self, wake: std::sync::Arc<tokio::sync::Notify>) {
@@ -823,44 +826,57 @@ impl ClientBackend {
 
     /// Fail closed before creating a network session if state cannot be restored.
     pub fn try_start(settings: &ClientSettings) -> Result<Self, String> {
+        Self::try_start_with_diagnostics(settings).map_err(|(_, detail)| detail)
+    }
+
+    /// Preserve the startup stage for the daemon's bounded recovery record.
+    pub fn try_start_with_diagnostics(
+        settings: &ClientSettings,
+    ) -> Result<Self, (crate::startup_recovery::StartupFailureCode, String)> {
+        use crate::startup_recovery::StartupFailureCode;
         let issues = settings.validate();
         if !issues.is_empty() {
-            return Err(format!(
-                "Invalid settings; engine not started: {}",
-                issues
-                    .iter()
-                    .map(|issue| format!("{}: {}", issue.field, issue.message))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+            return Err((
+                StartupFailureCode::InvalidSettings,
+                format!(
+                    "Invalid settings; engine not started: {}",
+                    issues
+                        .iter()
+                        .map(|issue| format!("{}: {}", issue.field, issue.message))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
             ));
         }
-        let mut state_store = StateStore::open(&data_directory().join("state.sqlite3"))
-            .map_err(|e| format!("Cannot open persistent state; engine not started: {e}"))?;
+        let mut state_store =
+            StateStore::open(&data_directory().join("state.sqlite3")).map_err(|error| {
+                (
+                    StartupFailureCode::from_state_error(&error),
+                    format!("Cannot open persistent state; engine not started: {error}"),
+                )
+            })?;
         state_store
-            .recover_storage_moves(&data_directory(), &settings.download.download_directory)?;
-        state_store
-            .load_deferred_torrents()
-            .map_err(|e| format!("Cannot restore persistent state; engine not started: {e}"))?;
-        let backend = Self {
+            .recover_storage_moves(&data_directory(), &settings.download.download_directory)
+            .map_err(|detail| (StartupFailureCode::StorageRecoveryFailed, detail))?;
+        state_store.load_deferred_torrents().map_err(|error| {
+            (
+                StartupFailureCode::from_state_error(&error),
+                format!("Cannot restore persistent state; engine not started: {error}"),
+            )
+        })?;
+        Ok(Self {
             file_loader: state_store
                 .database_path()
                 .map(crate::state::FileDetailLoader::new),
             attached: None,
             state_store: Some(state_store),
             session_runtime: Some(
-                SessionRuntime::start_configured(256, settings)
-                    .map_err(|e| format!("Cannot start transfer engine: {e}"))?,
+                SessionRuntime::start_configured_with_diagnostics(256, settings).map_err(
+                    |(code, detail)| (code, format!("Cannot start transfer engine: {detail}")),
+                )?,
             ),
             startup_error: None,
-        };
-        backend.send(SessionCommand::ConfigureQueue {
-            max_active_downloads: if settings.queue.enabled {
-                settings.queue.max_active_downloads
-            } else {
-                0
-            },
-        })?;
-        Ok(backend)
+        })
     }
 
     pub fn load_torrents(&self) -> Result<Vec<TorrentRecord>, String> {
@@ -974,6 +990,20 @@ impl ClientBackend {
 
     pub fn session_available(&self) -> bool {
         self.session_runtime.is_some() || self.attached.is_some()
+    }
+
+    pub(crate) fn request_live_speed(&self, plan: crate::settings::speed_policy::SpeedPlan) {
+        if let Some(runtime) = &self.session_runtime {
+            runtime.request_live_speed(plan);
+        }
+    }
+
+    pub(crate) fn speed_readback(
+        &self,
+    ) -> (Option<crate::settings::speed_policy::EffectiveSpeed>, bool) {
+        self.session_runtime
+            .as_ref()
+            .map_or((None, false), SessionRuntime::speed_readback)
     }
 
     pub(crate) fn persistence_available(&self) -> bool {

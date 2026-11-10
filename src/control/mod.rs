@@ -59,6 +59,7 @@ pub struct Controller {
     pub(crate) frontend_busy: std::collections::HashSet<String>,
     native_instance_id: Option<String>,
     native_durability: HashMap<String, (u64, bool)>,
+    native_operations: Option<frontend::operations::SharedHistory>,
     pub(crate) agent: Option<agent::AgentService>,
     pending_removals: std::collections::BTreeSet<String>,
     pending_restore: std::collections::BTreeSet<String>,
@@ -90,6 +91,7 @@ impl Controller {
             frontend_busy: Default::default(),
             native_instance_id: None,
             native_durability: Default::default(),
+            native_operations: None,
             agent: None,
             pending_removals: Default::default(),
             pending_restore: Default::default(),
@@ -187,6 +189,16 @@ impl Controller {
             SessionEvent::Stopped => None,
         };
         let index = event_id.as_deref().and_then(|id| self.torrent_index(id));
+        let operation_feedback = if self.native_operations.is_some() {
+            index.and_then(|index| {
+                frontend::operations::Feedback::from_event(
+                    &event,
+                    self.torrents[index].runtime.command.pending_action(),
+                )
+            })
+        } else {
+            None
+        };
         let quiet_telemetry = matches!(&event, SessionEvent::NetworkTotals { .. })
             || matches!(&event, SessionEvent::Stats { file_progress, .. } if file_progress.is_empty());
         let before = if quiet_telemetry {
@@ -264,6 +276,17 @@ impl Controller {
             self.dirty |= *observation != before;
         }
         self.dirty |= old_len != self.observed.len();
+        if let (Some(feedback), Some(index), Some(history)) =
+            (operation_feedback, index, &self.native_operations)
+        {
+            let id = &self.canonical_ids[index];
+            if let Some(row) = self.observed.get(id) {
+                history
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .observe(id, row.command_revision, feedback);
+            }
+        }
         if let SessionNotice::Removed { id } = &notice
             && self.pending_removals.contains(id)
         {
@@ -674,6 +697,9 @@ impl Controller {
         // ACK writes preserve tracker/audit columns in place; no file tree,
         // tracker secret or unrelated torrent is loaded on this path.
         let result = self.persist_confirmed_update(id, None);
+        if result.is_ok() {
+            self.record_native_operation_persistence(id, false);
+        }
         if let Err(message) = &result {
             let notice = SessionNotice::Error {
                 id: id.to_owned(),
@@ -705,6 +731,7 @@ impl Controller {
             });
             return Err(error);
         }
+        self.record_native_operation_persistence(id, true);
         self.torrents
             .retain(|torrent| torrent.info_hashes.join(";") != id);
         self.pending_removals.remove(id);
@@ -712,6 +739,15 @@ impl Controller {
         self.structural_dirty = true;
         self.dirty = true;
         Ok(())
+    }
+
+    fn record_native_operation_persistence(&self, id: &str, removal: bool) {
+        if let (Some(history), Some(row)) = (&self.native_operations, self.observed.get(id)) {
+            history
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .persisted(id, row.command_revision, removal);
+        }
     }
 
     fn import_native_snapshot(&mut self) {

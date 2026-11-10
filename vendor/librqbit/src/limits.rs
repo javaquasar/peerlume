@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Default, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LimitsConfig {
@@ -15,6 +16,7 @@ pub struct LimitsConfig {
 struct Limit {
     limiter: ArcSwapOption<RateLimiter>,
     current_bps: std::sync::atomic::AtomicU32,
+    changed: Notify,
 }
 
 impl Limit {
@@ -31,15 +33,27 @@ impl Limit {
         Self {
             limiter: ArcSwapOption::new(Self::new_inner(bps)),
             current_bps: AtomicU32::new(bps.map(|v| v.get()).unwrap_or(0)),
+            changed: Notify::new(),
         }
     }
 
     async fn acquire(&self, size: NonZeroU32) -> crate::Result<()> {
-        let lim = self.limiter.load().clone();
-        if let Some(rl) = lim.as_ref() {
-            rl.until_n_ready(size).await?;
+        loop {
+            // Subscribe before loading the limiter so a concurrent setter
+            // can wake even a waiter that has not begun polling the quota.
+            let changed = self.changed.notified();
+            let Some(limiter) = self.limiter.load_full() else {
+                return Ok(());
+            };
+            tokio::select! {
+                biased;
+                _ = changed => {}
+                ready = limiter.until_n_ready(size) => {
+                    ready?;
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
     }
 
     fn set(&self, limit: Option<NonZeroU32>) {
@@ -48,6 +62,7 @@ impl Limit {
         self.limiter.swap(new);
         self.current_bps
             .store(limit.map(|v| v.get()).unwrap_or(0), Ordering::Relaxed);
+        self.changed.notify_waiters();
     }
 
     fn get(&self) -> Option<NonZeroU32> {

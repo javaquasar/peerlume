@@ -155,10 +155,17 @@ impl PeerLumeApp {
             }
             Action::ShowOperations => {
                 self.operations_open = true;
+                self.owner_operations
+                    .prefer_local_errors(!self.operation_tracker.history.is_empty());
                 return;
             }
             Action::Appearance => {
                 self.appearance_open = true;
+                return;
+            }
+            Action::SpeedProfiles => {
+                self.page = MainPage::Preferences;
+                self.preferences_tab = PreferencesTab::Speed;
                 return;
             }
             Action::AgentAccess => {
@@ -447,7 +454,7 @@ impl PeerLumeApp {
                 let identities=&self.identities.indices;
                 let pane=torrent_panes::table_with_percent(ui,self.settings.ui.torrent_pane_percent,feedback_height,|ui|{
                     torrent_table::show(ui,torrent_table::TableInput{
-                        torrents,visible:&visible,filter:self.status_filter,
+                        torrents,visible:&visible,filter:self.status_filter,owner_connected:connected,
                         columns:&mut self.settings.ui.table_columns,sort:&mut self.settings.ui.sort,descending:&mut self.settings.ui.descending,
                         name_column:&mut self.name_column,selection:&mut self.selection,
                     },|ui,_,torrent,ids,hidden|{
@@ -606,18 +613,52 @@ impl PeerLumeApp {
                 }
             }
         }
+        let client = self.control.backend.attached_client().cloned();
+        let connection = self.desktop_connection();
+        self.owner_operations.observe(
+            &connection,
+            client.as_ref().and_then(|client| client.operation_view()),
+        );
         if self.operations_open {
+            if self.page != MainPage::Torrents {
+                self.reconcile_selection();
+            }
             let mut open = self.operations_open;
             let mut intents = Vec::new();
             egui::Window::new("Operations")
                 .open(&mut open)
                 .default_width(620.0)
                 .show(ctx, |ui| {
-                    intents = crate::ui_operations::gui::panel(
-                        ui,
-                        &self.operation_tracker.history,
-                        (ctx.content_rect().height() * 0.65).max(80.0),
-                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(
+                            &mut self.owner_operations.local_tab,
+                            false,
+                            "Background owner",
+                        );
+                        ui.selectable_value(
+                            &mut self.owner_operations.local_tab,
+                            true,
+                            "This window",
+                        );
+                    });
+                    let max_height = (ctx.content_rect().height() * 0.65).max(80.0);
+                    intents = if self.owner_operations.local_tab {
+                        crate::ui_operations::gui::panel(
+                            ui,
+                            &self.operation_tracker.history,
+                            max_height,
+                        )
+                    } else {
+                        let indices = &self.identities.indices;
+                        let torrents = &self.control.torrents;
+                        self.owner_operations
+                            .show(ui, &connection, max_height, |target| {
+                                indices
+                                    .get(target)
+                                    .and_then(|&index| torrents.get(index))
+                                    .map(|torrent| torrent.name.as_str())
+                            })
+                    };
                 });
             self.operations_open = open;
             for intent in intents {
@@ -645,6 +686,9 @@ impl PeerLumeApp {
                     }
                 }
             }
+        }
+        if let Some(client) = client {
+            client.set_operations_interest(self.operations_open, self.owner_operations.before);
         }
     }
 }

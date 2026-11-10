@@ -2,7 +2,7 @@
 //! context intents; they never perform IPC or touch payloads.
 use super::name_column::{self, NameColumn};
 use crate::{
-    appearance::{self, StatusPresentation},
+    appearance::{self, RowColors, StatusPresentation},
     table_view::{Column, TableColumns},
     torrent::TorrentItem,
     torrent_filter::StatusFilter,
@@ -16,6 +16,7 @@ pub(super) struct TableInput<'a> {
     pub torrents: &'a [TorrentItem],
     pub visible: &'a [usize],
     pub filter: StatusFilter,
+    pub owner_connected: bool,
     pub columns: &'a mut TableColumns,
     pub sort: &'a mut Sort,
     pub descending: &'a mut bool,
@@ -135,6 +136,7 @@ pub(super) fn show(
         torrents,
         visible,
         filter,
+        owner_connected,
         columns,
         sort,
         descending,
@@ -293,9 +295,9 @@ pub(super) fn show(
                                 cell_rect,
                                 cell.column,
                                 torrent,
-                                colors.text.color32(),
-                                colors.accent.color32(),
+                                colors,
                                 !columns.is_visible(Column::Status),
+                                owner_connected,
                             );
                         }
                         if !response.secondary_clicked() || current_hit {
@@ -530,9 +532,9 @@ fn row_cell(
     rect: egui::Rect,
     column: Column,
     torrent: &TorrentItem,
-    text: egui::Color32,
-    accent: egui::Color32,
+    colors: RowColors,
     status_hidden: bool,
+    owner_connected: bool,
 ) {
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -545,14 +547,14 @@ fn row_cell(
             }),
     );
     child.set_clip_rect(ui.clip_rect().intersect(rect));
-    child.visuals_mut().override_text_color = Some(text);
+    child.visuals_mut().override_text_color = Some(colors.text.color32());
     if column == Column::Progress {
         child.add(
             egui::ProgressBar::new(torrent.display_progress())
                 .desired_width((rect.width() - 8.0).max(1.0))
                 .desired_height((rect.height() - 4.0).max(1.0))
                 .text(torrent.progress_text())
-                .fill(accent),
+                .fill(colors.accent.color32()),
         );
         return;
     }
@@ -582,8 +584,17 @@ fn row_cell(
             egui::Align::Min
         },
     ));
-    if column == Column::Name {
-        response.on_hover_text(&torrent.name);
+    if column == Column::Name || column == Column::Status {
+        response.on_hover_ui(|ui| {
+            if column == Column::Name {
+                ui.label(&torrent.name);
+            }
+            if column == Column::Status || status_hidden {
+                let readiness = crate::diagnostics::readiness(torrent, None, owner_connected);
+                ui.strong(readiness.reason);
+                ui.label(readiness.next_action);
+            }
+        });
     }
 }
 

@@ -3,6 +3,7 @@ use super::*;
 struct Fixture {
     torrents: Vec<TorrentItem>,
     visible: Vec<usize>,
+    owner_connected: bool,
     columns: TableColumns,
     sort: Sort,
     descending: bool,
@@ -26,6 +27,7 @@ impl Fixture {
         Self {
             torrents,
             visible: (0..count).collect(),
+            owner_connected: true,
             columns: Default::default(),
             sort: Sort::Added,
             descending: false,
@@ -54,6 +56,7 @@ fn frame(
     let Fixture {
         torrents,
         visible,
+        owner_connected,
         columns,
         sort,
         descending,
@@ -77,6 +80,7 @@ fn frame(
                     TableInput {
                         torrents,
                         visible,
+                        owner_connected: *owner_connected,
                         filter: StatusFilter::All,
                         columns,
                         sort,
@@ -159,6 +163,49 @@ fn text(output: &egui::FullOutput, label: &str) -> egui::Rect {
             }
         })
         .unwrap_or_else(|| panic!("Missing visible text {label}"))
+}
+
+#[test]
+fn status_hover_explains_confirmed_queue_wait_and_marks_a_disconnected_view() {
+    use crate::torrent::TorrentState;
+
+    let ctx = egui::Context::default();
+    ctx.style_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+        style.interaction.show_tooltips_only_when_still = false;
+    });
+    let mut fixture = Fixture::new(1);
+    let torrent = &mut fixture.torrents[0];
+    torrent.state = TorrentState::Downloading;
+    torrent.runtime.registered = true;
+    torrent.runtime.diagnostics.queue_waiting = true;
+    let marker = StatusPresentation::for_state(torrent.state).marker;
+    let label = format!("{marker} {}", torrent.status_text());
+    let size = egui::vec2(1600.0, 700.0);
+    let (output, _) = settle(&ctx, &mut fixture, size);
+    let point = text(&output, &label).center();
+    frame(
+        &ctx,
+        &mut fixture,
+        size,
+        vec![egui::Event::PointerMoved(point)],
+    );
+    let (output, _) = settle(&ctx, &mut fixture, size);
+    text(
+        &output,
+        "Waiting for a download queue slot (engine-confirmed)",
+    );
+    text(
+        &output,
+        "Wait for an active slot or review the configured download queue limit.",
+    );
+
+    fixture.owner_connected = false;
+    let (output, _) = settle(&ctx, &mut fixture, size);
+    text(
+        &output,
+        "Background client disconnected. Showing last known data.",
+    );
 }
 fn drag(
     ctx: &egui::Context,

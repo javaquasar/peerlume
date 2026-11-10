@@ -19,6 +19,13 @@ struct NativeOwner {
 }
 impl NativeOwner {
     fn new(items: Vec<TorrentItem>, engine: bool) -> Self {
+        Self::new_with_listener(items, engine, None)
+    }
+    fn new_with_listener(
+        items: Vec<TorrentItem>,
+        engine: bool,
+        listen: Option<librqbit::ListenerOptions>,
+    ) -> Self {
         let profile = tempfile::tempdir().unwrap();
         let root = profile.path().join("payloads");
         std::fs::create_dir(&root).unwrap();
@@ -31,7 +38,7 @@ impl NativeOwner {
                 root.clone(),
                 librqbit::SessionOptions {
                     dht: None,
-                    listen: None,
+                    listen,
                     disable_trackers: true,
                     disable_local_service_discovery: true,
                     ..Default::default()
@@ -73,7 +80,10 @@ impl NativeOwner {
         }
     }
     fn rpc(&self, action: Action) -> Result<Reply, Error> {
-        transport::call_blocking(self.profile.path().into(), self.request(action))?.result
+        self.response(action)?.result
+    }
+    fn response(&self, action: Action) -> Result<Response, Error> {
+        transport::call_blocking(self.profile.path().into(), self.request(action))
     }
     fn current(&self, id: &str) -> WireTorrent {
         let Reply::Snapshot(page) = self
@@ -92,6 +102,7 @@ impl NativeOwner {
             .find(|row| row.info_hashes.join(";") == id)
             .unwrap()
     }
+    #[track_caller]
     fn wait_for(&self, mut ready: impl FnMut(&Controller) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -495,6 +506,202 @@ fn native_view_save_and_tracker_edit_preserve_unrelated_durable_state() {
     assert_eq!(record.trackers, trackers);
     assert_eq!(record.tracker_audit, Some(audit));
     assert_eq!(record.files.len(), 1);
+}
+
+#[test]
+fn native_live_speed_distinguishes_applied_and_saved_settings_across_frontend_detach() {
+    use crate::{control::frontend::Client, settings::speed_policy::SpeedPolicy};
+
+    let fixture = NativeOwner::new_with_listener(
+        vec![],
+        true,
+        Some(librqbit::ListenerOptions {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        }),
+    );
+    let mut saved = fixture.settings.clone();
+    saved.speed.download_limit_kib = 900;
+    saved.speed.alternate_download_kib = 300;
+    saved.queue.enabled = false;
+    saved.queue.max_active_downloads = 7;
+    assert!(matches!(
+        fixture.rpc(Action::SaveSettings(saved.clone())),
+        Ok(Reply::Done(_))
+    ));
+    let engine = fixture.owner.lock().unwrap().backend.test_engine().unwrap();
+    let listener = engine.listen_addr().unwrap();
+    let first = Client::connect(fixture.profile.path()).unwrap();
+    let second = Client::connect(fixture.profile.path()).unwrap();
+    fixture.wait_for(|_| {
+        let _ = first.sync();
+        let _ = second.sync();
+        first.speed_view().is_some() && second.speed_view().is_some()
+    });
+
+    let mut desired = saved.clone();
+    desired.speed.download_limit_kib = 1200;
+    desired.speed.alternate_download_kib = 400;
+    desired.speed.alternate_upload_kib = 200;
+    desired.queue.enabled = true;
+    desired.queue.max_active_downloads = 2;
+    desired.ui.search = "applied only".into();
+    first.apply_settings(&desired).unwrap();
+    let mut settings_receipt = None;
+    fixture.wait_for(|_| {
+        settings_receipt = first
+            .take_receipts()
+            .into_iter()
+            .find(|receipt| receipt.label == "Apply preferences" && !receipt.queued);
+        settings_receipt.is_some()
+    });
+    let settings_receipt = settings_receipt.unwrap();
+    assert_eq!(settings_receipt.error, None);
+    assert_eq!(settings_receipt.settings.as_ref(), Some(&desired));
+    let accepted = settings_receipt.speed_view.unwrap();
+    assert_eq!(accepted.desired, desired.speed);
+    assert_eq!(accepted.saved.as_ref(), Some(&saved.speed));
+    assert_eq!(accepted.desired_max_active_downloads, 2);
+    assert!(accepted.desired_queue_enabled);
+    assert_eq!(accepted.saved_queue_enabled, Some(false));
+    assert_eq!(accepted.saved_max_active_downloads, Some(7));
+
+    first.set_speed_policy(SpeedPolicy::Quiet).unwrap();
+    let mut profile_receipt = None;
+    fixture.wait_for(|_| {
+        profile_receipt = first
+            .take_receipts()
+            .into_iter()
+            .find(|receipt| receipt.label == "Speed profile" && !receipt.queued);
+        profile_receipt.is_some()
+    });
+    let receipt = profile_receipt.unwrap();
+    assert!(receipt.completed_by_reply);
+    assert!(receipt.error.is_none());
+    saved.speed.set_policy(SpeedPolicy::Quiet);
+    desired.speed.set_policy(SpeedPolicy::Quiet);
+    let accepted = receipt.speed_view.unwrap();
+    assert_eq!(accepted.desired, desired.speed);
+    assert_eq!(accepted.saved.as_ref(), Some(&saved.speed));
+    let path = fixture.profile.path().join("settings.toml");
+    assert_eq!(ClientSettings::load_from(&path).unwrap(), saved);
+    fixture.wait_for(|_| {
+        second.speed_view().is_some_and(|speed| {
+            !speed.pending
+                && speed.applied.is_some_and(|applied| {
+                    applied.quiet
+                        && applied.download_limit_kib == 400
+                        && applied.upload_limit_kib == 200
+                        && applied.max_active_downloads == 2
+                })
+        })
+    });
+
+    let mut invalid = desired.clone();
+    invalid.speed.alternate_download_kib = u64::MAX;
+    assert!(matches!(
+        fixture.rpc(Action::SaveSettings(invalid)),
+        Err(Error::Failed(_))
+    ));
+    drop((first, second));
+    let current = fixture.owner.lock().unwrap().backend.test_engine().unwrap();
+    assert!(Arc::ptr_eq(&engine, &current));
+    assert_eq!(current.listen_addr(), Some(listener));
+    assert_eq!(
+        current.ratelimits.get_download_bps().unwrap().get(),
+        400 * 1024
+    );
+    assert_eq!(
+        current.ratelimits.get_upload_bps().unwrap().get(),
+        200 * 1024
+    );
+    assert_eq!(ClientSettings::load_from(&path).unwrap(), saved);
+    let attached = Client::connect(fixture.profile.path()).unwrap();
+    fixture.wait_for(|_| {
+        let _ = attached.sync();
+        attached.speed_view().is_some_and(|speed| {
+            speed.desired == desired.speed && speed.saved.as_ref() == Some(&saved.speed)
+        })
+    });
+    drop((attached, engine, current));
+    fixture.stop_engine();
+}
+
+#[test]
+fn native_history_tracks_engine_ack_and_waits_for_durable_owner_update() {
+    let fixture = NativeOwner::new(vec![], true);
+    let root = PathBuf::from(&fixture.settings.download.download_directory);
+    std::fs::write(root.join("a.bin"), b"abc").unwrap();
+    std::fs::write(root.join("b.bin"), b"def").unwrap();
+    let request = local_metainfo(&fixture.profile.path().join("history.torrent"), &root);
+    let id = request.hashes[0].clone();
+    assert!(matches!(
+        fixture.rpc(Action::Add(request)),
+        Ok(Reply::Done(_))
+    ));
+    fixture.wait_for(|owner| {
+        owner
+            .torrents
+            .first()
+            .is_some_and(|item| item.runtime.registered && item.state == TorrentState::Paused)
+    });
+    let db = rusqlite::Connection::open(fixture.profile.path().join("state.sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_history_ack BEFORE UPDATE ON torrents
+        BEGIN SELECT RAISE(ABORT,'synthetic ACK write failure'); END;",
+    )
+    .unwrap();
+    let before = fixture.current(&id).command_revision;
+    let response = fixture
+        .response(Action::Mutate {
+            id: id.clone(),
+            command: TorrentCommand::Resume,
+            revision: Some(before),
+        })
+        .unwrap();
+    let operation_id = response.operation_id.unwrap();
+    let Reply::Accepted(accepted) = response.result.unwrap() else {
+        panic!("native resume acceptance required");
+    };
+    let read = || {
+        let Reply::Operations(page) = fixture
+            .rpc(Action::Operations {
+                before: None,
+                limit: 8,
+            })
+            .unwrap()
+        else {
+            panic!("owner history page required");
+        };
+        page.entries
+            .into_iter()
+            .find(|row| row.id == operation_id)
+            .unwrap()
+    };
+    let queued = read();
+    assert_eq!(queued.state, NativeOperationState::Accepted);
+    assert_eq!(queued.revision, Some(accepted.command_revision));
+    assert_eq!(queued.target.as_deref(), Some(id.as_str()));
+    fixture.wait_for(|owner| owner.has_confirmed_update(&id));
+    assert_eq!(read().state, NativeOperationState::EffectConfirmed);
+    db.execute_batch("DROP TRIGGER reject_history_ack").unwrap();
+    fixture.wait_for(|owner| !owner.has_confirmed_update(&id));
+    assert_eq!(read().state, NativeOperationState::Succeeded);
+    let stale = fixture
+        .response(Action::Mutate {
+            id,
+            command: TorrentCommand::Pause,
+            revision: Some(before),
+        })
+        .unwrap();
+    assert!(stale.operation_id.is_some());
+    assert!(matches!(
+        stale.result,
+        Err(Error::Command(
+            crate::control::CommandError::RevisionConflict { .. }
+        ))
+    ));
+    fixture.stop_engine();
 }
 
 #[test]

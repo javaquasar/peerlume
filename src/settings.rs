@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+pub mod speed_policy;
 
 pub const CONFIG_VERSION: u32 = 2;
 pub const DEFAULT_BLOCKLIST_URL: &str =
@@ -562,6 +563,12 @@ impl ClientSettings {
         if self.speed.schedule_begin_minutes >= 1440 || self.speed.schedule_end_minutes >= 1440 {
             push("speed.schedule", "schedule times must fall within one day");
         }
+        if self.speed.schedule_enabled && self.speed.schedule_days & !0x7f != 0 {
+            push(
+                "speed.schedule_days",
+                "only the seven weekday bits are valid",
+            );
+        }
         if self.speed.schedule_enabled && self.speed.schedule_days == 0 {
             push("speed.schedule_days", "select at least one schedule day");
         }
@@ -579,6 +586,22 @@ impl ClientSettings {
                 "speed.upload_limit_kib",
                 "must be 0..4194303 KiB/s (runtime byte-rate limit)",
             );
+        }
+        for (field, value) in [
+            (
+                "speed.alternate_download_kib",
+                self.speed.alternate_download_kib,
+            ),
+            (
+                "speed.alternate_upload_kib",
+                self.speed.alternate_upload_kib,
+            ),
+        ] {
+            if self.speed.policy() != speed_policy::SpeedPolicy::Normal
+                && value > u64::from(u32::MAX / 1024)
+            {
+                push(field, "must be 0..4194303 KiB/s (runtime byte-rate limit)");
+            }
         }
         if self.connection.max_connections_per_torrent == 0
             || self.connection.max_connections_per_torrent > 4096

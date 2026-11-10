@@ -255,6 +255,7 @@ mod tests {
             protocol,
             request_id: request_id.into(),
             instance_id: instance_id.into(),
+            operation_id: None,
             result,
         };
         for response in [

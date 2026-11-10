@@ -6,6 +6,7 @@ evidence that its acceptance criteria have passed.
 
 | Target version | Plan | Status |
 | --- | --- | --- |
+| 0.5.0 | [Live controls, diagnostics and safe automation](0.5.0/release-plan.md) | [Implementation evidence](0.5.0/results.md) |
 | 0.4.0 | [Coherent desktop controls and presentation](0.4.0/release-plan.md) | Implementation candidate; [Windows tests, coverage and inspection limits](0.4.0/results.md) |
 | 0.3.0 | [Efficient ownership and background operation](0.3.0/release-plan.md) | Implementation candidate; [Windows evidence and acceptance gaps](0.3.0/results.md) |
 | 0.2.0 | [Performance and responsiveness](0.2.0/release-plan.md) | Implemented; [Windows validation and measurements](0.2.0/results.md) |

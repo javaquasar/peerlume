@@ -13,9 +13,21 @@ pub fn application(tab: PreferencesTab, field: &str) -> &'static str {
             PreferencesTab::Seeding,
             "ratio_limit" | "time_limit_minutes" | "ratio_limit_enabled" | "time_limit_enabled",
         ) => "new torrents only; existing transfers unchanged",
-        (PreferencesTab::Queue, "enabled" | "max_active_downloads" | "max_active_checks")
+        (PreferencesTab::Queue, "enabled" | "max_active_downloads")
+        | (
+            PreferencesTab::Speed,
+            "download_limit_kib"
+            | "upload_limit_kib"
+            | "alternate_enabled"
+            | "alternate_download_kib"
+            | "alternate_upload_kib"
+            | "schedule_enabled"
+            | "schedule_begin_minutes"
+            | "schedule_end_minutes"
+            | "schedule_days",
+        ) => "live after background engine confirmation",
+        (PreferencesTab::Queue, "max_active_checks")
         | (PreferencesTab::Storage, "max_active_bulk_jobs" | "bulk_io_limit_kib")
-        | (PreferencesTab::Speed, "download_limit_kib" | "upload_limit_kib")
         | (
             PreferencesTab::Connection,
             "listen_port"

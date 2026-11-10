@@ -651,6 +651,20 @@ impl OperationHistory {
         self.changed();
         Ok(())
     }
+    /// Drop only the local display row once a correlated owner operation exists.
+    /// The authoritative owner retains and resolves the operation independently.
+    #[cfg(feature = "gui")]
+    pub(crate) fn handoff_to_owner(&mut self, id: OperationId) -> Result<(), HistoryError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .ok_or(HistoryError::UnknownOperation)?;
+        let entry = self.entries.remove(index).expect("existing local row");
+        self.reserved_bytes -= entry.reserved_bytes;
+        self.changed();
+        Ok(())
+    }
     /// Explicitly forget an uncertain display record without claiming success,
     /// cancelling work, or sending/retrying anything to the owner.
     pub fn acknowledge_review(&mut self, id: OperationId) -> Result<(), HistoryError> {

@@ -317,11 +317,18 @@ impl RepairBudget {
 }
 
 pub fn status_card(torrent: &TorrentItem, last: Option<&JournalEntry>) -> Vec<(String, String)> {
+    status_card_for_connection(torrent, last, true)
+}
+
+pub fn status_card_for_connection(
+    torrent: &TorrentItem,
+    last: Option<&JournalEntry>,
+    owner_connected: bool,
+) -> Vec<(String, String)> {
+    let readiness = crate::diagnostics::readiness(torrent, last, owner_connected);
     let mut rows = vec![
-        (
-            "Observed activity".into(),
-            crate::diagnostics::activity(torrent).into(),
-        ),
+        ("Observed activity".into(), readiness.reason.into()),
+        ("Next step".into(), readiness.next_action.into()),
         (
             "Storage operation".into(),
             format!("{:?}", torrent.runtime.storage),

@@ -434,6 +434,8 @@ mod tests {
             owner: Arc::new(Mutex::new(Controller::new(backend, vec![item]))),
             directory: directory.path().to_owned(),
             settings: Mutex::new(settings),
+            saved_speed: Default::default(),
+            history: Some(History::memory()),
             instance: "synthetic owner".into(),
             token_hash: "unused".into(),
             requested: Default::default(),

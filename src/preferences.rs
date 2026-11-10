@@ -211,6 +211,7 @@ fn show_queue(ui: &mut egui::Ui, settings: &mut ClientSettings) {
 }
 
 fn show_speed(ui: &mut egui::Ui, settings: &mut ClientSettings) {
+    const MAX_RATE_KIB: u64 = u32::MAX as u64 / 1024;
     let value = &mut settings.speed;
     ui.heading("Speed");
     group(ui, "Global limits", |ui| {
@@ -218,39 +219,49 @@ fn show_speed(ui: &mut egui::Ui, settings: &mut ClientSettings) {
             ui,
             "Download limit KiB/s (0 = unlimited)",
             &mut value.download_limit_kib,
-            0..=10_000_000,
+            0..=MAX_RATE_KIB,
         );
         u64_row(
             ui,
             "Upload limit KiB/s (0 = unlimited)",
             &mut value.upload_limit_kib,
-            0..=10_000_000,
+            0..=MAX_RATE_KIB,
         );
         ui.checkbox(
             &mut value.limit_local_peers,
             "Apply limits to local-network peers",
         );
     });
-    group(ui, "Alternative speed profile", |ui| {
-        ui.checkbox(
-            &mut value.alternate_enabled,
-            "Enable alternative speed limits",
+    group(ui, "Speed profile draft", |ui| {
+        use crate::settings::speed_policy::SpeedPolicy;
+        let mut policy = value.policy();
+        egui::ComboBox::from_id_salt("speed_profile_draft")
+            .selected_text(policy.label())
+            .show_ui(ui, |ui| {
+                for mode in [
+                    SpeedPolicy::Normal,
+                    SpeedPolicy::Quiet,
+                    SpeedPolicy::Automatic,
+                ] {
+                    ui.selectable_value(&mut policy, mode, mode.label());
+                }
+            });
+        if policy != value.policy() {
+            value.set_policy(policy);
+        }
+        u64_row(
+            ui,
+            "Quiet download KiB/s (0 = unlimited)",
+            &mut value.alternate_download_kib,
+            0..=MAX_RATE_KIB,
         );
-        ui.add_enabled_ui(value.alternate_enabled, |ui| {
-            u64_row(
-                ui,
-                "Alternative download KiB/s",
-                &mut value.alternate_download_kib,
-                1..=10_000_000,
-            );
-            u64_row(
-                ui,
-                "Alternative upload KiB/s",
-                &mut value.alternate_upload_kib,
-                1..=10_000_000,
-            );
-        });
-        ui.checkbox(&mut value.schedule_enabled, "Schedule alternative limits");
+        u64_row(
+            ui,
+            "Quiet upload KiB/s (0 = unlimited)",
+            &mut value.alternate_upload_kib,
+            0..=MAX_RATE_KIB,
+        );
+        ui.label("Automatic uses the configured local times. An overnight window belongs to its start day.");
         ui.add_enabled_ui(value.schedule_enabled, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Start minute of day");

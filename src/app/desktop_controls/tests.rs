@@ -189,6 +189,7 @@ fn every_toolbar_and_overflow_action_emits_its_exact_intent() {
         ("Save view", DesktopAction::SaveView, true),
         ("Restore default columns", DesktopAction::ResetColumns, true),
         ("Appearance...", DesktopAction::Appearance, true),
+        ("Speed profiles...", DesktopAction::SpeedProfiles, true),
         ("Agent access...", DesktopAction::AgentAccess, true),
         ("Operations", DesktopAction::ShowOperations, true),
     ] {

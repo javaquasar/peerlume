@@ -1,8 +1,16 @@
-use super::{MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION, transport, wire::*};
+use super::{
+    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    operations::{History, Intent, SharedHistory, Ticket},
+    transport,
+    wire::*,
+};
 use crate::{
     control::Controller,
     file_selection::FileSelectionModel,
-    settings::ClientSettings,
+    settings::{
+        ClientSettings, SpeedSettings,
+        speed_policy::{SpeedPlan, SpeedView},
+    },
     torrent::{TorrentItem, TorrentState},
 };
 use std::{
@@ -35,6 +43,8 @@ struct Service {
     owner: Arc<Mutex<Controller>>,
     directory: PathBuf,
     settings: Mutex<ClientSettings>,
+    saved_speed: Mutex<Option<(SpeedSettings, bool, usize)>>,
+    history: Option<SharedHistory>,
     instance: String,
     token_hash: String,
     requested: Arc<AtomicBool>,
@@ -57,10 +67,24 @@ impl Server {
         let requested = Arc::new(AtomicBool::new(false));
         let request_wake = Arc::new(tokio::sync::Notify::new());
         let wake = Arc::new(tokio::sync::Notify::new());
+        let saved_speed = ClientSettings::load_from(&directory.join("settings.toml"))
+            .ok()
+            .map(|saved| {
+                (
+                    saved.speed,
+                    saved.queue.enabled,
+                    saved.queue.max_active_downloads,
+                )
+            });
+        let history = History::open(&directory.join("native-operations.sqlite3"))
+            .ok()
+            .map(|history| Arc::new(Mutex::new(history)));
         let service = Arc::new(Service {
-            owner,
+            owner: owner.clone(),
             directory: directory.clone(),
             settings: Mutex::new(settings),
+            saved_speed: Mutex::new(saved_speed),
+            history: history.clone(),
             instance: instance.clone(),
             token_hash: crate::control::access::digest(token.as_bytes()),
             requested: requested.clone(),
@@ -94,6 +118,10 @@ impl Server {
         started
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| io::Error::other("Native server initialization timed out"))??;
+        owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .native_operations = history;
         transport::write_credentials(&directory, instance, &token)?;
         Ok(server)
     }
@@ -197,27 +225,30 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(stream: S, service: Arc<S
         String::new()
     };
     let requests_stop = matches!(&request.action, Action::Stop);
-    let result = if !valid_request_id {
-        Err(Error::TooLarge)
+    let (operation_id, result) = if !valid_request_id {
+        (None, Err(Error::TooLarge))
     } else if request.protocol != PROTOCOL_VERSION {
-        Err(Error::Incompatible)
+        (None, Err(Error::Incompatible))
     } else if request.client_id.len() != 64
         || !crate::control::access::matches_token(&service.token_hash, &request.token)
     {
-        Err(Error::Unauthorized)
+        (None, Err(Error::Unauthorized))
     } else if request
         .instance_id
         .as_ref()
         .is_some_and(|id| *id != service.instance)
     {
-        Err(Error::Stale)
+        (None, Err(Error::Stale))
     } else {
-        service.dispatch(request.client_id, request.action).await
+        service
+            .dispatch_tracked(request.client_id, &request_id, request.action)
+            .await
     };
     let mut response = Response {
         protocol: PROTOCOL_VERSION,
         request_id,
         instance_id: service.instance.clone(),
+        operation_id,
         result,
     };
     let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
@@ -238,7 +269,105 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(stream: S, service: Arc<S
 }
 
 impl Service {
-    async fn dispatch(self: &Arc<Self>, client: String, action: Action) -> Result<Reply, Error> {
+    fn record_saved_speed(&self, settings: &ClientSettings) {
+        *self.saved_speed.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+            settings.speed.clone(),
+            settings.queue.enabled,
+            settings.queue.max_active_downloads,
+        ));
+    }
+
+    fn speed_view(&self, owner: &Controller) -> SpeedView {
+        let desired = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = self.saved_speed.lock().unwrap_or_else(|e| e.into_inner());
+        let (applied, pending) = owner.backend.speed_readback();
+        SpeedView {
+            desired: desired.speed.clone(),
+            saved: saved.as_ref().map(|(speed, _, _)| speed.clone()),
+            desired_queue_enabled: desired.queue.enabled,
+            saved_queue_enabled: saved.as_ref().map(|(_, enabled, _)| *enabled),
+            desired_max_active_downloads: desired.queue.max_active_downloads,
+            saved_max_active_downloads: saved.as_ref().map(|(_, _, slots)| *slots),
+            applied,
+            pending,
+        }
+    }
+
+    async fn dispatch_tracked(
+        self: &Arc<Self>,
+        client: String,
+        request_id: &str,
+        action: Action,
+    ) -> (Option<String>, Result<Reply, Error>) {
+        let Some(intent) = Intent::from_action(&action) else {
+            return (None, self.dispatch(client, action, None).await);
+        };
+        let Some(history) = &self.history else {
+            return (None, self.dispatch(client, action, None).await);
+        };
+        let opened = history
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin(&self.instance, request_id, intent);
+        let (ticket, id) = match opened {
+            Ok(value) => value,
+            Err(Error::Busy) => return (None, Err(Error::Busy)),
+            Err(_) => {
+                history
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .degrade();
+                return (None, self.dispatch(client, action, None).await);
+            }
+        };
+        let result = self.dispatch(client, action, Some(ticket)).await;
+        let recorded = history
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish_rpc(ticket, &result);
+        (recorded.then_some(id), result)
+    }
+
+    fn record_acceptance(&self, ticket: Option<Ticket>, owner: &mut Controller, id: &str) {
+        let (Some(ticket), Some(history)) = (ticket, &self.history) else {
+            return;
+        };
+        let Some(index) = owner.torrent_index(id) else {
+            return;
+        };
+        let item = &owner.torrents[index];
+        let id = item.info_hashes.join(";");
+        let Ok(revision) = owner.command_revision(&id) else {
+            return;
+        };
+        let fresh = item.state != TorrentState::Checking
+            && !matches!(
+                item.runtime.storage,
+                crate::storage::relocation::StorageStatus::Copying { .. }
+                    | crate::storage::relocation::StorageStatus::Checking { .. }
+            );
+        history
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .accepted(ticket, &id, revision, fresh);
+    }
+
+    async fn dispatch(
+        self: &Arc<Self>,
+        client: String,
+        action: Action,
+        ticket: Option<Ticket>,
+    ) -> Result<Reply, Error> {
+        if let Action::Operations { before, limit } = action {
+            return self
+                .history
+                .as_ref()
+                .ok_or_else(super::operations::unavailable)?
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .page(before, limit)
+                .map(Reply::Operations);
+        }
         if let Action::Add(request) = action {
             let _permit = self.imports.try_acquire().map_err(|_| Error::Busy)?;
             let settings = self
@@ -264,6 +393,7 @@ impl Service {
             if let Some(index) = owner.torrent_index(&id) {
                 owner.torrents[index].files.defer_details();
             }
+            self.record_acceptance(ticket, &mut owner, &id);
             owner.owner_wake().notify_one();
             return Ok(Reply::Done(
                 "Torrent queued; awaiting engine confirmation".into(),
@@ -316,6 +446,7 @@ impl Service {
             action,
             Action::Hello
                 | Action::Snapshot { .. }
+                | Action::SpeedState
                 | Action::Files { .. }
                 | Action::Journal { .. }
                 | Action::Access(AccessAction::View)
@@ -486,6 +617,7 @@ impl Service {
                 if remove {
                     owner.pending_removals.insert(accepted.torrent_id.clone());
                 }
+                self.record_acceptance(ticket, &mut owner, &accepted.torrent_id);
                 Ok(Reply::Accepted(accepted))
             }
             Action::Selection {
@@ -496,14 +628,15 @@ impl Service {
             } => {
                 check_file_revision(&mut owner, &id, revision, file_revision)?;
                 check_file_count(&mut owner, &id, &files)?;
-                owner
+                let accepted = owner
                     .submit(
                         &id,
                         crate::control::TorrentCommand::SetFiles(files.indices()?),
                         Some(revision),
                     )
-                    .map(Reply::Accepted)
-                    .map_err(Error::Command)
+                    .map_err(Error::Command)?;
+                self.record_acceptance(ticket, &mut owner, &accepted.torrent_id);
+                Ok(Reply::Accepted(accepted))
             }
             Action::Priorities {
                 id,
@@ -518,6 +651,7 @@ impl Service {
                     .set_file_priorities(&id, files.indices()?)
                     .map_err(Error::Failed)?;
                 publish_native_revision(&mut owner, &id, next)?;
+                self.record_acceptance(ticket, &mut owner, &id);
                 Ok(Reply::Done("File priorities queued".into()))
             }
             Action::Retry { id, revision } => {
@@ -531,6 +665,7 @@ impl Service {
                             .unwrap_or_else(|error| error.into_inner()),
                     )
                     .map_err(Error::Failed)?;
+                self.record_acceptance(ticket, &mut owner, &id);
                 Ok(Reply::Done("Start queued".into()))
             }
             Action::Storage {
@@ -555,6 +690,7 @@ impl Service {
                 }
                 .map_err(Error::Failed)?;
                 publish_native_revision(&mut owner, &id, next)?;
+                self.record_acceptance(ticket, &mut owner, &id);
                 Ok(Reply::Done("Storage command queued".into()))
             }
             Action::Interest { id, files, peers } => {
@@ -582,6 +718,33 @@ impl Service {
                 .map(|()| Reply::Done(String::new()))
                 .map_err(|error| Error::Failed(format!("{error:?}"))),
             Action::Access(action) => access(&mut owner, action).map(Reply::Access),
+            Action::SpeedState => Ok(Reply::SpeedState(self.speed_view(&owner))),
+            Action::SetSpeedPolicy(policy) => {
+                // Persist only the policy flags. Other applied-only changes
+                // and another frontend's unsaved drafts must remain separate.
+                let mut desired = self
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                desired.speed.set_policy(policy);
+                let plan = SpeedPlan::from_settings(&desired).map_err(Error::Failed)?;
+                let path = self.directory.join("settings.toml");
+                let mut persisted = ClientSettings::load_from(&path)
+                    .map_err(|error| Error::Failed(error.to_string()))?;
+                persisted.speed.set_policy(policy);
+                SpeedPlan::from_settings(&persisted).map_err(Error::Failed)?;
+                persisted
+                    .save_to(&path)
+                    .map_err(|error| Error::Failed(error.to_string()))?;
+                self.record_saved_speed(&persisted);
+                if let Some(agent) = owner.agent.as_mut() {
+                    agent.client_settings.speed.set_policy(policy);
+                }
+                *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = desired;
+                owner.backend.request_live_speed(plan);
+                Ok(Reply::SpeedState(self.speed_view(&owner)))
+            }
             Action::SaveView(ui) => {
                 let path = self.directory.join("settings.toml");
                 let mut persisted = match ClientSettings::load_from(&path) {
@@ -600,6 +763,7 @@ impl Service {
                 persisted
                     .save_to(&path)
                     .map_err(|error| Error::Failed(error.to_string()))?;
+                self.record_saved_speed(&persisted);
                 self.settings
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -619,6 +783,7 @@ impl Service {
                     ));
                 }
                 crate::network_settings::options(&settings).map_err(Error::Failed)?;
+                let speed_plan = SpeedPlan::from_settings(&settings).map_err(Error::Failed)?;
                 // Changing a default directory applies to new registrations.
                 // Persist the actual inherited location of existing engines
                 // before replacing that default, even if the TOML write fails.
@@ -653,6 +818,7 @@ impl Service {
                     settings
                         .save_to(&self.directory.join("settings.toml"))
                         .map_err(|error| Error::Failed(error.to_string()))?;
+                    self.record_saved_speed(&settings);
                 }
                 owner
                     .set_agent_settings(&settings)
@@ -661,10 +827,11 @@ impl Service {
                     .settings
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = settings;
+                owner.backend.request_live_speed(speed_plan);
                 Ok(Reply::Done(if save_preferences {
-                    "Preferences saved; active engine unchanged".into()
+                    "Preferences saved. Check effective speed for engine confirmation.".into()
                 } else {
-                    "Preferences applied; active engine unchanged".into()
+                    "Preferences accepted. Check effective speed for engine confirmation.".into()
                 }))
             }
             Action::SaveEditable {
@@ -726,7 +893,8 @@ impl Service {
             Action::Add(_)
             | Action::Export { .. }
             | Action::Trash { .. }
-            | Action::PrepareTrash { .. } => unreachable!(),
+            | Action::PrepareTrash { .. }
+            | Action::Operations { .. } => unreachable!(),
         };
         if mutating {
             owner.owner_wake().notify_one();

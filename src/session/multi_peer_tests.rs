@@ -24,12 +24,17 @@ struct TransferProof {
     midpoint_requested: Vec<bool>,
     sent_bytes: Vec<usize>,
     requests_before_first_response: usize,
+    midpoint_released: bool,
+    first_peer_response_at: Option<Instant>,
+    first_peer_midpoint_at: Option<Instant>,
+    last_response_at: Option<Instant>,
 }
 
 struct RequestGate {
     proof: Mutex<TransferProof>,
     changed: Condvar,
     stop: Arc<AtomicBool>,
+    live_speed: bool,
 }
 
 impl RequestGate {
@@ -42,6 +47,9 @@ impl RequestGate {
         let mut proof = self.proof.lock().unwrap();
         if at_midpoint {
             proof.midpoint_requested[peer] = true;
+            if self.live_speed && peer == 0 {
+                proof.first_peer_midpoint_at = Some(Instant::now());
+            }
         } else {
             proof.requested[peer] = true;
         }
@@ -52,7 +60,9 @@ impl RequestGate {
             } else {
                 &proof.requested
             };
-            if requested.iter().all(|requested| *requested) {
+            if requested.iter().all(|requested| *requested)
+                && (!at_midpoint || !self.live_speed || proof.midpoint_released)
+            {
                 return Ok(());
             }
             if self.stop.load(Ordering::Relaxed) {
@@ -78,6 +88,13 @@ impl RequestGate {
                 .count();
         }
         proof.sent_bytes[peer] += bytes;
+        if self.live_speed {
+            let now = Instant::now();
+            if peer == 0 {
+                proof.first_peer_response_at.get_or_insert(now);
+            }
+            proof.last_response_at = Some(now);
+        }
     }
 }
 
@@ -211,8 +228,12 @@ fn serve_peer(
     if incoming.info_hash != info_hash {
         return Err("client requested the wrong torrent from a local peer".into());
     }
+    let mut reserved = [0; 8];
+    if gate.live_speed {
+        reserved[5] = 0x10;
+    }
     let outgoing = Handshake {
-        reserved: [0; 8],
+        reserved,
         info_hash,
         peer_id: format!("-PLTEST-multi{gate_slot:07}")
             .as_bytes()
@@ -222,6 +243,19 @@ fn serve_peer(
     stream
         .write_all(&outgoing.encode())
         .map_err(|e| e.to_string())?;
+    if gate.live_speed {
+        // A one-request window leaves most midpoint blocks to be admitted by
+        // the new limiter, rather than already sitting in the peer socket.
+        stream
+            .write_all(
+                &PeerMessage::Extended {
+                    extension_id: 0,
+                    payload: b"d1:mde4:reqqi1ee".to_vec(),
+                }
+                .encode(),
+            )
+            .map_err(|e| e.to_string())?;
+    }
     let piece_count = data.len() / PIECE_LENGTH;
     let mut bitfield = vec![0; piece_count.div_ceil(8)];
     for index in (peer..piece_count).step_by(peer_count) {
@@ -325,12 +359,13 @@ struct TorrentFixture {
 }
 
 fn download_torrents_concurrently(specifications: &[(usize, DownloadMode)]) {
-    download_torrents_with_verification(specifications, false);
+    download_torrents_with_verification(specifications, false, false);
 }
 
 fn download_torrents_with_verification(
     specifications: &[(usize, DownloadMode)],
     verify_after_download: bool,
+    live_speed: bool,
 ) {
     let root = tempfile::tempdir().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -344,6 +379,7 @@ fn download_torrents_with_verification(
         }),
         changed: Condvar::new(),
         stop,
+        live_speed,
     });
     let mut fixture = Fixture {
         runtime: None,
@@ -438,13 +474,19 @@ fn download_torrents_with_verification(
             SessionOptions {
                 dht: None,
                 disable_local_service_discovery: true,
+                listen: live_speed.then(|| librqbit::ListenerOptions {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ..Default::default()
+                }),
                 ..super::session_options(false)
             },
         )
         .unwrap(),
     );
     let runtime = fixture.runtime.as_ref().unwrap();
-    for torrent in &torrents {
+    let engine = live_speed.then(|| runtime.test_engine().unwrap());
+    let listener = engine.as_ref().map(|engine| engine.listen_addr().unwrap());
+    for (index, torrent) in torrents.iter().enumerate() {
         runtime
             .try_send(SessionCommand::AddTorrent {
                 resume: Default::default(),
@@ -460,7 +502,10 @@ fn download_torrents_with_verification(
                 only_files: None,
                 trackers: vec![torrent.tracker_url.clone()],
                 paused: false,
-                transfer: Default::default(),
+                transfer: crate::transfer_settings::TransferSettings {
+                    download_kib: if live_speed && index == 0 { 48 } else { 0 },
+                    ..Default::default()
+                },
                 peer_limit: Some(torrent.peer_count),
             })
             .unwrap();
@@ -470,7 +515,22 @@ fn download_torrents_with_verification(
     let mut checking_seen = HashSet::new();
     let mut verified_seen = HashSet::new();
     let mut last_stats = String::new();
+    let mut released_at = None;
     while Instant::now() < deadline {
+        let midpoint_ready = live_speed && released_at.is_none() && {
+            let proof = fixture.gate.proof.lock().unwrap();
+            proof.midpoint_requested.iter().all(|requested| *requested)
+        };
+        if let Some(engine) = &engine
+            && midpoint_ready
+        {
+            assert!(finished.is_empty());
+            change_limits_at_midpoint(runtime, engine, &torrents, listener.unwrap());
+            let mut proof = fixture.gate.proof.lock().unwrap();
+            released_at = Some(Instant::now());
+            proof.midpoint_released = true;
+            fixture.gate.changed.notify_all();
+        }
         match runtime.recv_timeout(Duration::from_millis(200)) {
             Ok(SessionEvent::Stats {
                 id: torrent_id,
@@ -534,6 +594,23 @@ fn download_torrents_with_verification(
             "parallel downloads did not finish; finished={finished:?}; requests={requested:?}; midpoint={midpoint:?}; bytes={sent_bytes:?}; last={last_stats}; fixture={errors:?}"
         );
     }
+    if let Some(engine) = &engine {
+        // 256 KiB remained across the two torrents at midpoint. Allow for
+        // in-flight blocks, one quota burst and generous scheduling margin.
+        let proof = fixture.gate.proof.lock().unwrap();
+        let sent_at = proof.last_response_at.unwrap();
+        assert!(sent_at.duration_since(released_at.unwrap()) >= Duration::from_millis(1500));
+        // Before midpoint the global quota was unlimited. The first peer's
+        // 128 KiB half was paced by its own 48 KiB/s cap.
+        let initial_elapsed = proof
+            .first_peer_midpoint_at
+            .unwrap()
+            .duration_since(proof.first_peer_response_at.unwrap());
+        assert!(initial_elapsed >= Duration::from_millis(750));
+        assert!(Arc::ptr_eq(engine, &runtime.test_engine().unwrap()));
+        assert_eq!(engine.listen_addr(), listener);
+    }
+    drop(engine);
     fixture.shutdown().unwrap();
     let proof = fixture.gate.proof.lock().unwrap();
     assert_eq!(proof.requests_before_first_response, total_peers);
@@ -553,6 +630,56 @@ fn download_torrents_with_verification(
         {
             assert_eq!(Sha1::digest(piece), Sha1::digest(expected));
         }
+    }
+}
+
+fn change_limits_at_midpoint(
+    runtime: &SessionRuntime,
+    engine: &Arc<librqbit::Session>,
+    torrents: &[TorrentFixture],
+    listener: SocketAddr,
+) {
+    use crate::settings::speed_policy::{SpeedPlan, SpeedPolicy};
+
+    let mut settings = crate::settings::ClientSettings::default();
+    settings.speed.set_policy(SpeedPolicy::Quiet);
+    settings.speed.alternate_download_kib = 64;
+    settings.speed.alternate_upload_kib = 32;
+    settings.queue.max_active_downloads = 2;
+    runtime.request_live_speed(SpeedPlan::from_settings(&settings).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (applied, pending) = runtime.speed_readback();
+        if let Some(applied) = applied.filter(|_| !pending) {
+            assert_eq!(applied.policy, SpeedPolicy::Quiet);
+            assert_eq!(applied.download_limit_kib, 64);
+            assert_eq!(applied.upload_limit_kib, 32);
+            assert_eq!(applied.max_active_downloads, 2);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "engine speed readback did not arrive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(Arc::ptr_eq(engine, &runtime.test_engine().unwrap()));
+    assert_eq!(engine.listen_addr(), Some(listener));
+    for (index, torrent) in torrents.iter().enumerate() {
+        let hash =
+            crate::tracker::parse_info_hash_hex(torrent.id.strip_prefix("v1: ").unwrap()).unwrap();
+        let handle = engine
+            .get(librqbit::api::TorrentIdOrHash::Hash(
+                librqbit::dht::Id20::new(hash),
+            ))
+            .unwrap();
+        assert!(!handle.stats().finished);
+        let cap = handle
+            .transfer_settings()
+            .limits
+            .download_bps
+            .map(|bps| bps.get());
+        assert_eq!(cap, (index == 0).then_some(48 * 1024));
     }
 }
 
@@ -576,6 +703,7 @@ fn verify_gate_blocks_incomplete_group(peer_count: usize, active_peers: usize, a
         }),
         changed: Condvar::new(),
         stop: Arc::new(AtomicBool::new(false)),
+        live_speed: false,
     });
     let workers: Vec<_> = (0..active_peers)
         .map(|peer| {
@@ -644,6 +772,16 @@ fn different_torrents_download_concurrently_in_one_session() {
 pub(super) fn different_torrents_are_verified_after_parallel_download_before_done() {
     download_torrents_with_verification(
         &[(2, DownloadMode::Normal), (2, DownloadMode::NoProgress)],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn live_speed_changes_preserve_two_active_loopback_downloads_and_listener() {
+    download_torrents_with_verification(
+        &[(1, DownloadMode::Normal), (1, DownloadMode::Normal)],
+        true,
         true,
     );
 }
