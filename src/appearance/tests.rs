@@ -68,7 +68,7 @@ fn every_status_selection_and_hover_pair_has_readable_text_and_noncolor_meaning(
         S::Error,
     ] {
         let badge = StatusPresentation::for_state(state);
-        assert!(!badge.marker.is_empty() && !badge.label.is_empty());
+        assert!(!badge.label.is_empty());
         for dark in [false, true] {
             for selected in [false, true] {
                 for hovered in [false, true] {

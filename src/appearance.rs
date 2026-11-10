@@ -123,22 +123,33 @@ pub fn tone_colors(tone: Tone, dark: bool, selected: bool, hovered: bool) -> Row
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusMarker {
+    Download,
+    Waiting,
+    Pause,
+    Seed,
+    Check,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusPresentation {
-    pub marker: &'static str,
+    pub marker: StatusMarker,
     pub label: &'static str,
     pub tone: Tone,
 }
 impl StatusPresentation {
     pub fn for_state(state: crate::torrent::TorrentState) -> Self {
         use crate::torrent::TorrentState as S;
+        use StatusMarker as M;
         let (marker, label, tone) = match state {
-            S::Downloading => ("↓", "Downloading", Tone::Info),
-            S::WaitingForEngine => ("…", "Waiting", Tone::Info),
-            S::Paused => ("Ⅱ", "Paused", Tone::Neutral),
-            S::Seeding => ("↑", "Seeding", Tone::Success),
-            S::Checking => ("↻", "Checking", Tone::Warning),
-            S::VerificationFailed => ("!", "Verification failed", Tone::Danger),
-            S::Error => ("!", "Error", Tone::Danger),
+            S::Downloading => (M::Download, "Downloading", Tone::Info),
+            S::WaitingForEngine => (M::Waiting, "Waiting", Tone::Info),
+            S::Paused => (M::Pause, "Paused", Tone::Neutral),
+            S::Seeding => (M::Seed, "Seeding", Tone::Success),
+            S::Checking => (M::Check, "Checking", Tone::Warning),
+            S::VerificationFailed => (M::Error, "Verification failed", Tone::Danger),
+            S::Error => (M::Error, "Error", Tone::Danger),
         };
         Self {
             marker,

@@ -2,7 +2,7 @@
 //! context intents; they never perform IPC or touch payloads.
 use super::name_column::{self, NameColumn};
 use crate::{
-    appearance::{self, RowColors, StatusPresentation},
+    appearance::{self, RowColors, StatusMarker, StatusPresentation},
     table_view::{Column, TableColumns},
     torrent::TorrentItem,
     torrent_filter::StatusFilter,
@@ -398,12 +398,11 @@ pub(super) fn show(
                             .truncate(),
                     );
                     if *sort == cell.column.sort() {
-                        header_ui.painter().text(
-                            egui::pos2(rect.right() - 4.0, rect.center().y),
-                            egui::Align2::RIGHT_CENTER,
-                            if *descending { "↓" } else { "↑" },
-                            egui::TextStyle::Body.resolve(ui.style()),
-                            ui.visuals().text_color(),
+                        paint_vertical_arrow(
+                            &header_ui.painter().with_clip_rect(rect),
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            *descending,
+                            egui::Stroke::new(1.5, ui.visuals().text_color()),
                         );
                     }
                     if response.clicked() && runtime.layout_frame != Some(frame) {
@@ -558,15 +557,27 @@ fn row_cell(
         );
         return;
     }
-    let marker = StatusPresentation::for_state(torrent.state).marker;
+    let icon = if column == Column::Status || (column == Column::Name && status_hidden) {
+        child.spacing_mut().item_spacing.x = 4.0;
+        let (icon_rect, response) =
+            child.allocate_exact_size(egui::vec2(11.0, 12.0), egui::Sense::hover());
+        paint_status_marker(
+            child.painter(),
+            icon_rect.center(),
+            StatusPresentation::for_state(torrent.state).marker,
+            colors.text.color32(),
+        );
+        Some(response)
+    } else {
+        None
+    };
     let value = match column {
         Column::Name => format!(
-            "{}{}{}",
-            if status_hidden { marker } else { "" },
+            "{}{}",
             if torrent.is_private { "🔒 " } else { "" },
             torrent.name
         ),
-        Column::Status => format!("{marker} {}", torrent.status_text()),
+        Column::Status => torrent.status_text(),
         Column::Download => super::format_rate(torrent.download_rate),
         Column::Upload => super::format_rate(torrent.upload_rate),
         Column::Peers => format!("{} / {}", torrent.peers, torrent.seeds),
@@ -585,6 +596,11 @@ fn row_cell(
         },
     ));
     if column == Column::Name || column == Column::Status {
+        let response = if let Some(icon) = icon {
+            response.union(icon)
+        } else {
+            response
+        };
         response.on_hover_ui(|ui| {
             if column == Column::Name {
                 ui.label(&torrent.name);
@@ -595,6 +611,72 @@ fn row_cell(
                 ui.label(readiness.next_action);
             }
         });
+    }
+}
+
+fn paint_vertical_arrow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    down: bool,
+    stroke: egui::Stroke,
+) {
+    let half_shaft = egui::vec2(0.0, if down { 4.5 } else { -4.5 });
+    let tip = center + half_shaft;
+    painter.line_segment([center - half_shaft, tip], stroke);
+    painter.add(egui::Shape::line(
+        vec![
+            center - egui::vec2(3.5, 0.0),
+            tip,
+            center + egui::vec2(3.5, 0.0),
+        ],
+        stroke,
+    ));
+}
+
+fn paint_status_marker(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    marker: StatusMarker,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let point = |x, y| center + egui::vec2(x, y);
+    match marker {
+        StatusMarker::Download => paint_vertical_arrow(painter, center, true, stroke),
+        StatusMarker::Seed => paint_vertical_arrow(painter, center, false, stroke),
+        StatusMarker::Pause => {
+            for x in [-2.0, 2.0] {
+                painter.line_segment([point(x, -4.0), point(x, 4.0)], stroke);
+            }
+        }
+        StatusMarker::Waiting => {
+            for x in [-3.5, 0.0, 3.5] {
+                painter.circle_filled(point(x, 0.0), 0.9, color);
+            }
+        }
+        StatusMarker::Check => {
+            painter.add(egui::Shape::line(
+                vec![
+                    point(2.5, -3.0),
+                    point(0.0, -4.0),
+                    point(-3.0, -3.0),
+                    point(-4.0, 0.0),
+                    point(-3.0, 3.0),
+                    point(0.0, 4.0),
+                    point(3.0, 3.0),
+                    point(4.0, 0.0),
+                ],
+                stroke,
+            ));
+            painter.add(egui::Shape::line(
+                vec![point(1.0, 1.0), point(4.0, 0.0), point(5.0, 3.0)],
+                stroke,
+            ));
+        }
+        StatusMarker::Error => {
+            painter.line_segment([point(0.0, -4.0), point(0.0, 1.0)], stroke);
+            painter.circle_filled(point(0.0, 4.0), 0.9, color);
+        }
     }
 }
 

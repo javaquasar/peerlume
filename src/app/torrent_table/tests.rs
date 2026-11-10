@@ -165,6 +165,53 @@ fn text(output: &egui::FullOutput, label: &str) -> egui::Rect {
         .unwrap_or_else(|| panic!("Missing visible text {label}"))
 }
 
+fn has_arrow(output: &egui::FullOutput, rect: egui::Rect, down: bool) -> bool {
+    output.shapes.iter().any(|shape| {
+        let egui::Shape::LineSegment {
+            points: [start, end],
+            ..
+        } = shape.shape
+        else {
+            return false;
+        };
+        start.x == end.x
+            && (end.y - start.y) == if down { 9.0 } else { -9.0 }
+            && rect.contains(start)
+            && rect.contains(end)
+            && shape.clip_rect.contains(start)
+            && shape.clip_rect.contains(end)
+    })
+}
+
+#[test]
+fn status_arrows_are_painted_in_the_status_or_name_cells() {
+    use crate::torrent::TorrentState;
+
+    let ctx = egui::Context::default();
+    let size = egui::vec2(1600.0, 700.0);
+    let mut fixture = Fixture::new(2);
+    fixture.torrents[0].state = TorrentState::Downloading;
+    fixture.torrents[1].state = TorrentState::Seeding;
+    for column in [Column::Status, Column::Name] {
+        fixture
+            .columns
+            .set_visible(Column::Status, column == Column::Status);
+        let (output, table) = settle(&ctx, &mut fixture, size);
+        let cells: Vec<_> = table
+            .cells
+            .iter()
+            .filter_map(|(_, key, rect)| (*key == column).then_some(*rect))
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert!(has_arrow(&output, cells[0], true));
+        assert!(has_arrow(&output, cells[1], false));
+        if column == Column::Status {
+            assert!(cells[0].contains(text(&output, &fixture.torrents[0].status_text()).center()));
+            assert!(cells[1].contains(text(&output, &fixture.torrents[1].status_text()).center()));
+        }
+    }
+}
+
 #[test]
 fn status_hover_explains_confirmed_queue_wait_and_marks_a_disconnected_view() {
     use crate::torrent::TorrentState;
@@ -179,8 +226,7 @@ fn status_hover_explains_confirmed_queue_wait_and_marks_a_disconnected_view() {
     torrent.state = TorrentState::Downloading;
     torrent.runtime.registered = true;
     torrent.runtime.diagnostics.queue_waiting = true;
-    let marker = StatusPresentation::for_state(torrent.state).marker;
-    let label = format!("{marker} {}", torrent.status_text());
+    let label = torrent.status_text();
     let size = egui::vec2(1600.0, 700.0);
     let (output, _) = settle(&ctx, &mut fixture, size);
     let point = text(&output, &label).center();
@@ -284,8 +330,8 @@ fn every_header_sorts_and_toggles_without_reordering_canonical_items() {
             egui::Modifiers::NONE,
         );
         assert!(fixture.descending);
-        let (out, _) = settle(&ctx, &mut fixture, size);
-        text(&out, "↓");
+        let (out, table) = settle(&ctx, &mut fixture, size);
+        assert!(has_arrow(&out, header(&table, column), true));
     }
     assert_eq!(
         fixture
